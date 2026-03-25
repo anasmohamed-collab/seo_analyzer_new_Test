@@ -1,0 +1,47 @@
+{
+  "name": "technical-onpage",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node --env-file=.env server/index.js & vite --host 0.0.0.0",
+    "dev:server": "node --env-file=.env server/index.js",
+    "dev:start": "node --env-file=.env server/index.js",
+    "build": "vite build && tsc -p backend/tsconfig.json",
+    "build:backend": "tsc -p backend/tsconfig.json",
+    "start": "node server/index.js",
+    "lint": "eslint .",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.app.json",
+    "typecheck:backend": "tsc --noEmit -p backend/tsconfig.json",
+    "db:migrate": "echo 'Using Supabase migrations now'"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.98.0",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.13.0",
+    "@types/react": "^18.3.5",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.4.18",
+    "express": "^4.21.0",
+    "lucide-react": "^0.344.0",
+    "postcss": "^8.4.35",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tailwindcss": "^3.4.1",
+    "typescript": "^5.5.3",
+    "vite": "^5.4.2"
+  },
+  "engines": {
+    "node": "20.x"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.9.1",
+    "eslint": "^9.9.1",
+    "eslint-plugin-react-hooks": "^5.1.0-rc.0",
+    "eslint-plugin-react-refresh": "^0.4.11",
+    "globals": "^15.9.0",
+    "typescript-eslint": "^8.3.0"
+  }
+}

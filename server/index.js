@@ -1,0 +1,112 @@
+import process from 'node:process';
+import express from 'express';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { seoIntelligenceRouter } from './routes/seo-intelligence.js';
+import { seoCrawlerRouter } from './routes/seo-site-crawler.js';
+import { newsSeoRouter } from './routes/news-seo.js';
+import { unifiedAuditRouter } from './routes/unified-audit.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+const app = express();
+const PORT = parseInt(process.env.PORT || '3000', 10);
+
+// --------------- Database config validation ---------------
+const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY;
+
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.warn('⚠  DATABASE WARNING: SUPABASE_URL and SUPABASE_ANON_KEY are not set.');
+  console.warn('   The server will run in IN-MEMORY mode — audit results will not be persisted.');
+  console.warn('   Set SUPABASE_URL + SUPABASE_ANON_KEY (or VITE_SUPABASE_URL + VITE_SUPABASE_ANON_KEY) to enable persistence.');
+} else {
+  console.log('✓  Supabase configured:', SUPABASE_URL);
+}
+
+// --------------- Middleware ---------------
+app.use((req, _res, next) => {
+  if (req.url.startsWith('/api')) {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  }
+  next();
+});
+app.use(express.json({ limit: '2mb' }));
+
+// CORS - allow all origins (same behaviour as the edge functions)
+app.use((_req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Client-Info, Apikey');
+  if (_req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
+// --------------- Health check ---------------
+app.get('/health', async (_req, res) => {
+  res.json({
+    status: 'ok',
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// --------------- API routes ---------------
+app.get('/api/health', async (_req, res) => {
+  res.json({
+    status: 'ok',
+    env: {
+      SUPABASE_URL_SET: !!process.env.VITE_SUPABASE_URL,
+      NODE_ENV: process.env.NODE_ENV || 'not set',
+      PORT: process.env.PORT || 'not set',
+    },
+  });
+});
+
+app.use('/api/seo-intelligence', seoIntelligenceRouter);
+app.use('/api/seo-site-crawler', seoCrawlerRouter);
+app.use('/api/news-seo', newsSeoRouter);
+app.use('/api/unified-audit', unifiedAuditRouter);
+
+// Phase 1: DB-backed audit routes (loaded from compiled backend)
+try {
+  const { auditRunsRouter } = await import('../backend/dist/routes/auditRunsSimple.js');
+  app.use('/api', auditRunsRouter);
+  console.log('Phase 1 audit routes loaded');
+} catch (err) {
+  console.warn('Phase 1 audit routes not available (run `npm run build:backend` first):', err.message);
+}
+
+// Backward-compatible Supabase-style paths (if a reverse proxy sends these)
+app.use('/functions/v1/seo-intelligence', seoIntelligenceRouter);
+app.use('/functions/v1/seo-site-crawler', seoCrawlerRouter);
+
+// Catch-all for unmatched /api routes — return clear 404 JSON
+app.all('/api/*', (req, res) => {
+  console.warn(`[404] No handler for ${req.method} ${req.url}`);
+  res.status(404).json({ error: `Not found: ${req.method} ${req.url}` });
+});
+
+// --------------- Static files (Vite build output) ---------------
+import { existsSync } from 'node:fs';
+const distPath = join(__dirname, '..', 'dist');
+
+if (existsSync(distPath)) {
+  app.use(express.static(distPath));
+
+  // SPA fallback - serve index.html for all non-API routes
+  app.get('*', (_req, res) => {
+    res.sendFile(join(distPath, 'index.html'));
+  });
+  console.log('Serving static files from:', distPath);
+} else {
+  console.log('No dist/ folder found — run `npm run build` to build the frontend');
+}
+
+// --------------- Start ---------------
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running on http://0.0.0.0:${PORT}`);
+  console.log(`Health check: http://0.0.0.0:${PORT}/health`);
+  console.log(`NODE_ENV: ${process.env.NODE_ENV}`);
+});
