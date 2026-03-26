@@ -22,6 +22,9 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 
+# pg (node-postgres) needs libpq for native bindings
+RUN apk add --no-cache postgresql-client
+
 # Copy only production dependency manifests
 COPY package*.json ./
 
