@@ -14,10 +14,12 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.app.json",
     "typecheck:backend": "tsc --noEmit -p backend/tsconfig.json",
-    "db:migrate": "echo 'Using Supabase migrations now'"
+    "db:migrate": "node scripts/migrate.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.98.0",
+    "pg": "^8.13.3",
+    "@types/pg": "^8.11.11",
     "@types/express": "^5.0.0",
     "@types/node": "^22.13.0",
     "@types/react": "^18.3.5",

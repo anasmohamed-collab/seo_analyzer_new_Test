@@ -1,6 +1,29 @@
 version: "3.8"
 
 services:
+
+  # ── PostgreSQL database ──────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-seo_analyzer}
+      POSTGRES_USER: ${POSTGRES_USER:-seo_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Auto-run schema on first boot (creates tables)
+      - ./supabase/migrations/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-seo_user} -d ${POSTGRES_DB:-seo_analyzer}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── Node.js app ──────────────────────────────────────────────────
   app:
     build:
       context: .
@@ -8,37 +31,31 @@ services:
     ports:
       - "${PORT:-3000}:3000"
     environment:
-      # Server
-      - PORT=3000
-      - NODE_ENV=production
-      # Database — use non-VITE_ names for server-side runtime
-      - SUPABASE_URL=${SUPABASE_URL}
-      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
-      # Keep VITE_ aliases for backward compatibility (both are read by the code)
-      - VITE_SUPABASE_URL=${SUPABASE_URL}
-      - VITE_SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
-      # Scrapling sidecar URL (points to sibling container)
-      - SCRAPLING_SIDECAR_URL=http://scrapling:5000
+      PORT: 3000
+      NODE_ENV: production
+      # PostgreSQL connection string (points to sibling container)
+      DATABASE_URL: postgresql://${POSTGRES_USER:-seo_user}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-seo_analyzer}
+      # Scrapling sidecar
+      SCRAPLING_SIDECAR_URL: http://scrapling:5000
       # Optional: PageSpeed Insights API key
-      - PAGESPEED_API_KEY=${PAGESPEED_API_KEY:-}
+      PAGESPEED_API_KEY: ${PAGESPEED_API_KEY:-}
     depends_on:
+      postgres:
+        condition: service_healthy
       scrapling:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"]
       interval: 30s
       timeout: 5s
-      start_period: 15s
+      start_period: 20s
       retries: 3
 
+  # ── Python Scrapling sidecar ─────────────────────────────────────
   scrapling:
     build:
       context: ./scrapling-sidecar
-    ports:
-      - "${SIDECAR_PORT:-5000}:5000"
-    environment:
-      - SIDECAR_PORT=5000
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
@@ -46,3 +63,6 @@ services:
       timeout: 5s
       start_period: 10s
       retries: 3
+
+volumes:
+  postgres_data:

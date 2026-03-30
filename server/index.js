@@ -14,15 +14,20 @@ const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
 
 // --------------- Database config validation ---------------
-const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY;
+const DATABASE_URL = process.env.DATABASE_URL;
 
-if (!SUPABASE_URL || !SUPABASE_KEY) {
-  console.warn('⚠  DATABASE WARNING: SUPABASE_URL and SUPABASE_ANON_KEY are not set.');
+if (!DATABASE_URL) {
+  console.warn('⚠  DATABASE WARNING: DATABASE_URL is not set.');
   console.warn('   The server will run in IN-MEMORY mode — audit results will not be persisted.');
-  console.warn('   Set SUPABASE_URL + SUPABASE_ANON_KEY (or VITE_SUPABASE_URL + VITE_SUPABASE_ANON_KEY) to enable persistence.');
+  console.warn('   Set DATABASE_URL=postgresql://user:password@host:5432/dbname to enable persistence.');
 } else {
-  console.log('✓  Supabase configured:', SUPABASE_URL);
+  // Show host only — never log credentials
+  try {
+    const u = new URL(DATABASE_URL);
+    console.log(`✓  PostgreSQL configured: ${u.hostname}:${u.port || 5432}${u.pathname}`);
+  } catch {
+    console.log('✓  PostgreSQL DATABASE_URL configured');
+  }
 }
 
 // --------------- Middleware ---------------
@@ -54,12 +59,16 @@ app.get('/health', async (_req, res) => {
 
 // --------------- API routes ---------------
 app.get('/api/health', async (_req, res) => {
-  const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+  const dbUrl = process.env.DATABASE_URL;
+  let dbHost = null;
+  if (dbUrl) {
+    try { dbHost = new URL(dbUrl).hostname; } catch { dbHost = 'configured'; }
+  }
   res.json({
     status: 'ok',
     env: {
-      SUPABASE_CONFIGURED: !!supabaseUrl,
-      SUPABASE_URL: supabaseUrl ? `${supabaseUrl.slice(0, 30)}...` : null,
+      DB_CONFIGURED: !!dbUrl,
+      DB_HOST: dbHost,
       SCRAPLING_SIDECAR_URL: process.env.SCRAPLING_SIDECAR_URL || null,
       NODE_ENV: process.env.NODE_ENV || 'not set',
       PORT: process.env.PORT || 'not set',

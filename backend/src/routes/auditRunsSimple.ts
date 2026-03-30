@@ -1,5 +1,5 @@
 /**
- * Audit routes — in-memory by default, optional Supabase persistence.
+ * Audit routes — in-memory by default, PostgreSQL persistence when DATABASE_URL is set.
  *
  * POST /api/technical-analyzer/run   — run audit (returns results directly or auditRunId)
  * GET  /api/audit-runs/:id/results   — poll results (DB mode only)
@@ -7,7 +7,7 @@
 
 import { Router } from 'express';
 import type { Request, Response } from 'express';
-import { getSupabase } from '../lib/supabase.js';
+import { getDb } from '../lib/db.js';
 import { runSiteChecks } from '../services/checks/siteChecks.js';
 import { runCanonicalCheck, detectPageType, detectPageTypeWithHtml } from '../services/checks/page/canonicalCheck.js';
 import { runStructuredDataCheck } from '../services/checks/page/structuredDataCheck.js';
@@ -40,7 +40,7 @@ function isSafeUrl(raw: string): boolean {
   } catch { return false; }
 }
 
-// ── Page state classification ────────────────────────────────────
+// ── Page state classification ───────────────────────────────────
 
 type PageState = 'OK' | 'CRAWLER_BLOCKED' | 'NOT_FOUND' | 'SERVER_ERROR' | 'FETCH_ERROR';
 
@@ -81,7 +81,6 @@ async function auditSingleUrl(
   const redirectChain: string[] = [];
   const fetchStart = Date.now();
   try {
-    // Follow redirects manually to detect chains
     for (let hop = 0; hop < 6; hop++) {
       const hopRes = await fetch(currentUrl, {
         redirect: 'manual', signal: controller.signal,
@@ -101,23 +100,12 @@ async function auditSingleUrl(
         fetchOk = true;
         xRobotsTag = hopRes.headers.get('x-robots-tag') ?? '';
       } else {
-        // Read the body for diagnostics but do NOT treat error pages as real content
-        try {
-          const body = await hopRes.text();
-          html = body;  // Store for diagnostic reference only
-        } catch { /* body read fail ok */ }
+        try { html = await hopRes.text(); } catch { /* body read fail ok */ }
         xRobotsTag = hopRes.headers.get('x-robots-tag') ?? '';
       }
       break;
     }
   } finally { loadMs = Date.now() - fetchStart; clearTimeout(timer); }
-
-  // ════════════════════════════════════════════════════════════════
-  // CRAWL VALIDATION GATE
-  // Classify page state, but ONLY skip SEO checks when we have no
-  // usable HTML.  Many sites return 403 yet still serve the full
-  // page — we should still analyse that content.
-  // ════════════════════════════════════════════════════════════════
 
   const pageState = classifyPageState(httpStatus, fetchOk);
   const hasUsableHtml = html.length > 500 && /<!doctype|<html|<head|<body/i.test(html);
@@ -129,61 +117,37 @@ async function auditSingleUrl(
       ? (seedType as typeof VALID_TYPES[number])
       : urlOnlyType;
 
-    console.log(`[audit] Crawl gate: ${pageState} (HTTP ${httpStatus}) for ${url} — no usable HTML, skipping SEO checks`);
+    console.log(`[audit] Crawl gate: ${pageState} (HTTP ${httpStatus}) for ${url} — no usable HTML`);
 
     const data: Record<string, unknown> = {
-      pageType,
-      httpStatus,
-      page_state: pageState,
+      pageType, httpStatus, page_state: pageState,
       page_state_message: PAGE_STATE_MESSAGES[pageState],
       redirectChain: redirectChain.length > 0 ? redirectChain : null,
       redirectCount: redirectChain.length,
       finalUrl: finalUrl !== url ? finalUrl : undefined,
-      detection: {
-        urlOnly: urlOnlyType,
-        withHtml: pageType,
-        seedType: seedType ?? null,
-        override: false,
-      },
-      // All check results are null — checks were skipped
-      canonical: null,
-      structuredData: null,
-      contentMeta: null,
-      pagination: null,
-      performance: null,
+      detection: { urlOnly: urlOnlyType, withHtml: pageType, seedType: seedType ?? null, override: false },
+      canonical: null, structuredData: null, contentMeta: null, pagination: null, performance: null,
       checksSkipped: true,
       checksSkippedReason: `${PAGE_STATE_MESSAGES[pageState]} (HTTP ${httpStatus})`,
     };
-
     return {
-      url,
-      data,
-      page_state: pageState,
+      url, data, page_state: pageState,
       status: pageState === 'CRAWLER_BLOCKED' ? 'WARN' : 'FAIL',
       error: `${PAGE_STATE_MESSAGES[pageState]} (HTTP ${httpStatus})`,
       recommendations: [PAGE_STATE_MESSAGES[pageState]],
     };
   }
 
-  // If we got here with a non-OK state but usable HTML, log it and continue with checks
   if (pageState !== 'OK' && hasUsableHtml) {
-    console.log(`[audit] Crawl gate: ${pageState} (HTTP ${httpStatus}) for ${url} — usable HTML found (${html.length} bytes), running checks anyway`);
+    console.log(`[audit] Crawl gate: ${pageState} (HTTP ${httpStatus}) for ${url} — usable HTML found, running checks anyway`);
   }
 
-  // ════════════════════════════════════════════════════════════════
-  // Proceed with full SEO audit (page OK or usable HTML despite non-200)
-  // ════════════════════════════════════════════════════════════════
-
-  // Use the final URL after redirects for detection and canonical checks
   const finalUrl = redirectChain.length > 0 ? currentUrl : url;
-
-  // Prefer the explicit seed type if it's a known PageType, otherwise auto-detect
   const urlOnlyType = detectPageType(finalUrl);
   const pageType = (seedType && (VALID_TYPES as readonly string[]).includes(seedType))
     ? (seedType as typeof VALID_TYPES[number])
     : detectPageTypeWithHtml(finalUrl, html);
 
-  // Run checks with error logging instead of silent swallowing
   const checkErrors: string[] = [];
   let canonical = null;
   try { canonical = runCanonicalCheck(html, finalUrl, pageType); } catch (err) {
@@ -213,16 +177,12 @@ async function auditSingleUrl(
 
   const toJson = (v: unknown) => JSON.parse(JSON.stringify(v));
   const data: Record<string, unknown> = {
-    pageType,
-    httpStatus,
-    page_state: pageState,
+    pageType, httpStatus, page_state: pageState,
     redirectChain: redirectChain.length > 0 ? redirectChain : null,
     redirectCount: redirectChain.length,
     finalUrl: finalUrl !== url ? finalUrl : undefined,
     detection: {
-      urlOnly: urlOnlyType,
-      withHtml: pageType,
-      seedType: seedType ?? null,
+      urlOnly: urlOnlyType, withHtml: pageType, seedType: seedType ?? null,
       override: seedType ? (seedType !== urlOnlyType) : (pageType !== urlOnlyType),
     },
     canonical: canonical ? toJson(canonical) : null,
@@ -234,11 +194,8 @@ async function auditSingleUrl(
   };
   const scored = scoreResult(data as Parameters<typeof scoreResult>[0]);
 
-  // Compute layered quality scores for transparency
   let layeredScore = null;
-  try {
-    layeredScore = computeLayeredScore(data as unknown as AuditData);
-  } catch (err) {
+  try { layeredScore = computeLayeredScore(data as unknown as AuditData); } catch (err) {
     console.error(`[audit] layeredScore failed for ${url}:`, err);
   }
 
@@ -274,17 +231,14 @@ auditRunsRouter.post('/technical-analyzer/run', async (req: Request, res: Respon
       return;
     }
 
-    // Extract domain
     let domain: string;
     try {
-      const u = new URL(body.homeUrl);
-      domain = u.hostname;
+      domain = new URL(body.homeUrl).hostname;
     } catch {
       res.status(400).json({ error: 'Invalid homeUrl' });
       return;
     }
 
-    // Collect all seed URLs
     const urlMap: Record<string, string> = { home: body.homeUrl, article: body.articleUrl };
     if (body.optionalUrls) {
       for (const [type, url] of Object.entries(body.optionalUrls)) {
@@ -294,36 +248,36 @@ auditRunsRouter.post('/technical-analyzer/run', async (req: Request, res: Respon
       }
     }
 
-    // Check if Supabase is available
-    const supabase = getSupabase();
+    const db = getDb();
 
-    if (supabase) {
-      // ── DB mode: persist and run in background ──
+    if (db) {
+      // ── DB mode ──────────────────────────────────────────────
       try {
         // Upsert site
-        let site;
-        const { data: existingSite } = await supabase
-          .from('sites').select('*').eq('domain', domain).maybeSingle();
+        const siteRes = await db.query<{ id: string; domain: string }>(
+          `INSERT INTO sites (domain, updated_at)
+           VALUES ($1, NOW())
+           ON CONFLICT (domain) DO UPDATE SET updated_at = NOW()
+           RETURNING *`,
+          [domain],
+        );
+        const site = siteRes.rows[0];
 
-        if (existingSite) {
-          site = existingSite;
-        } else {
-          const { data: newSite, error: createError } = await supabase
-            .from('sites').insert({ domain, updated_at: new Date().toISOString() }).select().single();
-          if (createError) throw createError;
-          site = newSite;
+        // Replace seed URLs
+        await db.query('DELETE FROM seed_urls WHERE site_id = $1', [site.id]);
+        for (const [type, url] of Object.entries(urlMap)) {
+          await db.query(
+            'INSERT INTO seed_urls (site_id, url, page_type) VALUES ($1, $2, $3)',
+            [site.id, url, type],
+          );
         }
 
-        // Replace seed URLs (store type alongside URL for background audit)
-        await supabase.from('seed_urls').delete().eq('site_id', site.id);
-        await supabase.from('seed_urls').insert(
-          Object.entries(urlMap).map(([type, url]) => ({ site_id: site.id, url, page_type: type }))
-        );
-
         // Create audit run
-        const { data: auditRun, error: runError } = await supabase
-          .from('audit_runs').insert({ site_id: site.id, status: 'RUNNING' }).select().single();
-        if (runError) throw runError;
+        const runRes = await db.query<{ id: string }>(
+          `INSERT INTO audit_runs (site_id, status) VALUES ($1, 'RUNNING') RETURNING *`,
+          [site.id],
+        );
+        const auditRun = runRes.rows[0];
 
         // Return immediately
         res.json({ siteId: site.id, auditRunId: auditRun.id });
@@ -332,7 +286,7 @@ auditRunsRouter.post('/technical-analyzer/run', async (req: Request, res: Respon
         (async () => {
           try {
             let siteChecks: unknown = null;
-            try { siteChecks = await runSiteChecks(domain); } catch (err: unknown) {
+            try { siteChecks = await runSiteChecks(domain); } catch (err) {
               siteChecks = {
                 robots: { status: 'ERROR', httpStatus: 0, sitemapsFound: [],
                   notes: [`Failed: ${err instanceof Error ? err.message : 'unknown'}`] },
@@ -341,57 +295,68 @@ auditRunsRouter.post('/technical-analyzer/run', async (req: Request, res: Respon
               };
             }
 
-            await supabase.from('audit_runs').update({ site_checks: siteChecks }).eq('id', auditRun.id);
+            await db.query(
+              'UPDATE audit_runs SET site_checks = $1 WHERE id = $2',
+              [JSON.stringify(siteChecks), auditRun.id],
+            );
 
-            const { data: seedUrls } = await supabase.from('seed_urls').select('*').eq('site_id', site.id);
+            const seedRes = await db.query<{ url: string; page_type: string | null }>(
+              'SELECT url, page_type FROM seed_urls WHERE site_id = $1',
+              [site.id],
+            );
             const seenTitles = new Set<string>();
 
-            for (const seed of seedUrls || []) {
+            for (const seed of seedRes.rows) {
               try {
-                const seedPageType = (seed as Record<string, unknown>).page_type as string | undefined;
-                const result = await auditSingleUrl(seed.url, seenTitles, seedPageType);
-                await supabase.from('audit_results').insert({
-                  audit_run_id: auditRun.id, url: seed.url,
-                  data: (result.data ?? { error: result.error }) as Record<string, unknown>,
-                  status: (result.status as string) ?? 'FAIL',
-                  recommendations: Array.isArray(result.recommendations) && result.recommendations.length > 0
-                    ? result.recommendations : null,
-                });
-              } catch (err: unknown) {
-                await supabase.from('audit_results').insert({
-                  audit_run_id: auditRun.id, url: seed.url,
-                  data: { error: err instanceof Error ? err.message : 'unknown' },
-                  status: 'FAIL', recommendations: ['Audit failed for this URL'],
-                });
+                const result = await auditSingleUrl(seed.url, seenTitles, seed.page_type ?? undefined);
+                const resultData = (result.data ?? { error: result.error }) as Record<string, unknown>;
+                const resultStatus = (result.status as string) ?? 'FAIL';
+                const resultRecs = Array.isArray(result.recommendations) && result.recommendations.length > 0
+                  ? result.recommendations : null;
+
+                await db.query(
+                  `INSERT INTO audit_results (audit_run_id, url, data, status, recommendations)
+                   VALUES ($1, $2, $3, $4, $5)`,
+                  [auditRun.id, seed.url, JSON.stringify(resultData), resultStatus,
+                    resultRecs ? JSON.stringify(resultRecs) : null],
+                );
+              } catch (err) {
+                await db.query(
+                  `INSERT INTO audit_results (audit_run_id, url, data, status, recommendations)
+                   VALUES ($1, $2, $3, $4, $5)`,
+                  [auditRun.id, seed.url,
+                    JSON.stringify({ error: err instanceof Error ? err.message : 'unknown' }),
+                    'FAIL', JSON.stringify(['Audit failed for this URL'])],
+                );
               }
             }
 
-            await supabase.from('audit_runs')
-              .update({ status: 'COMPLETED', finished_at: new Date().toISOString() })
-              .eq('id', auditRun.id);
+            await db.query(
+              `UPDATE audit_runs SET status = 'COMPLETED', finished_at = NOW() WHERE id = $1`,
+              [auditRun.id],
+            );
           } catch (err) {
-            console.error('Background audit error:', err);
-            await supabase.from('audit_runs')
-              .update({ status: 'FAILED', finished_at: new Date().toISOString() })
-              .eq('id', auditRun.id).then(() => {}, () => {});
+            console.error('[audit] Background audit error:', err);
+            await db.query(
+              `UPDATE audit_runs SET status = 'FAILED', finished_at = NOW() WHERE id = $1`,
+              [auditRun.id],
+            ).catch(() => {});
           }
         })();
         return;
+
       } catch (dbErr) {
-        // DB failed — fall through to in-memory mode
-        console.warn('[audit] Supabase call failed, falling back to in-memory:', dbErr);
+        console.warn('[audit] DB call failed, falling back to in-memory:', dbErr);
       }
     }
 
-    // ── In-memory mode: run synchronously, return results directly ──
+    // ── In-memory mode ───────────────────────────────────────────
     console.log('[audit] Running in-memory mode for', domain);
 
-    // Site-level checks
     let siteChecks: Record<string, unknown> | null = null;
     try {
-      const checks = await runSiteChecks(domain);
-      siteChecks = JSON.parse(JSON.stringify(checks));
-    } catch (err: unknown) {
+      siteChecks = JSON.parse(JSON.stringify(await runSiteChecks(domain)));
+    } catch (err) {
       siteChecks = {
         robots: { status: 'ERROR', httpStatus: 0, sitemapsFound: [],
           notes: [`Site checks failed: ${err instanceof Error ? err.message : 'unknown'}`] },
@@ -400,27 +365,21 @@ auditRunsRouter.post('/technical-analyzer/run', async (req: Request, res: Respon
       };
     }
 
-    // Per-URL audits
     const seenTitles = new Set<string>();
     const results: Record<string, unknown>[] = [];
 
     for (const [type, url] of Object.entries(urlMap)) {
       try {
-        const result = await auditSingleUrl(url, seenTitles, type);
-        results.push({ ...result, seedType: type });
-      } catch (err: unknown) {
-        results.push({
-          url, seedType: type, status: 'FAIL',
+        results.push({ ...await auditSingleUrl(url, seenTitles, type), seedType: type });
+      } catch (err) {
+        results.push({ url, seedType: type, status: 'FAIL',
           error: err instanceof Error ? err.message : 'unknown',
-          recommendations: ['Audit failed for this URL'],
-        });
+          recommendations: ['Audit failed for this URL'] });
       }
     }
 
-    // Compute site-level recommendations
     const siteRecs = scoreSiteChecks(siteChecks as Parameters<typeof scoreSiteChecks>[0]);
 
-    // Group results by pageType
     const grouped: Record<string, unknown[]> = {};
     for (const r of results) {
       const data = r.data as Record<string, unknown> | null;
@@ -429,19 +388,12 @@ auditRunsRouter.post('/technical-analyzer/run', async (req: Request, res: Respon
       grouped[pageType].push(r);
     }
 
-    res.json({
-      mode: 'in-memory',
-      status: 'COMPLETED',
-      domain,
-      siteChecks,
-      siteRecommendations: siteRecs,
-      resultsByType: grouped,
-      results,
-    });
-  } catch (err: unknown) {
-    console.error('POST technical-analyzer/run error:', err);
-    const message = err instanceof Error ? err.message : 'Unknown error';
-    res.status(500).json({ error: 'Internal server error', detail: message });
+    res.json({ mode: 'in-memory', status: 'COMPLETED', domain, siteChecks,
+      siteRecommendations: siteRecs, resultsByType: grouped, results });
+
+  } catch (err) {
+    console.error('[audit] POST technical-analyzer/run error:', err);
+    res.status(500).json({ error: 'Internal server error', detail: err instanceof Error ? err.message : 'Unknown' });
   }
 });
 
@@ -449,30 +401,29 @@ auditRunsRouter.post('/technical-analyzer/run', async (req: Request, res: Respon
 
 auditRunsRouter.get('/audit-runs/:id/results', async (req: Request, res: Response) => {
   try {
-    const supabase = getSupabase();
-    if (!supabase) {
+    const db = getDb();
+    if (!db) {
       res.status(503).json({ error: 'Database not configured. Results were returned directly in the run response.' });
       return;
     }
 
     const id = req.params['id'] as string;
 
-    const { data: run, error: runError } = await supabase
-      .from('audit_runs').select('*').eq('id', id).maybeSingle();
-
-    if (runError) throw runError;
+    const runRes = await db.query('SELECT * FROM audit_runs WHERE id = $1', [id]);
+    const run = runRes.rows[0] ?? null;
     if (!run) {
       res.status(404).json({ error: 'AuditRun not found' });
       return;
     }
 
-    const { data: results, error: resultsError } = await supabase
-      .from('audit_results').select('*').eq('audit_run_id', id);
-
-    if (resultsError) throw resultsError;
+    const resultsRes = await db.query(
+      'SELECT * FROM audit_results WHERE audit_run_id = $1 ORDER BY created_at ASC',
+      [id],
+    );
+    const results = resultsRes.rows;
 
     const grouped: Record<string, typeof results> = {};
-    for (const r of results || []) {
+    for (const r of results) {
       const data = r.data as Record<string, unknown> | null;
       const pageType = (data?.pageType as string) ?? 'unknown';
       if (!grouped[pageType]) grouped[pageType] = [];
@@ -482,15 +433,14 @@ auditRunsRouter.get('/audit-runs/:id/results', async (req: Request, res: Respons
     const siteRecs = scoreSiteChecks(run.site_checks as Parameters<typeof scoreSiteChecks>[0]);
 
     res.json({
-      id: run.id,
-      status: run.status,
+      id: run.id, status: run.status,
       siteChecks: run.site_checks,
       siteRecommendations: siteRecs,
       resultsByType: grouped,
-      results: results || [],
+      results,
     });
-  } catch (err: unknown) {
-    console.error('GET results error:', err);
+  } catch (err) {
+    console.error('[audit] GET results error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
