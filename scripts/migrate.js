@@ -1,17 +1,18 @@
 /**
  * SEO Analyzer — Database Migration Runner
  *
- * Reads DATABASE_URL from environment and runs supabase/migrations/init.sql.
- * Safe to run multiple times — all SQL uses IF NOT EXISTS.
+ * Discovers and runs ALL .sql files in supabase/migrations/ in alphabetical
+ * order. Tracks applied files in a `schema_migrations` table — idempotent,
+ * safe to run multiple times.
  *
  * Usage:
- *   node --env-file=.env scripts/migrate.js           ← run migration
+ *   node --env-file=.env scripts/migrate.js           ← run pending migrations
  *   node --env-file=.env scripts/migrate.js --check   ← test connection + show tables
  *
  *   DATABASE_URL=postgresql://user:pass@host:5432/db node scripts/migrate.js
  */
 
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import pg from 'pg';
@@ -44,17 +45,23 @@ if (!DATABASE_URL) {
   process.exit(1);
 }
 
-// ── Locate SQL file ───────────────────────────────────────────────
+// ── Discover migration files ──────────────────────────────────────
 
-const sqlPath = join(__dirname, '..', 'supabase', 'migrations', 'init.sql');
+const migrationsDir = join(__dirname, '..', 'supabase', 'migrations');
 
-if (!existsSync(sqlPath)) {
-  err(`Migration file not found: ${sqlPath}`);
-  err('Make sure you are running this from the project root.');
+if (!existsSync(migrationsDir)) {
+  err(`Migrations directory not found: ${migrationsDir}`);
   process.exit(1);
 }
 
-const sql = readFileSync(sqlPath, 'utf8');
+const migrationFiles = readdirSync(migrationsDir)
+  .filter(f => f.endsWith('.sql'))
+  .sort(); // alphabetical = chronological for timestamped filenames
+
+if (migrationFiles.length === 0) {
+  err('No .sql files found in supabase/migrations/');
+  process.exit(1);
+}
 
 // ── Connect ───────────────────────────────────────────────────────
 
@@ -79,7 +86,7 @@ log('🔌', `Connecting to: ${dbHost}`);
 
 try {
   await client.connect();
-  ok(`Connected successfully`);
+  ok('Connected successfully');
 
   // ── Check mode — show existing tables and exit ────────────────
   if (CHECK_ONLY) {
@@ -102,12 +109,12 @@ try {
       warn('No tables found — run without --check to create them.');
     } else {
       console.log('');
-      console.log('  Table              Columns   Size');
-      console.log('  ─────────────────────────────────────');
+      console.log('  Table                Columns   Size');
+      console.log('  ───────────────────────────────────────');
       for (const row of tablesRes.rows) {
         const exists = EXPECTED.includes(row.table_name);
         const icon = exists ? '✅' : '  ';
-        console.log(`  ${icon} ${row.table_name.padEnd(18)} ${String(row.columns).padEnd(9)} ${row.size}`);
+        console.log(`  ${icon} ${row.table_name.padEnd(20)} ${String(row.columns).padEnd(9)} ${row.size}`);
       }
       console.log('');
 
@@ -125,24 +132,85 @@ try {
     for (const table of EXPECTED) {
       try {
         const r = await client.query(`SELECT COUNT(*) FROM "${table}"`);
-        console.log(`  ${table.padEnd(20)} ${r.rows[0].count} rows`);
+        console.log(`  ${table.padEnd(22)} ${r.rows[0].count} rows`);
       } catch {
-        console.log(`  ${table.padEnd(20)} (table missing)`);
+        console.log(`  ${table.padEnd(22)} (table missing)`);
       }
     }
+
+    // Applied migrations
+    section('Applied Migrations');
+    try {
+      const migRes = await client.query(
+        `SELECT filename, applied_at FROM schema_migrations ORDER BY filename`,
+      );
+      if (migRes.rows.length === 0) {
+        warn('schema_migrations table empty — run without --check to apply migrations.');
+      } else {
+        for (const row of migRes.rows) {
+          const ts = new Date(row.applied_at).toISOString().slice(0, 19).replace('T', ' ');
+          console.log(`  ✅ ${row.filename.padEnd(55)} ${ts}`);
+        }
+      }
+    } catch {
+      warn('schema_migrations table not found — run without --check first.');
+    }
+
     console.log('');
     process.exit(0);
   }
 
   // ── Migration mode ────────────────────────────────────────────
-  section('Running Migration');
-  log('📄', `SQL file: ${sqlPath}`);
-  log('📝', `SQL size: ${sql.length} bytes`);
-  console.log('');
 
-  await client.query(sql);
+  // Ensure tracking table exists (safe to run each time)
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      filename   TEXT        PRIMARY KEY,
+      applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
 
-  // Verify tables were created
+  // Load already-applied filenames
+  const appliedRes = await client.query(
+    `SELECT filename FROM schema_migrations ORDER BY filename`,
+  );
+  const applied = new Set(appliedRes.rows.map(r => r.filename));
+
+  const pending = migrationFiles.filter(f => !applied.has(f));
+
+  section('Running Migrations');
+  log('📁', `Migrations dir: ${migrationsDir}`);
+  log('📋', `Total files:    ${migrationFiles.length}  (${applied.size} already applied, ${pending.length} pending)`);
+
+  if (pending.length === 0) {
+    console.log('');
+    ok('Nothing to do — all migrations already applied.');
+  } else {
+    console.log('');
+    for (const filename of pending) {
+      const filePath = join(migrationsDir, filename);
+      const sql = readFileSync(filePath, 'utf8');
+
+      log('📄', `Applying: ${filename}  (${sql.length} bytes)`);
+
+      try {
+        await client.query('BEGIN');
+        await client.query(sql);
+        await client.query(
+          `INSERT INTO schema_migrations (filename) VALUES ($1) ON CONFLICT DO NOTHING`,
+          [filename],
+        );
+        await client.query('COMMIT');
+        ok(`Applied: ${filename}`);
+      } catch (applyErr) {
+        await client.query('ROLLBACK');
+        err(`Failed to apply ${filename}: ${applyErr.message}`);
+        throw applyErr;
+      }
+    }
+  }
+
+  // ── Verification ──────────────────────────────────────────────
   const verifyRes = await client.query(`
     SELECT table_name
     FROM information_schema.tables
@@ -162,7 +230,23 @@ try {
     }
   }
 
-  // Show indexes
+  // Columns added by project layer
+  const colRes = await client.query(`
+    SELECT column_name FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'sites'
+    ORDER BY ordinal_position;
+  `);
+  const cols = colRes.rows.map(r => r.column_name);
+  const projectCols = ['project_name', 'website_url', 'last_audit_at'];
+  for (const col of projectCols) {
+    if (cols.includes(col)) {
+      ok(`sites.${col} column exists`);
+    } else {
+      warn(`sites.${col} column missing — check migration 20260407000000_add_project_layer.sql`);
+    }
+  }
+
+  // Indexes
   const indexRes = await client.query(`
     SELECT indexname
     FROM pg_indexes
@@ -172,18 +256,19 @@ try {
 
   if (indexRes.rows.length > 0) {
     console.log('');
-    log('🗂️ ', `Indexes created: ${indexRes.rows.length}`);
+    log('🗂️ ', `Indexes: ${indexRes.rows.length}`);
     for (const row of indexRes.rows) {
       console.log(`     ✓ ${row.indexname}`);
     }
   }
 
   console.log('');
-  ok('Migration complete — database is ready.');
+  ok('All migrations applied — database is ready.');
   console.log('');
   console.log('  Next steps:');
-  console.log('  1. npm run dev          ← start the app');
-  console.log('  2. open http://localhost:5173');
+  console.log('  1. npm run build:backend   ← compile TypeScript');
+  console.log('  2. npm run dev             ← start the app');
+  console.log('  3. open http://localhost:5173');
   console.log('');
 
 } catch (error) {
