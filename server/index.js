@@ -90,6 +90,15 @@ try {
   console.warn('Phase 1 audit routes not available (run `npm run build:backend` first):', err.message);
 }
 
+// Project management & audit history routes
+try {
+  const { projectsRouter } = await import('../backend/dist/routes/projects.js');
+  app.use('/api', projectsRouter);
+  console.log('Project management routes loaded');
+} catch (err) {
+  console.warn('Project management routes not available (run `npm run build:backend` first):', err.message);
+}
+
 // Backward-compatible Supabase-style paths (if a reverse proxy sends these)
 app.use('/functions/v1/seo-intelligence', seoIntelligenceRouter);
 app.use('/functions/v1/seo-site-crawler', seoCrawlerRouter);
