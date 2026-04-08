@@ -361,11 +361,13 @@ export function scoreResult(data: CheckData): ScoringResult {
       });
     }
     if (!data.contentMeta.h1Ok) {
-      escalate('WARN');
+      escalate('FAIL');
       recs.push({
-        priority: 'P1', area: 'meta',
-        message: 'H1 heading issue (missing or multiple)',
-        fixHint: 'Ensure the page has exactly one H1 heading for article/section pages.',
+        priority: 'P0', area: 'meta',
+        message: data.contentMeta.h1Count === 0
+          ? 'Missing H1 heading — every page must have exactly one H1'
+          : `Multiple H1 headings found (${data.contentMeta.h1Count}) — use exactly one H1 per page`,
+        fixHint: 'Each page must have exactly one <h1> tag. The H1 should match the main topic of the page and differ from the <title> tag.',
       });
     }
     if (data.contentMeta.duplicateTitle) {
@@ -533,6 +535,7 @@ interface SiteChecksData {
   robots?: {
     status: string;
     notes?: string[];
+    sitemapsFound?: string[];
     rules?: { userAgent: string; disallow: string[]; allow: string[] }[];
   };
   sitemap?: {
@@ -611,6 +614,20 @@ export function scoreSiteChecks(data: SiteChecksData | null): Recommendation[] {
           // Already covered above
         }
       }
+    }
+
+    // Sitemap not declared in robots.txt — add recommendation when robots.txt
+    // is accessible (FOUND) but has no Sitemap: directives.
+    if (
+      data.robots.status === 'FOUND' &&
+      Array.isArray(data.robots.sitemapsFound) &&
+      data.robots.sitemapsFound.length === 0
+    ) {
+      recs.push({
+        priority: 'P1', area: 'sitemap',
+        message: 'Sitemap URL not declared in robots.txt',
+        fixHint: 'Add a Sitemap: directive to robots.txt (e.g. Sitemap: https://yourdomain.com/sitemap.xml). This helps all search engines discover your sitemap regardless of the crawl path.',
+      });
     }
   }
 
