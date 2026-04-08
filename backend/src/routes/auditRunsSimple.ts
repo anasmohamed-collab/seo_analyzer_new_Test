@@ -194,7 +194,13 @@ async function auditSingleUrl(
   } finally { loadMs = Date.now() - fetchStart; clearTimeout(timer); }
 
   const pageState = classifyPageState(httpStatus, fetchOk);
-  const hasUsableHtml = html.length > 500 && /<!doctype|<html|<head|<body/i.test(html);
+
+  // IMPORTANT: Only trust HTML when we have a genuine 2xx response (fetchOk=true).
+  // A 403 Cloudflare challenge page contains real-looking HTML (>500 chars, has <html>)
+  // but it is NOT the real page content. Running SEO checks on it produces completely
+  // wrong results (no canonical, no H1, wrong structured data, etc.).
+  // fetchOk is only set to true in Phase 2/3 when we actually get a 200-range response.
+  const hasUsableHtml = fetchOk && html.length > 500 && /<!doctype|<html|<head|<body/i.test(html);
 
   if (pageState !== 'OK' && !hasUsableHtml) {
     const finalUrl = redirectChain.length > 0 ? currentUrl : url;
