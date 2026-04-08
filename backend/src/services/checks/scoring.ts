@@ -546,6 +546,16 @@ interface SiteChecksData {
       emptyLocs: number;
     };
   };
+  newsSitemap?: {
+    status: string;           // 'FOUND' | 'BLOCKED' | 'NOT_FOUND' | 'ERROR'
+    url: string | null;
+    hasNewsNamespace: boolean;
+    hasPublicationDate: boolean;
+    hasNewsTitle: boolean;
+    hasPublicationTag: boolean;
+    urlCount: number;
+    notes?: string[];
+  };
 }
 
 export function scoreSiteChecks(data: SiteChecksData | null): Recommendation[] {
@@ -692,6 +702,61 @@ export function scoreSiteChecks(data: SiteChecksData | null): Recommendation[] {
             fixHint: 'Ensure sitemap child files contain valid <url> entries.',
           });
         }
+      }
+    }
+  }
+
+  // ── News sitemap scoring ──────────────────────────────────────
+  if (data.newsSitemap) {
+    const ns = data.newsSitemap;
+
+    if (ns.status === 'NOT_FOUND') {
+      recs.push({
+        priority: 'P1', area: 'news',
+        message: 'No Google News sitemap found at any standard path',
+        fixHint: 'Create /news-sitemap.xml with xmlns:news namespace, <news:publication>, <news:publication_date>, and <news:title> for every article. Submit it in Google Search Console.',
+      });
+    } else if (ns.status === 'BLOCKED') {
+      recs.push({
+        priority: 'P1', area: 'news',
+        message: `News sitemap access blocked (HTTP 401/403) at ${ns.url ?? 'unknown path'}`,
+        fixHint: 'Ensure the news sitemap URL is publicly accessible without authentication. Both browsers and Googlebot must be able to fetch it.',
+      });
+    } else if (ns.status === 'FOUND') {
+      if (!ns.hasNewsNamespace) {
+        recs.push({
+          priority: 'P1', area: 'news',
+          message: 'News sitemap found but missing Google News XML namespace',
+          fixHint: 'Add xmlns:news="http://www.google.com/schemas/sitemap-news/0.9" to the <urlset> root element.',
+        });
+      }
+      if (!ns.hasPublicationDate) {
+        recs.push({
+          priority: 'P1', area: 'news',
+          message: 'News sitemap missing <news:publication_date> — required for Google News freshness signals',
+          fixHint: 'Add <news:publication_date> in W3C format (e.g. 2024-01-15T12:00:00Z) to every <url> entry.',
+        });
+      }
+      if (!ns.hasNewsTitle) {
+        recs.push({
+          priority: 'P1', area: 'news',
+          message: 'News sitemap missing <news:title> — required in every entry',
+          fixHint: 'Add <news:title> matching the article headline inside each <news:news> block.',
+        });
+      }
+      if (!ns.hasPublicationTag) {
+        recs.push({
+          priority: 'P1', area: 'news',
+          message: 'News sitemap missing <news:publication> block — required for publisher identification',
+          fixHint: 'Add <news:publication><news:name>Your Publication</news:name><news:language>ar</news:language></news:publication> inside each <news:news> block.',
+        });
+      }
+      if (ns.urlCount === 0) {
+        recs.push({
+          priority: 'P1', area: 'news',
+          message: 'News sitemap is empty (0 <url> entries)',
+          fixHint: 'Populate the news sitemap with articles published in the last 48 hours. Remove articles older than 48 hours.',
+        });
       }
     }
   }
