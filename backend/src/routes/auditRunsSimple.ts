@@ -20,9 +20,30 @@ import type { AuditData } from '../services/checks/scoring/types.js';
 
 export const auditRunsRouter = Router();
 
-const PAGE_TIMEOUT = 25_000;
+const PAGE_TIMEOUT = 30_000; // extended to allow for UA retries
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const UA_GOOGLEBOT = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
 const VALID_TYPES = ['home', 'section', 'article', 'search', 'tag', 'author', 'video_article'] as const;
+
+// Full browser-like headers — bare UA requests are caught by Cloudflare and most WAFs
+const BROWSER_HEADERS = {
+  'User-Agent':     UA,
+  'Accept':         'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Accept-Language':'en-US,en;q=0.9,ar;q=0.8',
+  'Accept-Encoding':'gzip, deflate, br',
+  'Cache-Control':  'no-cache',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Upgrade-Insecure-Requests': '1',
+};
+
+const GOOGLEBOT_HEADERS = {
+  'User-Agent':     UA_GOOGLEBOT,
+  'Accept':         'text/html,application/xhtml+xml,*/*',
+  'Accept-Language':'en-US,en;q=0.5',
+  'Accept-Encoding':'gzip, deflate, br',
+};
 
 // ── SSRF guard ──────────────────────────────────────────────────
 
@@ -80,13 +101,17 @@ async function auditSingleUrl(
   let currentUrl = url;
   const redirectChain: string[] = [];
   const fetchStart = Date.now();
+
   try {
+    // ── Phase 1: Browser UA + full headers, redirect: manual (to track chain) ──
     for (let hop = 0; hop < 6; hop++) {
       const hopRes = await fetch(currentUrl, {
-        redirect: 'manual', signal: controller.signal,
-        headers: { 'User-Agent': UA, Accept: 'text/html,application/xhtml+xml' },
+        redirect: 'manual',
+        signal: controller.signal,
+        headers: BROWSER_HEADERS,
       });
       httpStatus = hopRes.status;
+
       if (httpStatus >= 300 && httpStatus < 400) {
         const location = hopRes.headers.get('location');
         if (location) {
@@ -95,6 +120,7 @@ async function auditSingleUrl(
           continue;
         }
       }
+
       if (hopRes.ok) {
         html = await hopRes.text();
         fetchOk = true;
@@ -105,10 +131,76 @@ async function auditSingleUrl(
       }
       break;
     }
+
+    // ── Phase 2: 403/401 → retry with Googlebot UA ────────────────────────────
+    // Many news sites (and Cloudflare configs) whitelist Googlebot but block
+    // generic browser requests from datacenter IPs.
+    if ((httpStatus === 401 || httpStatus === 403) && !fetchOk) {
+      console.log(`[audit] Phase 2: Googlebot-UA retry for ${currentUrl} (was HTTP ${httpStatus})`);
+      try {
+        const gbRes = await fetch(currentUrl, {
+          redirect: 'follow',
+          signal: controller.signal,
+          headers: GOOGLEBOT_HEADERS,
+        });
+        if (gbRes.ok) {
+          html = await gbRes.text();
+          httpStatus = gbRes.status;
+          fetchOk = true;
+          xRobotsTag = gbRes.headers.get('x-robots-tag') ?? '';
+          console.log(`[audit] Phase 2 succeeded: HTTP ${httpStatus} for ${currentUrl}`);
+        } else {
+          httpStatus = gbRes.status;
+          try { html = await gbRes.text(); } catch {}
+        }
+      } catch (err: unknown) {
+        console.log(`[audit] Phase 2 failed: ${err instanceof Error ? err.message : 'unknown'}`);
+      }
+    }
+
+    // ── Phase 3: Still blocked → try Scrapling sidecar (headless browser) ─────
+    // StealthyFetcher passes TLS fingerprint + JS challenges that native fetch
+    // cannot. Only runs when SCRAPLING_SIDECAR_URL is configured.
+    if ((httpStatus === 401 || httpStatus === 403) && !fetchOk) {
+      const sidecarBase = process.env.SCRAPLING_SIDECAR_URL?.replace(/\/+$/, '');
+      if (sidecarBase) {
+        console.log(`[audit] Phase 3: Scrapling sidecar for ${currentUrl}`);
+        try {
+          const sidecarRes = await fetch(`${sidecarBase}/fetch`, {
+            method: 'POST',
+            signal: controller.signal,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: currentUrl, timeout: 20 }),
+          });
+          if (sidecarRes.ok) {
+            const sidecarData = await sidecarRes.json() as {
+              html?: string; status?: number;
+              headers?: Record<string, string>;
+            };
+            if (sidecarData.html && sidecarData.status && sidecarData.status < 300) {
+              html = sidecarData.html;
+              httpStatus = sidecarData.status;
+              fetchOk = true;
+              xRobotsTag = sidecarData.headers?.['x-robots-tag'] ?? '';
+              console.log(`[audit] Phase 3 succeeded: HTTP ${httpStatus} via Scrapling`);
+            }
+          }
+        } catch (err: unknown) {
+          console.log(`[audit] Phase 3 failed: ${err instanceof Error ? err.message : 'unknown'}`);
+        }
+      }
+    }
+
   } finally { loadMs = Date.now() - fetchStart; clearTimeout(timer); }
 
   const pageState = classifyPageState(httpStatus, fetchOk);
-  const hasUsableHtml = html.length > 500 && /<!doctype|<html|<head|<body/i.test(html);
+
+  // IMPORTANT: Only trust HTML when we have a genuine 2xx response (fetchOk=true).
+  // A 403 Cloudflare challenge page contains real-looking HTML (>500 chars, has <html>)
+  // but it is NOT the real page content. Running SEO checks on it produces completely
+  // wrong results (no canonical, no H1, wrong structured data, etc.).
+  // fetchOk is only set to true in Phase 2/3 when we actually get a 200-range response.
+  const hasUsableHtml = fetchOk && html.length > 500 && /<!doctype|<html|<head|<body/i.test(html);
 
   if (pageState !== 'OK' && !hasUsableHtml) {
     const finalUrl = redirectChain.length > 0 ? currentUrl : url;
