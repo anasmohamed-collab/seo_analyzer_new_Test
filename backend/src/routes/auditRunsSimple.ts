@@ -17,33 +17,13 @@ import { runPerformanceCheck } from '../services/checks/page/performanceCheck.js
 import { scoreResult, scoreSiteChecks } from '../services/checks/scoring.js';
 import { computeLayeredScore } from '../services/checks/scoring/orchestrator.js';
 import type { AuditData } from '../services/checks/scoring/types.js';
+import { runFetchEngine } from '../services/fetch/fetchEngine.js';
+import type { BlockedConfidence } from '../services/fetch/fetchEngine.js';
 
 export const auditRunsRouter = Router();
 
-const PAGE_TIMEOUT = 30_000; // extended to allow for UA retries
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-const UA_GOOGLEBOT = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
+const PAGE_TIMEOUT = 30_000;
 const VALID_TYPES = ['home', 'section', 'article', 'search', 'tag', 'author', 'video_article'] as const;
-
-// Full browser-like headers — bare UA requests are caught by Cloudflare and most WAFs
-const BROWSER_HEADERS = {
-  'User-Agent':     UA,
-  'Accept':         'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-  'Accept-Language':'en-US,en;q=0.9,ar;q=0.8',
-  'Accept-Encoding':'gzip, deflate, br',
-  'Cache-Control':  'no-cache',
-  'Sec-Fetch-Dest': 'document',
-  'Sec-Fetch-Mode': 'navigate',
-  'Sec-Fetch-Site': 'none',
-  'Upgrade-Insecure-Requests': '1',
-};
-
-const GOOGLEBOT_HEADERS = {
-  'User-Agent':     UA_GOOGLEBOT,
-  'Accept':         'text/html,application/xhtml+xml,*/*',
-  'Accept-Language':'en-US,en;q=0.5',
-  'Accept-Encoding':'gzip, deflate, br',
-};
 
 // ── SSRF guard ──────────────────────────────────────────────────
 
@@ -61,46 +41,33 @@ function isSafeUrl(raw: string): boolean {
   } catch { return false; }
 }
 
-// ── Cloudflare / WAF challenge page detection ───────────────────
-//
-// Cloudflare (and some other WAFs) can return HTTP 200 with a JavaScript
-// challenge page instead of the real content.  Native fetch() gets the
-// challenge HTML, marks it fetchOk=true, and we'd analyze it as real content.
-// These patterns are specific enough to avoid false-positives on real pages.
-
-function isCloudflareChallengePage(html: string): boolean {
-  if (!html) return false;
-  // Cloudflare JS challenge / Managed Challenge (most reliable — CF-specific var)
-  if (/window\._cf_chl_opt\b/.test(html)) return true;
-  // Cloudflare IUAM ("I'm Under Attack Mode") title
-  if (/<title>\s*Just a moment\.\.\.\s*<\/title>/i.test(html)) return true;
-  // Cloudflare challenge platform script path
-  if (/\/cdn-cgi\/challenge-platform\//.test(html)) return true;
-  // Older Cloudflare browser-verification page
-  if (/id="cf-browser-verification"/.test(html)) return true;
-  // Cloudflare Turnstile widget wrapper
-  if (/class="cf-turnstile"/.test(html)) return true;
-  return false;
-}
-
 // ── Page state classification ───────────────────────────────────
+// Uses blockedConfidence so we don't cry "BLOCKED" on a single failure.
+// Only HIGH/MEDIUM confidence warrants a CRAWLER_BLOCKED state.
 
 type PageState = 'OK' | 'CRAWLER_BLOCKED' | 'NOT_FOUND' | 'SERVER_ERROR' | 'FETCH_ERROR';
 
-function classifyPageState(httpStatus: number, fetchOk: boolean): PageState {
-  if (httpStatus >= 200 && httpStatus < 300 && fetchOk) return 'OK';
-  if (httpStatus === 401 || httpStatus === 403) return 'CRAWLER_BLOCKED';
+function classifyPageState(
+  httpStatus: number,
+  fetchOk: boolean,
+  blockedConfidence: BlockedConfidence,
+): PageState {
+  if (fetchOk) return 'OK';
   if (httpStatus === 404 || httpStatus === 410) return 'NOT_FOUND';
   if (httpStatus >= 500) return 'SERVER_ERROR';
+  if ((httpStatus === 401 || httpStatus === 403) &&
+      (blockedConfidence === 'HIGH' || blockedConfidence === 'MEDIUM')) {
+    return 'CRAWLER_BLOCKED';
+  }
   return 'FETCH_ERROR';
 }
 
 const PAGE_STATE_MESSAGES: Record<PageState, string> = {
-  OK: 'Page accessible',
-  CRAWLER_BLOCKED: 'Crawler access blocked. On-page SEO checks skipped.',
-  NOT_FOUND: 'Page not found. On-page SEO checks skipped.',
-  SERVER_ERROR: 'Server error. On-page SEO checks skipped.',
-  FETCH_ERROR: 'Page could not be fetched. On-page SEO checks skipped.',
+  OK:              'Page accessible',
+  CRAWLER_BLOCKED: 'Crawler blocked — all fetch profiles denied access.',
+  NOT_FOUND:       'Page not found (404/410). On-page SEO checks skipped.',
+  SERVER_ERROR:    'Server error (5xx). On-page SEO checks skipped.',
+  FETCH_ERROR:     'Page could not be fetched. May be a temporary network issue.',
 };
 
 // ── Shared: run all page checks for one URL ─────────────────────
@@ -115,159 +82,63 @@ async function auditSingleUrl(
       recommendations: ['URL blocked by security policy'] };
   }
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), PAGE_TIMEOUT);
-  let html = '', fetchOk = false, loadMs = 0;
-  let xRobotsTag = '';
-  let httpStatus = 0;
-  let currentUrl = url;
-  const redirectChain: string[] = [];
-  const fetchStart = Date.now();
+  // ── Multi-profile fetch (Chrome → Firefox → Googlebot → Scrapling) ──────────
+  const fetchResult = await runFetchEngine(url, { timeoutMs: PAGE_TIMEOUT });
 
-  try {
-    // ── Phase 1: Browser UA + full headers, redirect: manual (to track chain) ──
-    for (let hop = 0; hop < 6; hop++) {
-      const hopRes = await fetch(currentUrl, {
-        redirect: 'manual',
-        signal: controller.signal,
-        headers: BROWSER_HEADERS,
-      });
-      httpStatus = hopRes.status;
+  const {
+    fetchOk, html, httpStatus, xRobotsTag,
+    finalUrl, redirectChain, elapsedMs: loadMs,
+    profilesTried, blockedConfidence, blockedReason,
+  } = fetchResult;
 
-      if (httpStatus >= 300 && httpStatus < 400) {
-        const location = hopRes.headers.get('location');
-        if (location) {
-          redirectChain.push(currentUrl);
-          currentUrl = new URL(location, currentUrl).href;
-          continue;
-        }
-      }
+  const pageState = classifyPageState(httpStatus, fetchOk, blockedConfidence);
 
-      if (hopRes.ok) {
-        html = await hopRes.text();
-        xRobotsTag = hopRes.headers.get('x-robots-tag') ?? '';
-        if (isCloudflareChallengePage(html)) {
-          // CF returned 200 but with a JS challenge — not real content
-          console.log(`[audit] Phase 1: CF challenge page detected on HTTP 200, normalising to 403`);
-          httpStatus = 403;
-        } else {
-          fetchOk = true;
-        }
-      } else {
-        try { html = await hopRes.text(); } catch { /* body read fail ok */ }
-        xRobotsTag = hopRes.headers.get('x-robots-tag') ?? '';
-      }
-      break;
-    }
-
-    // ── Phase 2: 403/401 → retry with Googlebot UA ────────────────────────────
-    // Many news sites (and Cloudflare configs) whitelist Googlebot but block
-    // generic browser requests from datacenter IPs.
-    if ((httpStatus === 401 || httpStatus === 403) && !fetchOk) {
-      console.log(`[audit] Phase 2: Googlebot-UA retry for ${currentUrl} (was HTTP ${httpStatus})`);
-      try {
-        const gbRes = await fetch(currentUrl, {
-          redirect: 'follow',
-          signal: controller.signal,
-          headers: GOOGLEBOT_HEADERS,
-        });
-        if (gbRes.ok) {
-          html = await gbRes.text();
-          httpStatus = gbRes.status;
-          xRobotsTag = gbRes.headers.get('x-robots-tag') ?? '';
-          if (isCloudflareChallengePage(html)) {
-            console.log(`[audit] Phase 2: CF challenge page on HTTP 200, normalising to 403`);
-            httpStatus = 403;
-          } else {
-            fetchOk = true;
-            console.log(`[audit] Phase 2 succeeded: HTTP ${httpStatus} for ${currentUrl}`);
-          }
-        } else {
-          httpStatus = gbRes.status;
-          try { html = await gbRes.text(); } catch {}
-        }
-      } catch (err: unknown) {
-        console.log(`[audit] Phase 2 failed: ${err instanceof Error ? err.message : 'unknown'}`);
-      }
-    }
-
-    // ── Phase 3: Still blocked → try Scrapling sidecar (headless browser) ─────
-    // StealthyFetcher passes TLS fingerprint + JS challenges that native fetch
-    // cannot. Only runs when SCRAPLING_SIDECAR_URL is configured.
-    if ((httpStatus === 401 || httpStatus === 403) && !fetchOk) {
-      const sidecarBase = process.env.SCRAPLING_SIDECAR_URL?.replace(/\/+$/, '');
-      if (sidecarBase) {
-        console.log(`[audit] Phase 3: Scrapling sidecar for ${currentUrl}`);
-        try {
-          const sidecarRes = await fetch(`${sidecarBase}/fetch`, {
-            method: 'POST',
-            signal: controller.signal,
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url: currentUrl, timeout: 20 }),
-          });
-          if (sidecarRes.ok) {
-            const sidecarData = await sidecarRes.json() as {
-              html?: string; status?: number;
-              headers?: Record<string, string>;
-            };
-            if (sidecarData.html && sidecarData.status && sidecarData.status < 300) {
-              html = sidecarData.html;
-              httpStatus = sidecarData.status;
-              fetchOk = true;
-              xRobotsTag = sidecarData.headers?.['x-robots-tag'] ?? '';
-              console.log(`[audit] Phase 3 succeeded: HTTP ${httpStatus} via Scrapling`);
-            }
-          }
-        } catch (err: unknown) {
-          console.log(`[audit] Phase 3 failed: ${err instanceof Error ? err.message : 'unknown'}`);
-        }
-      }
-    }
-
-  } finally { loadMs = Date.now() - fetchStart; clearTimeout(timer); }
-
-  const pageState = classifyPageState(httpStatus, fetchOk);
-
-  // IMPORTANT: Only trust HTML when we have a genuine 2xx response (fetchOk=true).
-  // A 403 Cloudflare challenge page contains real-looking HTML (>500 chars, has <html>)
-  // but it is NOT the real page content. Running SEO checks on it produces completely
-  // wrong results (no canonical, no H1, wrong structured data, etc.).
-  // fetchOk is only set to true in Phase 2/3 when we actually get a 200-range response.
+  // fetchOk=true means a profile returned real 2xx content — run all SEO checks.
+  // Only skip checks when no profile succeeded AND html is absent/unusable.
   const hasUsableHtml = fetchOk && html.length > 500 && /<!doctype|<html|<head|<body/i.test(html);
 
-  if (pageState !== 'OK' && !hasUsableHtml) {
-    const finalUrl = redirectChain.length > 0 ? currentUrl : url;
+  if (!hasUsableHtml) {
     const urlOnlyType = detectPageType(finalUrl);
     const pageType = (seedType && (VALID_TYPES as readonly string[]).includes(seedType))
       ? (seedType as typeof VALID_TYPES[number])
       : urlOnlyType;
 
-    console.log(`[audit] Crawl gate: ${pageState} (HTTP ${httpStatus}) for ${url} — no usable HTML`);
+    console.log(
+      `[audit] Crawl gate: ${pageState} (HTTP ${httpStatus}, confidence=${blockedConfidence}) for ${url}` +
+      ` — profiles tried: ${profilesTried.map(a => `${a.profile}:${a.status}(${a.failure_kind})`).join(', ')}`,
+    );
 
     const data: Record<string, unknown> = {
       pageType, httpStatus, page_state: pageState,
       page_state_message: PAGE_STATE_MESSAGES[pageState],
+      blocked_confidence: blockedConfidence,
+      blocked_reason: blockedReason,
+      profiles_tried: profilesTried,
       redirectChain: redirectChain.length > 0 ? redirectChain : null,
       redirectCount: redirectChain.length,
       finalUrl: finalUrl !== url ? finalUrl : undefined,
       detection: { urlOnly: urlOnlyType, withHtml: pageType, seedType: seedType ?? null, override: false },
       canonical: null, structuredData: null, contentMeta: null, pagination: null, performance: null,
       checksSkipped: true,
-      checksSkippedReason: `${PAGE_STATE_MESSAGES[pageState]} (HTTP ${httpStatus})`,
+      checksSkippedReason: `${PAGE_STATE_MESSAGES[pageState]} (HTTP ${httpStatus}) — confidence: ${blockedConfidence}`,
     };
+
+    // Only hard-FAIL for confirmed blocks / not-found.  LOW confidence → WARN (may be transient).
+    const returnStatus =
+      pageState === 'NOT_FOUND'       ? 'FAIL' :
+      blockedConfidence === 'HIGH'    ? 'WARN' :
+      blockedConfidence === 'MEDIUM'  ? 'WARN' :
+      'WARN'; // LOW / transient — don't penalise
+
     return {
       url, data, page_state: pageState,
-      status: pageState === 'CRAWLER_BLOCKED' ? 'WARN' : 'FAIL',
+      status: returnStatus,
       error: `${PAGE_STATE_MESSAGES[pageState]} (HTTP ${httpStatus})`,
-      recommendations: [PAGE_STATE_MESSAGES[pageState]],
+      recommendations: blockedConfidence === 'HIGH' || blockedConfidence === 'MEDIUM'
+        ? [`Access blocked by WAF/bot-protection after ${profilesTried.length} profile attempt(s). Consider whitelisting our crawler IP or using Googlebot-compatible settings.`]
+        : [`Could not fetch page — may be a transient network issue (${blockedReason ?? 'unknown reason'}). No SEO penalties applied.`],
     };
   }
-
-  if (pageState !== 'OK' && hasUsableHtml) {
-    console.log(`[audit] Crawl gate: ${pageState} (HTTP ${httpStatus}) for ${url} — usable HTML found, running checks anyway`);
-  }
-
-  const finalUrl = redirectChain.length > 0 ? currentUrl : url;
   const urlOnlyType = detectPageType(finalUrl);
   const pageType = (seedType && (VALID_TYPES as readonly string[]).includes(seedType))
     ? (seedType as typeof VALID_TYPES[number])

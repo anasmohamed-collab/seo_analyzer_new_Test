@@ -27,32 +27,17 @@ const SITEMAP_TIMEOUT = 20_000;
 const MAX_CHILD_SITEMAPS = 5;
 const MAX_CHILD_SIZE = 5 * 1024 * 1024; // 5 MB
 
-// User-Agent strings — keep Chrome version recent to avoid bot detection
-const UA_BROWSER  = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-const UA_GOOGLEBOT = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
+// Re-use shared UA/header profiles from the fetch engine — single source of truth.
+import { UA_BROWSER, UA_GOOGLEBOT, BROWSER_HEADERS, GOOGLEBOT_HEADERS } from '../fetch/fetchEngine.js';
+import { gunzipSync } from 'node:zlib';
 
-// Full browser-like header set.
-// Many WAFs (Cloudflare, Imperva) check for missing Accept-Language /
-// Accept-Encoding / Sec-Fetch-* — a bare UA-only request is a strong bot signal.
-const BROWSER_HEADERS: Record<string, string> = {
-  'Accept':           'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-  'Accept-Language':  'en-US,en;q=0.9,ar;q=0.8',
-  'Accept-Encoding':  'gzip, deflate, br',
-  'Cache-Control':    'no-cache',
-  'Pragma':           'no-cache',
-  'Sec-Fetch-Dest':   'document',
-  'Sec-Fetch-Mode':   'navigate',
-  'Sec-Fetch-Site':   'none',
-  'Sec-Fetch-User':   '?1',
+const UA_FIREFOX = 'Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0';
+const FIREFOX_HEADERS: Record<string, string> = {
+  'Accept':                    'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Accept-Language':           'en-US,en;q=0.5',
+  'Accept-Encoding':           'gzip, deflate, br',
+  'Connection':                'keep-alive',
   'Upgrade-Insecure-Requests': '1',
-};
-
-// Lighter header set for Googlebot — adding Sec-Fetch-* to a Googlebot UA
-// looks inconsistent; Googlebot only sends basic headers.
-const GOOGLEBOT_HEADERS: Record<string, string> = {
-  'Accept':           'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-  'Accept-Language':  'en-US,en;q=0.5',
-  'Accept-Encoding':  'gzip, deflate, br',
 };
 
 // General sitemap discovery paths — checked in priority order.
@@ -127,7 +112,7 @@ interface FetchResult {
 async function safeFetch(
   url: string,
   timeoutMs: number,
-  opts: { maxBytes?: number; userAgent?: string } = {},
+  opts: { maxBytes?: number; userAgent?: string; extraHeaders?: Record<string, string> } = {},
 ): Promise<FetchResult> {
   const empty: FetchResult = { ok: false, status: 0, text: '', contentType: '', finalUrl: url, redirected: false };
   if (!isSafeUrl(url)) return empty;
@@ -136,7 +121,8 @@ async function safeFetch(
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   const ua = opts.userAgent ?? UA_BROWSER;
-  const extraHeaders = ua === UA_GOOGLEBOT ? GOOGLEBOT_HEADERS : BROWSER_HEADERS;
+  // If caller explicitly passes extraHeaders, use those; otherwise pick by UA
+  const extraHeaders = opts.extraHeaders ?? (ua === UA_GOOGLEBOT ? GOOGLEBOT_HEADERS : BROWSER_HEADERS);
 
   try {
     const res = await fetch(url, {
@@ -153,12 +139,28 @@ async function safeFetch(
     const redirected = res.redirected || finalUrl !== url;
     const maxBytes = opts.maxBytes ?? 2 * 1024 * 1024;
 
-    // Always read the body — needed for classification of 403s etc.
+    // ── Read body with gzip support ──────────────────────────────
+    // Sitemaps are often served as application/gzip (.xml.gz).
+    // HTTP Content-Encoding gzip is decompressed automatically by fetch(),
+    // but raw gzip file bodies need manual decompression.
     let text = '';
+    const isRawGzip = (
+      contentType.includes('application/gzip') ||
+      contentType.includes('application/x-gzip') ||
+      (url.toLowerCase().endsWith('.gz') && !contentType.includes('text/'))
+    );
+
     try {
-      const raw = await res.text();
-      text = raw.length > maxBytes ? raw.slice(0, maxBytes) : raw;
-    } catch { /* body read fail is ok */ }
+      if (isRawGzip) {
+        const buf = await res.arrayBuffer();
+        const decompressed = gunzipSync(Buffer.from(buf));
+        const raw = decompressed.toString('utf-8');
+        text = raw.length > maxBytes ? raw.slice(0, maxBytes) : raw;
+      } else {
+        const raw = await res.text();
+        text = raw.length > maxBytes ? raw.slice(0, maxBytes) : raw;
+      }
+    } catch { /* body read/decompress fail is ok — we'll classify from status */ }
 
     return { ok: res.ok, status: res.status, text, contentType, finalUrl, redirected };
   } catch (err: unknown) {
@@ -471,33 +473,49 @@ async function checkRobots(origin: string): Promise<RobotsResult> {
   return result;
 }
 
-// ── Stage 2: Accessibility — fetch with UA retry on 403 ─────────
+// ── Stage 2: Accessibility — fetch with multi-profile UA retry ──────────────
+//
+// Try Chrome → Firefox → Googlebot before declaring a sitemap blocked.
+// A single 403 from Chrome does NOT mean the sitemap is inaccessible;
+// many news sites whitelist Firefox or Googlebot while blocking datacenter IPs
+// that use a bare Chrome UA.
 
 async function fetchSitemapWithRetry(
   url: string,
 ): Promise<{ res: FetchResult; retryLog: string[] }> {
   const retryLog: string[] = [];
 
-  // Attempt 1: browser UA
-  console.log(`[sitemap:fetch] Attempt 1 — browser UA for ${url}`);
+  // Attempt 1: Chrome browser UA (with full Sec-Fetch-* headers)
+  console.log(`[sitemap:fetch] chrome-win10 for ${url}`);
   const res1 = await safeFetch(url, SITEMAP_TIMEOUT, { userAgent: UA_BROWSER });
-  retryLog.push(`browser-ua: HTTP ${res1.status}`);
-  console.log(`[sitemap:fetch] browser UA → HTTP ${res1.status}, redirected: ${res1.redirected}, finalUrl: ${res1.finalUrl}`);
+  retryLog.push(`chrome-win10: HTTP ${res1.status}`);
+  console.log(`[sitemap:fetch] chrome-win10 → HTTP ${res1.status}, redirected: ${res1.redirected}, finalUrl: ${res1.finalUrl}`);
 
-  if (res1.ok) return { res: res1, retryLog };
-
-  // On 403, retry with Googlebot UA (many news sites whitelist Googlebot for sitemaps)
-  if (res1.status === 403) {
-    console.log(`[sitemap:fetch] Attempt 2 — Googlebot UA for ${url} (403 retry)`);
-    const res2 = await safeFetch(url, SITEMAP_TIMEOUT, { userAgent: UA_GOOGLEBOT });
-    retryLog.push(`googlebot-ua: HTTP ${res2.status}`);
-    console.log(`[sitemap:fetch] Googlebot UA → HTTP ${res2.status}`);
-
-    if (res2.ok) return { res: res2, retryLog };
-    // If still 403, use the first response (has body from browser UA attempt)
+  if (res1.ok || (res1.status !== 401 && res1.status !== 403)) {
+    return { res: res1, retryLog };
   }
 
-  return { res: res1, retryLog };
+  // Attempt 2: Firefox UA — different TLS fingerprint and Accept-Language
+  console.log(`[sitemap:fetch] firefox-linux for ${url} (was HTTP ${res1.status})`);
+  const res2 = await safeFetch(url, SITEMAP_TIMEOUT, { userAgent: UA_FIREFOX, extraHeaders: FIREFOX_HEADERS });
+  retryLog.push(`firefox-linux: HTTP ${res2.status}`);
+  console.log(`[sitemap:fetch] firefox-linux → HTTP ${res2.status}`);
+
+  if (res2.ok) return { res: res2, retryLog };
+  if (res2.status !== 401 && res2.status !== 403) return { res: res2, retryLog };
+
+  // Attempt 3: Googlebot — whitelisted by most news publishers
+  console.log(`[sitemap:fetch] googlebot-2.1 for ${url} (was HTTP ${res2.status})`);
+  const res3 = await safeFetch(url, SITEMAP_TIMEOUT, { userAgent: UA_GOOGLEBOT });
+  retryLog.push(`googlebot-2.1: HTTP ${res3.status}`);
+  console.log(`[sitemap:fetch] googlebot-2.1 → HTTP ${res3.status}`);
+
+  if (res3.ok) return { res: res3, retryLog };
+
+  // All profiles denied — return the one with most information
+  // (prefer a response that has a body over one that doesn't)
+  const best = [res3, res2, res1].find(r => r.text.length > 0) ?? res1;
+  return { res: best, retryLog };
 }
 
 // ── Stage 3: Validation — XML structure + format compliance ─────
@@ -961,14 +979,22 @@ async function checkNewsSitemapPresence(origin: string): Promise<NewsSitemapResu
       continue;
     }
 
-    // On 403 with UA_BROWSER, retry with Googlebot
-    if ((res.status === 401 || res.status === 403)) {
+    // Multi-profile retry: Firefox → Googlebot on any 4xx denial
+    if ((res.status === 401 || res.status === 403) && !res.ok) {
       try {
         const r2 = await safeFetch(url, SITEMAP_TIMEOUT, {
-          maxBytes: MAX_CHILD_SIZE,
-          userAgent: UA_GOOGLEBOT,
+          maxBytes: MAX_CHILD_SIZE, userAgent: UA_FIREFOX,
+          extraHeaders: FIREFOX_HEADERS,
         });
         if (r2.ok) { res = r2; }
+      } catch { /* keep original */ }
+    }
+    if ((res.status === 401 || res.status === 403) && !res.ok) {
+      try {
+        const r3 = await safeFetch(url, SITEMAP_TIMEOUT, {
+          maxBytes: MAX_CHILD_SIZE, userAgent: UA_GOOGLEBOT,
+        });
+        if (r3.ok) { res = r3; }
       } catch { /* keep original */ }
     }
 
