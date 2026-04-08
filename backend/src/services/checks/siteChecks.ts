@@ -30,20 +30,16 @@ const MAX_CHILD_SIZE = 5 * 1024 * 1024; // 5 MB
 const UA_BROWSER = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const UA_GOOGLEBOT = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
 
-// Priority-ordered discovery paths (manager specification):
-//   1. robots.txt Sitemap directives  (handled separately)
-//   2. /sitemaps/sitemap_0.xml        (news publisher primary)
-//   3. /sitemap_0.xml                 (news publisher alternate)
-//   4. /sitemap.xml                   (standard default)
-//   5. /sitemap_index.xml             (common index variant)
-//   6. /news-sitemap.xml              (Google News)
-//   7–13. additional common paths
+// General sitemap discovery paths — checked in priority order.
+// Step 1 is always robots.txt (handled separately).
+// Step 2 onwards are well-known paths for the GENERAL (non-news) sitemap.
+// News-specific paths are intentionally excluded here — they are handled
+// by the dedicated checkNewsSitemapPresence() probe below.
 const PRIORITY_SITEMAP_PATHS = [
-  '/sitemaps/sitemap_0.xml',
-  '/sitemap_0.xml',
-  '/sitemap.xml',
-  '/sitemap_index.xml',
-  '/news-sitemap.xml',
+  '/sitemaps/sitemap_0.xml',   // news publisher primary (most common)
+  '/sitemap_0.xml',             // news publisher alternate
+  '/sitemap.xml',               // standard default
+  '/sitemap_index.xml',         // common index variant
   '/sitemap-index.xml',
   '/sitemaps.xml',
   '/sitemaps/sitemap.xml',
@@ -52,9 +48,9 @@ const PRIORITY_SITEMAP_PATHS = [
   '/sitemap/sitemap.xml',
 ];
 
-// News-sitemap-specific paths — always probed independently of the main
-// sitemap check so that a blocked general sitemap does not hide an
-// accessible Google News sitemap.
+// News-sitemap-specific paths — always probed INDEPENDENTLY of the main
+// sitemap check. A blocked general sitemap does not prevent this probe,
+// and these paths are NOT duplicated in PRIORITY_SITEMAP_PATHS.
 const NEWS_SITEMAP_PATHS = [
   '/news-sitemap.xml',
   '/news-sitemap-index.xml',
