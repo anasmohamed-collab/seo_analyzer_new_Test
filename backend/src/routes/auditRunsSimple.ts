@@ -61,6 +61,28 @@ function isSafeUrl(raw: string): boolean {
   } catch { return false; }
 }
 
+// ── Cloudflare / WAF challenge page detection ───────────────────
+//
+// Cloudflare (and some other WAFs) can return HTTP 200 with a JavaScript
+// challenge page instead of the real content.  Native fetch() gets the
+// challenge HTML, marks it fetchOk=true, and we'd analyze it as real content.
+// These patterns are specific enough to avoid false-positives on real pages.
+
+function isCloudflareChallengePage(html: string): boolean {
+  if (!html) return false;
+  // Cloudflare JS challenge / Managed Challenge (most reliable — CF-specific var)
+  if (/window\._cf_chl_opt\b/.test(html)) return true;
+  // Cloudflare IUAM ("I'm Under Attack Mode") title
+  if (/<title>\s*Just a moment\.\.\.\s*<\/title>/i.test(html)) return true;
+  // Cloudflare challenge platform script path
+  if (/\/cdn-cgi\/challenge-platform\//.test(html)) return true;
+  // Older Cloudflare browser-verification page
+  if (/id="cf-browser-verification"/.test(html)) return true;
+  // Cloudflare Turnstile widget wrapper
+  if (/class="cf-turnstile"/.test(html)) return true;
+  return false;
+}
+
 // ── Page state classification ───────────────────────────────────
 
 type PageState = 'OK' | 'CRAWLER_BLOCKED' | 'NOT_FOUND' | 'SERVER_ERROR' | 'FETCH_ERROR';
@@ -123,8 +145,14 @@ async function auditSingleUrl(
 
       if (hopRes.ok) {
         html = await hopRes.text();
-        fetchOk = true;
         xRobotsTag = hopRes.headers.get('x-robots-tag') ?? '';
+        if (isCloudflareChallengePage(html)) {
+          // CF returned 200 but with a JS challenge — not real content
+          console.log(`[audit] Phase 1: CF challenge page detected on HTTP 200, normalising to 403`);
+          httpStatus = 403;
+        } else {
+          fetchOk = true;
+        }
       } else {
         try { html = await hopRes.text(); } catch { /* body read fail ok */ }
         xRobotsTag = hopRes.headers.get('x-robots-tag') ?? '';
@@ -146,9 +174,14 @@ async function auditSingleUrl(
         if (gbRes.ok) {
           html = await gbRes.text();
           httpStatus = gbRes.status;
-          fetchOk = true;
           xRobotsTag = gbRes.headers.get('x-robots-tag') ?? '';
-          console.log(`[audit] Phase 2 succeeded: HTTP ${httpStatus} for ${currentUrl}`);
+          if (isCloudflareChallengePage(html)) {
+            console.log(`[audit] Phase 2: CF challenge page on HTTP 200, normalising to 403`);
+            httpStatus = 403;
+          } else {
+            fetchOk = true;
+            console.log(`[audit] Phase 2 succeeded: HTTP ${httpStatus} for ${currentUrl}`);
+          }
         } else {
           httpStatus = gbRes.status;
           try { html = await gbRes.text(); } catch {}
