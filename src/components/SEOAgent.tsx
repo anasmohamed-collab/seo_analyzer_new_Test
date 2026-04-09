@@ -879,15 +879,21 @@ function CrawlGatePanel({ title, url, row }: { title: string; url: string; row: 
     profile: string; status: number; failure_kind: string; cf_challenge?: boolean;
   }> | undefined) ?? [];
 
-  type StateKey = 'BOT_PROTECTION_CHALLENGE' | 'CRAWLER_BLOCKED' | 'NOT_FOUND' | 'SERVER_ERROR' | 'FETCH_ERROR';
+  type StateKey = 'BOT_PROTECTION_CHALLENGE' | 'CRAWLER_BLOCKED' | 'NOT_FOUND' | 'SERVER_ERROR' | 'FETCH_ERROR' | 'PARSE_ERROR';
   const stateConfig: Record<StateKey, { badge: string; badgeColor: string; icon: React.ReactNode; bg: string; border: string }> = {
     BOT_PROTECTION_CHALLENGE: { badge: 'BOT CHALLENGE', badgeColor: 'bg-purple-100 text-purple-700', icon: <Shield className="w-5 h-5 text-purple-500" />, bg: 'bg-purple-50', border: 'border-purple-200' },
     CRAWLER_BLOCKED:          { badge: 'BLOCKED',       badgeColor: 'bg-orange-100 text-orange-700', icon: <Shield className="w-5 h-5 text-orange-500" />, bg: 'bg-orange-50', border: 'border-orange-200' },
     NOT_FOUND:                { badge: 'NOT FOUND',     badgeColor: 'bg-red-100 text-red-700',       icon: <XCircle className="w-5 h-5 text-red-500" />,  bg: 'bg-red-50',    border: 'border-red-200'    },
     SERVER_ERROR:             { badge: 'SERVER ERROR',  badgeColor: 'bg-red-100 text-red-700',       icon: <AlertCircle className="w-5 h-5 text-red-500" />, bg: 'bg-red-50',  border: 'border-red-200'    },
+    PARSE_ERROR:              { badge: 'PARSE ERROR',   badgeColor: 'bg-yellow-100 text-yellow-800', icon: <AlertTriangle className="w-5 h-5 text-yellow-600" />, bg: 'bg-yellow-50', border: 'border-yellow-200' },
     FETCH_ERROR:              { badge: 'FETCH ERROR',   badgeColor: 'bg-red-100 text-red-700',       icon: <AlertCircle className="w-5 h-5 text-red-500" />, bg: 'bg-red-50',  border: 'border-red-200'    },
   };
-  const cfg = stateConfig[pageState as StateKey] ?? stateConfig.FETCH_ERROR;
+  // Safety net: if the backend emits FETCH_ERROR but challenge was detected (edge-case
+  // from old data or race), promote the badge to BOT CHALLENGE so it isn't misleading.
+  const effectiveState: StateKey = (pageState === 'FETCH_ERROR' && challengeDetected)
+    ? 'BOT_PROTECTION_CHALLENGE'
+    : (pageState as StateKey);
+  const cfg = stateConfig[effectiveState] ?? stateConfig.FETCH_ERROR;
 
   // Confidence pill styling
   const confidencePill: Record<string, string> = {
@@ -902,9 +908,9 @@ function CrawlGatePanel({ title, url, row }: { title: string; url: string; row: 
   );
 
   let contextNote = '';
-  if (pageState === 'BOT_PROTECTION_CHALLENGE' || challengeDetected) {
+  if (effectiveState === 'BOT_PROTECTION_CHALLENGE' || challengeDetected) {
     contextNote = `Bot protection challenge detected — the server returned HTTP ${httpStatus ?? 200} but the response body is a Cloudflare/WAF challenge page, not real content. The page IS accessible to real browsers. Enable the Scrapling headless-browser sidecar (SCRAPLING_SIDECAR_URL) to attempt JS-challenge bypass.`;
-  } else if (pageState === 'CRAWLER_BLOCKED') {
+  } else if (effectiveState === 'CRAWLER_BLOCKED') {
     if (allTimeout) {
       contextNote = 'All fetch attempts timed out or failed with network errors — this may be a temporary issue. No SEO penalties were applied.';
     } else if (confidence === 'HIGH') {
@@ -912,10 +918,12 @@ function CrawlGatePanel({ title, url, row }: { title: string; url: string; row: 
     } else {
       contextNote = 'Multiple profiles were denied. The site may have inconsistent bot-protection rules.';
     }
-  } else if (pageState === 'NOT_FOUND') {
+  } else if (effectiveState === 'NOT_FOUND') {
     contextNote = 'The URL returned 404 or 410 — verify the URL is correct and the page has not been removed.';
-  } else if (pageState === 'SERVER_ERROR') {
+  } else if (effectiveState === 'SERVER_ERROR') {
     contextNote = 'The server returned a 5xx error. This is typically a temporary issue — try the audit again.';
+  } else if (effectiveState === 'PARSE_ERROR') {
+    contextNote = `The server responded (HTTP ${httpStatus ?? '?'}) but the response body could not be decoded — likely a corrupt gzip or broken Content-Encoding. The page may be accessible to real browsers. Check the server\u2019s compression configuration.`;
   } else if (allTimeout) {
     contextNote = 'The page could not be reached — possible DNS, SSL, or transient network issue. No SEO penalties were applied.';
   }
@@ -961,7 +969,11 @@ function CrawlGatePanel({ title, url, row }: { title: string; url: string; row: 
             {cfg.icon}
             <div className="flex-1">
               <p className="text-sm font-semibold text-slate-800">
-                On-page SEO checks skipped — crawler could not retrieve page content.
+                {effectiveState === 'BOT_PROTECTION_CHALLENGE'
+                  ? 'On-page SEO checks skipped — bot protection challenge returned instead of real page content.'
+                  : effectiveState === 'PARSE_ERROR'
+                    ? 'On-page SEO checks skipped — server response could not be decoded.'
+                    : 'On-page SEO checks skipped — crawler could not retrieve page content.'}
               </p>
               {contextNote && (
                 <p className="text-xs text-slate-600 mt-1 leading-relaxed">{contextNote}</p>

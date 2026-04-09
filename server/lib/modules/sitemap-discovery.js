@@ -8,11 +8,13 @@
  *   4. RSS/Atom Fallback — /feed, /rss, /rss.xml, /atom.xml + <link rel="alternate">
  *
  * Classification per tested URL:
- *   FOUND     — HTTP 200 + valid <urlset> or <sitemapindex>
- *   BLOCKED   — HTTP 401 / 403
- *   NOT_FOUND — HTTP 404
- *   SOFT_404  — HTTP 200 but HTML (not valid sitemap XML)
- *   ERROR     — HTTP >= 500 or network error
+ *   FOUND            — HTTP 200 + valid <urlset> or <sitemapindex>
+ *   BLOCKED          — HTTP 401 / 403 with NO challenge body (genuine access denial)
+ *   CHALLENGE        — HTTP 200 or 403 + WAF/Cloudflare challenge body
+ *   NOT_FOUND        — HTTP 404
+ *   CONTENT_MISMATCH — HTTP 200 but HTML returned instead of XML (CMS redirect, soft-404)
+ *   SOFT_404         — HTTP 200 but neither XML nor recognisable HTML
+ *   ERROR            — HTTP >= 500 or network error
  *
  * Supports gzip (.xml.gz), redirect chains (max 5 hops),
  * sitemap index recursion (max depth 3, max 20 files total).
@@ -66,6 +68,20 @@ async function fetchUrl(url, timeoutMs = FETCH_TIMEOUT) {
   }
 }
 
+// ── WAF / Challenge detection ───────────────────────────────────
+// Mirrors isCloudflareChallengePage() from fetchEngine.ts — single pattern set.
+// Applies to sitemap bodies: CF/WAF can return 200 or 403 with a challenge page.
+
+export function isWafChallengePage(html) {
+  if (!html) return false;
+  if (/window\._cf_chl_opt\b/.test(html))                      return true; // CF JS challenge
+  if (/<title>\s*Just a moment\.\.\.\s*<\/title>/i.test(html)) return true; // CF IUAM title
+  if (/\/cdn-cgi\/challenge-platform\//.test(html))             return true; // CF challenge CDN
+  if (/id="cf-browser-verification"/.test(html))                return true; // Older CF check
+  if (/class="cf-turnstile"/.test(html))                        return true; // CF Turnstile
+  return false;
+}
+
 // ── Content helpers ─────────────────────────────────────────────
 
 function isValidSitemapXml(text) {
@@ -116,13 +132,24 @@ async function readContent(res, url) {
 }
 
 // ── Classification ──────────────────────────────────────────────
+//
+// Priority: WAF challenge > HTTP status > content type > fallback.
+// This mirrors the same priority as fetchEngine → classifyPageState.
 
 function classify(httpStatus, content) {
+  // WAF/CF challenge takes priority regardless of HTTP status.
+  // Cloudflare IUAM returns HTTP 200; Managed Challenge may return 403.
+  // Either way the body is a JS challenge, not real sitemap content.
+  if (content && isWafChallengePage(content)) return 'CHALLENGE';
+
   if (httpStatus === 401 || httpStatus === 403) return 'BLOCKED';
   if (httpStatus === 404) return 'NOT_FOUND';
   if (httpStatus >= 500) return 'ERROR';
   if (httpStatus >= 200 && httpStatus < 300) {
     if (content && isValidSitemapXml(content)) return 'FOUND';
+    // HTML body where XML was expected — typically a CMS redirect to homepage or
+    // a login/interstitial page. Distinct from SOFT_404 (ambiguous non-XML).
+    if (content && /<html[\s>]/i.test(content)) return 'CONTENT_MISMATCH';
     return 'SOFT_404';
   }
   return 'ERROR';
@@ -133,7 +160,11 @@ function classify(httpStatus, content) {
 async function probe(url, source) {
   try {
     const res = await fetchUrl(url);
-    const content = res.ok ? await readContent(res, url) : '';
+    // Read content for successful responses AND for 401/403 — WAF/CF challenge pages
+    // can return either HTTP 200 or HTTP 403 with a challenge body, so we must inspect
+    // the body before deciding BLOCKED vs CHALLENGE.
+    const shouldReadBody = res.ok || res.status === 401 || res.status === 403;
+    const content = shouldReadBody ? await readContent(res, url) : '';
     const classification = classify(res.status, content);
 
     return {
@@ -161,7 +192,13 @@ async function discoverFromRobotsTxt(origin) {
   try {
     const res = await fetchUrl(`${origin}/robots.txt`);
     if (res.status === 401 || res.status === 403) {
-      result.status = 'blocked';
+      // Read body to distinguish genuine 401/403 from WAF challenge pages
+      try {
+        const body = await res.text();
+        result.status = isWafChallengePage(body) ? 'waf_challenge' : 'blocked';
+      } catch {
+        result.status = 'blocked';
+      }
       return result;
     }
     if (!res.ok) {
