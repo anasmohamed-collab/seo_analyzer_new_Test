@@ -874,16 +874,18 @@ function CrawlGatePanel({ title, url, row }: { title: string; url: string; row: 
   const httpStatus       = row.data?.httpStatus as number | undefined;
   const confidence       = (row.data?.blocked_confidence as string | undefined) ?? '';
   const blockedReason    = row.data?.blocked_reason as string | undefined;
+  const challengeDetected = !!(row.data?.challenge_detected as boolean | undefined);
   const profilesTried    = (row.data?.profiles_tried as Array<{
     profile: string; status: number; failure_kind: string; cf_challenge?: boolean;
   }> | undefined) ?? [];
 
-  type StateKey = 'CRAWLER_BLOCKED' | 'NOT_FOUND' | 'SERVER_ERROR' | 'FETCH_ERROR';
+  type StateKey = 'BOT_PROTECTION_CHALLENGE' | 'CRAWLER_BLOCKED' | 'NOT_FOUND' | 'SERVER_ERROR' | 'FETCH_ERROR';
   const stateConfig: Record<StateKey, { badge: string; badgeColor: string; icon: React.ReactNode; bg: string; border: string }> = {
-    CRAWLER_BLOCKED: { badge: 'BLOCKED',      badgeColor: 'bg-orange-100 text-orange-700', icon: <Shield className="w-5 h-5 text-orange-500" />,      bg: 'bg-orange-50', border: 'border-orange-200' },
-    NOT_FOUND:       { badge: 'NOT FOUND',    badgeColor: 'bg-red-100 text-red-700',    icon: <XCircle className="w-5 h-5 text-red-500" />,       bg: 'bg-red-50',    border: 'border-red-200'    },
-    SERVER_ERROR:    { badge: 'SERVER ERROR', badgeColor: 'bg-red-100 text-red-700',    icon: <AlertCircle className="w-5 h-5 text-red-500" />,   bg: 'bg-red-50',    border: 'border-red-200'    },
-    FETCH_ERROR:     { badge: 'FETCH ERROR',  badgeColor: 'bg-red-100 text-red-700',    icon: <AlertCircle className="w-5 h-5 text-red-500" />,   bg: 'bg-red-50',    border: 'border-red-200'    },
+    BOT_PROTECTION_CHALLENGE: { badge: 'BOT CHALLENGE', badgeColor: 'bg-purple-100 text-purple-700', icon: <Shield className="w-5 h-5 text-purple-500" />, bg: 'bg-purple-50', border: 'border-purple-200' },
+    CRAWLER_BLOCKED:          { badge: 'BLOCKED',       badgeColor: 'bg-orange-100 text-orange-700', icon: <Shield className="w-5 h-5 text-orange-500" />, bg: 'bg-orange-50', border: 'border-orange-200' },
+    NOT_FOUND:                { badge: 'NOT FOUND',     badgeColor: 'bg-red-100 text-red-700',       icon: <XCircle className="w-5 h-5 text-red-500" />,  bg: 'bg-red-50',    border: 'border-red-200'    },
+    SERVER_ERROR:             { badge: 'SERVER ERROR',  badgeColor: 'bg-red-100 text-red-700',       icon: <AlertCircle className="w-5 h-5 text-red-500" />, bg: 'bg-red-50',  border: 'border-red-200'    },
+    FETCH_ERROR:              { badge: 'FETCH ERROR',   badgeColor: 'bg-red-100 text-red-700',       icon: <AlertCircle className="w-5 h-5 text-red-500" />, bg: 'bg-red-50',  border: 'border-red-200'    },
   };
   const cfg = stateConfig[pageState as StateKey] ?? stateConfig.FETCH_ERROR;
 
@@ -894,29 +896,28 @@ function CrawlGatePanel({ title, url, row }: { title: string; url: string; row: 
     LOW:    'bg-yellow-100 text-yellow-700',
   };
 
-  // Contextual explanation based on what actually happened
-  const allWaf = profilesTried.length > 0 && profilesTried.every(p => p.cf_challenge || p.failure_kind === 'waf_challenge');
-  const allTimeout = profilesTried.length > 0 && profilesTried.every(p => p.failure_kind === 'timeout' || p.failure_kind === 'ssl_error' || p.failure_kind === 'dns_error');
+  // Contextual explanation — body-aware signal takes priority over status
+  const allTimeout = profilesTried.length > 0 && profilesTried.every(
+    p => p.failure_kind === 'timeout' || p.failure_kind === 'ssl_error' || p.failure_kind === 'dns_error',
+  );
 
   let contextNote = '';
-  if (pageState === 'CRAWLER_BLOCKED') {
-    if (allWaf) {
-      contextNote = 'Cloudflare / WAF challenge detected on all profiles. The page is accessible to real browsers but blocks server-side crawlers by IP and TLS fingerprint. Enable the Scrapling headless-browser sidecar to attempt JS-challenge bypass.';
-    } else if (allTimeout) {
+  if (pageState === 'BOT_PROTECTION_CHALLENGE' || challengeDetected) {
+    contextNote = `Bot protection challenge detected — the server returned HTTP ${httpStatus ?? 200} but the response body is a Cloudflare/WAF challenge page, not real content. The page IS accessible to real browsers. Enable the Scrapling headless-browser sidecar (SCRAPLING_SIDECAR_URL) to attempt JS-challenge bypass.`;
+  } else if (pageState === 'CRAWLER_BLOCKED') {
+    if (allTimeout) {
       contextNote = 'All fetch attempts timed out or failed with network errors — this may be a temporary issue. No SEO penalties were applied.';
     } else if (confidence === 'HIGH') {
-      contextNote = `All ${profilesTried.length} crawler profiles (Chrome, Firefox, Googlebot) received 403. The site enforces strict IP-based or bot-protection rules. SEO checks could not be performed.`;
-    } else if (confidence === 'MEDIUM') {
-      contextNote = 'Multiple profiles were denied. The site may have inconsistent bot-protection rules. Consider retrying or checking robots.txt for crawler permissions.';
+      contextNote = `All ${profilesTried.length} crawler profiles (Chrome, Firefox, Googlebot) received HTTP ${httpStatus ?? 403}. The site enforces strict IP-based bot-protection. SEO checks could not be performed.`;
     } else {
-      contextNote = 'Access was denied. On-page SEO checks were skipped for this page.';
+      contextNote = 'Multiple profiles were denied. The site may have inconsistent bot-protection rules.';
     }
   } else if (pageState === 'NOT_FOUND') {
-    contextNote = 'The URL returned 404 or 410 — the page does not exist. Verify the URL is correct and that the page has not been removed.';
+    contextNote = 'The URL returned 404 or 410 — verify the URL is correct and the page has not been removed.';
   } else if (pageState === 'SERVER_ERROR') {
-    contextNote = 'The server returned a 5xx error. This is typically a temporary issue. Try the audit again or check server logs.';
+    contextNote = 'The server returned a 5xx error. This is typically a temporary issue — try the audit again.';
   } else if (allTimeout) {
-    contextNote = 'The page could not be reached — possible DNS failure, SSL error, or temporary network issue. No SEO penalties were applied.';
+    contextNote = 'The page could not be reached — possible DNS, SSL, or transient network issue. No SEO penalties were applied.';
   }
 
   const failureKindLabel: Record<string, string> = {

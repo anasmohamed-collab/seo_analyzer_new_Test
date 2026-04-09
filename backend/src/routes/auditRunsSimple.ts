@@ -42,32 +42,57 @@ function isSafeUrl(raw: string): boolean {
 }
 
 // ── Page state classification ───────────────────────────────────
-// Uses blockedConfidence so we don't cry "BLOCKED" on a single failure.
-// Only HIGH/MEDIUM confidence warrants a CRAWLER_BLOCKED state.
+//
+// Priority order (matches the spec):
+//   1. fetchOk → OK (real 2xx content received)
+//   2. Body-based WAF/challenge signal → BOT_PROTECTION_CHALLENGE
+//      (runs BEFORE status checks — CF returns 200 with challenge body)
+//   3. Explicit HTTP 404/410 → NOT_FOUND
+//   4. Explicit HTTP 5xx → SERVER_ERROR
+//   5. HIGH/MEDIUM confidence denial → CRAWLER_BLOCKED
+//   6. Fallback → FETCH_ERROR (transient / unknown)
+//
+// HIGH confidence is never overridden by FETCH_ERROR fallback.
 
-type PageState = 'OK' | 'CRAWLER_BLOCKED' | 'NOT_FOUND' | 'SERVER_ERROR' | 'FETCH_ERROR';
+type PageState =
+  | 'OK'
+  | 'BOT_PROTECTION_CHALLENGE'
+  | 'CRAWLER_BLOCKED'
+  | 'NOT_FOUND'
+  | 'SERVER_ERROR'
+  | 'FETCH_ERROR';
 
 function classifyPageState(
   httpStatus: number,
   fetchOk: boolean,
   blockedConfidence: BlockedConfidence,
+  challengeDetected: boolean,
 ): PageState {
+  // 1. Real content received
   if (fetchOk) return 'OK';
+
+  // 2. Body-based WAF/CF challenge — takes priority over raw HTTP status.
+  //    Cloudflare IUAM / Managed Challenge returns 200 + challenge body.
+  if (challengeDetected) return 'BOT_PROTECTION_CHALLENGE';
+
+  // 3. Unambiguous HTTP errors
   if (httpStatus === 404 || httpStatus === 410) return 'NOT_FOUND';
-  if (httpStatus >= 500) return 'SERVER_ERROR';
-  if ((httpStatus === 401 || httpStatus === 403) &&
-      (blockedConfidence === 'HIGH' || blockedConfidence === 'MEDIUM')) {
-    return 'CRAWLER_BLOCKED';
-  }
+  if (httpStatus >= 500)                         return 'SERVER_ERROR';
+
+  // 4. Confidence-driven access denial (401/403 or normalised 403 from engine)
+  if (blockedConfidence === 'HIGH' || blockedConfidence === 'MEDIUM') return 'CRAWLER_BLOCKED';
+
+  // 5. Fallback — transient network issue or unknown failure
   return 'FETCH_ERROR';
 }
 
 const PAGE_STATE_MESSAGES: Record<PageState, string> = {
-  OK:              'Page accessible',
-  CRAWLER_BLOCKED: 'Crawler blocked — all fetch profiles denied access.',
-  NOT_FOUND:       'Page not found (404/410). On-page SEO checks skipped.',
-  SERVER_ERROR:    'Server error (5xx). On-page SEO checks skipped.',
-  FETCH_ERROR:     'Page could not be fetched. May be a temporary network issue.',
+  OK:                      'Page accessible',
+  BOT_PROTECTION_CHALLENGE:'Bot protection challenge detected — page returned HTTP 200 but content is a WAF/Cloudflare challenge, not real page content.',
+  CRAWLER_BLOCKED:         'Crawler blocked — all fetch profiles denied access (HTTP 401/403).',
+  NOT_FOUND:               'Page not found (404/410).',
+  SERVER_ERROR:            'Server error (5xx).',
+  FETCH_ERROR:             'Page could not be fetched — may be a transient network issue.',
 };
 
 // ── Shared: run all page checks for one URL ─────────────────────
@@ -88,10 +113,11 @@ async function auditSingleUrl(
   const {
     fetchOk, html, httpStatus, xRobotsTag,
     finalUrl, redirectChain, elapsedMs: loadMs,
-    profilesTried, blockedConfidence, blockedReason,
+    profilesTried, blockedConfidence, blockedReason, challengeDetected,
   } = fetchResult;
 
-  const pageState = classifyPageState(httpStatus, fetchOk, blockedConfidence);
+  // Body-aware classification: challenge signal beats raw HTTP status.
+  const pageState = classifyPageState(httpStatus, fetchOk, blockedConfidence, challengeDetected);
 
   // fetchOk=true means a profile returned real 2xx content — run all SEO checks.
   // Only skip checks when no profile succeeded AND html is absent/unusable.
@@ -104,14 +130,15 @@ async function auditSingleUrl(
       : urlOnlyType;
 
     console.log(
-      `[audit] Crawl gate: ${pageState} (HTTP ${httpStatus}, confidence=${blockedConfidence}) for ${url}` +
-      ` — profiles tried: ${profilesTried.map(a => `${a.profile}:${a.status}(${a.failure_kind})`).join(', ')}`,
+      `[audit] Crawl gate: ${pageState} (HTTP ${httpStatus}, confidence=${blockedConfidence}${challengeDetected ? ', CHALLENGE' : ''}) for ${url}` +
+      ` — profiles tried: ${profilesTried.map(a => `${a.profile}:${a.status}(${a.failure_kind}${a.cf_challenge ? '/CF' : ''})`).join(', ')}`,
     );
 
     const data: Record<string, unknown> = {
       pageType, httpStatus, page_state: pageState,
       page_state_message: PAGE_STATE_MESSAGES[pageState],
       blocked_confidence: blockedConfidence,
+      challenge_detected: challengeDetected,
       blocked_reason: blockedReason,
       profiles_tried: profilesTried,
       redirectChain: redirectChain.length > 0 ? redirectChain : null,
@@ -120,23 +147,23 @@ async function auditSingleUrl(
       detection: { urlOnly: urlOnlyType, withHtml: pageType, seedType: seedType ?? null, override: false },
       canonical: null, structuredData: null, contentMeta: null, pagination: null, performance: null,
       checksSkipped: true,
-      checksSkippedReason: `${PAGE_STATE_MESSAGES[pageState]} (HTTP ${httpStatus}) — confidence: ${blockedConfidence}`,
+      checksSkippedReason: PAGE_STATE_MESSAGES[pageState],
     };
 
-    // Only hard-FAIL for confirmed blocks / not-found.  LOW confidence → WARN (may be transient).
-    const returnStatus =
-      pageState === 'NOT_FOUND'       ? 'FAIL' :
-      blockedConfidence === 'HIGH'    ? 'WARN' :
-      blockedConfidence === 'MEDIUM'  ? 'WARN' :
-      'WARN'; // LOW / transient — don't penalise
+    // NOT_FOUND is a definitive failure. Blocked/challenge/transient are WARN (not FAIL).
+    const returnStatus = pageState === 'NOT_FOUND' ? 'FAIL' : 'WARN';
 
     return {
       url, data, page_state: pageState,
       status: returnStatus,
-      error: `${PAGE_STATE_MESSAGES[pageState]} (HTTP ${httpStatus})`,
-      recommendations: blockedConfidence === 'HIGH' || blockedConfidence === 'MEDIUM'
-        ? [`Access blocked by WAF/bot-protection after ${profilesTried.length} profile attempt(s). Consider whitelisting our crawler IP or using Googlebot-compatible settings.`]
-        : [`Could not fetch page — may be a transient network issue (${blockedReason ?? 'unknown reason'}). No SEO penalties applied.`],
+      error: PAGE_STATE_MESSAGES[pageState],
+      recommendations: pageState === 'BOT_PROTECTION_CHALLENGE'
+        ? [`Cloudflare/WAF challenge page returned instead of real content (HTTP ${httpStatus} with challenge body). Enable the Scrapling headless-browser sidecar (SCRAPLING_SIDECAR_URL) to bypass JS challenges.`]
+        : pageState === 'CRAWLER_BLOCKED'
+          ? [`All ${profilesTried.length} crawler profiles (Chrome, Firefox, Googlebot) received HTTP ${httpStatus}. Consider whitelisting the crawler IP or enabling Googlebot-compatible access.`]
+          : pageState === 'NOT_FOUND'
+            ? [`Page returned HTTP ${httpStatus} — verify the URL is correct and the page exists.`]
+            : [`Page could not be fetched — may be a transient network issue. ${blockedReason ?? ''}`],
     };
   }
   const urlOnlyType = detectPageType(finalUrl);
