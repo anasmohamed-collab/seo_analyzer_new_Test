@@ -134,20 +134,74 @@ export interface FetchEngineOptions {
   fetchFn?: typeof fetch;
 }
 
-// ── CF / WAF challenge detection ─────────────────────────────────
+// ── Bot-protection / challenge-page detection ────────────────────
 
 /**
- * Returns true when html looks like a Cloudflare challenge page.
- * Patterns are CF-specific — no legitimate page matches any of them.
+ * Vendor-agnostic check for WAF challenge / CAPTCHA / interstitial pages.
+ *
+ * Returns true when the HTML body looks like any kind of bot-protection gate
+ * rather than real page content.  Covers:
+ *   Cloudflare (IUAM / Managed Challenge / Turnstile),
+ *   Akamai Bot Manager, Imperva/Incapsula, DataDome, PerimeterX/HUMAN,
+ *   AWS WAF, hCaptcha interstitials, and generic challenge-phrase titles.
+ *
+ * Patterns are chosen to be high-precision (very unlikely to match real pages).
+ */
+export function isBotProtectionPage(html: string): boolean {
+  if (!html || html.length < 10) return false;
+
+  // ── Cloudflare ──────────────────────────────────────────────────
+  if (/window\._cf_chl_opt\b/.test(html))                           return true; // CF JS challenge
+  if (/<title>\s*Just a moment\.\.\.\s*<\/title>/i.test(html))      return true; // CF IUAM title
+  if (/\/cdn-cgi\/challenge-platform\//.test(html))                  return true; // CF challenge CDN
+  if (/id="cf-browser-verification"/.test(html))                     return true; // Older CF check
+  if (/class="cf-turnstile"/.test(html))                             return true; // CF Turnstile
+  if (/<title>\s*Attention Required!\s*<\/title>/i.test(html))       return true; // CF firewall block
+
+  // ── Akamai Bot Manager ──────────────────────────────────────────
+  // Both cookies together are a strong signal; either alone can appear on normal pages.
+  if (/_abck=/.test(html) && /ak_bmsc=/.test(html))                  return true;
+  if (/sensor_data.*akamai/i.test(html))                             return true;
+
+  // ── Imperva / Incapsula ─────────────────────────────────────────
+  if (/<!-- Incapsula incident ID:/.test(html))                      return true;
+  // Both session cookies together (incap_ses_ and visid_incap_) are vendor-specific
+  if (/incap_ses_\w+/.test(html) && /visid_incap_\w+/.test(html))   return true;
+
+  // ── DataDome ───────────────────────────────────────────────────
+  if (/tag\.captcha-delivery\.com/.test(html))                       return true;
+  if (/window\.ddjskey\s*=/.test(html))                              return true;
+
+  // ── PerimeterX / HUMAN ─────────────────────────────────────────
+  if (/_pxAppId\s*=/.test(html))                                     return true;
+  if (/px-captcha|class="pxCaptcha"/.test(html))                     return true;
+
+  // ── AWS WAF challenge ───────────────────────────────────────────
+  if (/aws-waf-token/.test(html))                                    return true;
+  if (/awswaf.*checksum/i.test(html))                                return true;
+
+  // ── hCaptcha interstitial (full-page gate, not embedded widget) ─
+  if (/hcaptcha\.com\/1\/api\.js/.test(html) &&
+      /verify|bot|human/i.test(html.slice(0, 2000)))                 return true;
+
+  // ── Generic challenge phrases in <title> ────────────────────────
+  // Match only when the entire title is a standard challenge phrase, minimising
+  // false-positives on legitimate pages that happen to use similar words.
+  const titleMatch = /<title[^>]*>([\s\S]{0,200}?)<\/title>/i.exec(html);
+  if (titleMatch) {
+    const title = titleMatch[1].trim();
+    if (/^(verify you are human|human verification|bot check|ddos protection(?: by \w+)?|please verify you are( a)? human|you have been blocked|browser integrity check|security check required|checking your browser\.\.\.|please wait\.\.\.|one more step)$/i.test(title)) return true;
+  }
+
+  return false;
+}
+
+/**
+ * @deprecated Retained for backward-compatibility — delegates to isBotProtectionPage().
+ * New code should call isBotProtectionPage() directly.
  */
 export function isCloudflareChallengePage(html: string): boolean {
-  if (!html) return false;
-  if (/window\._cf_chl_opt\b/.test(html))                      return true; // CF JS challenge
-  if (/<title>\s*Just a moment\.\.\.\s*<\/title>/i.test(html)) return true; // CF IUAM title
-  if (/\/cdn-cgi\/challenge-platform\//.test(html))             return true; // CF challenge CDN
-  if (/id="cf-browser-verification"/.test(html))                return true; // Older CF check
-  if (/class="cf-turnstile"/.test(html))                        return true; // CF Turnstile
-  return false;
+  return isBotProtectionPage(html);
 }
 
 // ── Network-error classifier ─────────────────────────────────────
@@ -347,7 +401,7 @@ async function tryScrapling(
     const rawHtml  = data.html ?? '';
     const html     = rawHtml.length > maxBytes ? rawHtml.slice(0, maxBytes) : rawHtml;
     const status   = data.status ?? 0;
-    const cfCheck  = isCloudflareChallengePage(html);
+    const cfCheck  = isBotProtectionPage(html);
 
     attempt.status       = status;
     attempt.final_url    = data.final_url ?? url;
@@ -494,7 +548,7 @@ export async function runFetchEngine(
         break; // redirect loop is structural — no point trying other profiles
       }
 
-      const cfChallenge = isCloudflareChallengePage(text);
+      const cfChallenge = isBotProtectionPage(text);
 
       attempt.status         = resStatus;
       attempt.final_url      = resFinalUrl;

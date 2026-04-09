@@ -76,7 +76,7 @@ const SEO_KNOWLEDGE: Record<string, { why: string; fix: string; cat: string }> =
   h1: { why: 'The H1 tag signals the main topic of the page to search engines and users.', fix: 'Add exactly one H1 tag per page with a clear, descriptive heading that includes your primary keyword.', cat: 'Content' },
   dup_title: { why: 'Duplicate titles confuse search engines about which page to rank and dilute ranking potential.', fix: 'Ensure every page has a unique title tag that accurately describes its specific content.', cat: 'Metadata' },
   schema_detected: { why: 'Structured data helps search engines understand your content and can enable rich results in SERPs.', fix: 'No action needed — structured data is properly implemented.', cat: 'Structured Data' },
-  website_schema: { why: 'WebSite schema enables the sitelinks searchbox in Google results, improving site visibility.', fix: 'Add WebSite schema with a SearchAction to enable the sitelinks search box.', cat: 'Structured Data' },
+  website_schema: { why: 'WebSite schema provides structured information about your site to search engines and can support sitelinks and brand knowledge panels.', fix: 'Add WebSite schema with name, url, and publisher fields. Note: Google retired the Sitelinks Searchbox feature in 2024, so SearchAction is no longer required.', cat: 'Structured Data' },
   org_schema: { why: 'Organization schema provides knowledge panel information and establishes brand identity in search.', fix: 'Add Organization schema with name, logo, url, and social profiles.', cat: 'Structured Data' },
   org_name: { why: 'The organization name in schema helps Google populate knowledge panels and brand recognition.', fix: 'Add the "name" property to your Organization schema markup.', cat: 'Structured Data' },
   org_logo: { why: 'A logo in Organization schema appears in Google knowledge panels, increasing brand trust.', fix: 'Add the "logo" property with a URL to your organization\'s logo (min 112x112px).', cat: 'Structured Data' },
@@ -105,7 +105,7 @@ const SEO_KNOWLEDGE: Record<string, { why: string; fix: string; cat: string }> =
   article_published_time: { why: 'The article:published_time OG tag signals freshness to social platforms and some search features.', fix: 'Add <meta property="article:published_time" content="..."> with an ISO 8601 date.', cat: 'Metadata' },
   byline: { why: 'A visible author byline supports content credibility and E-E-A-T signals.', fix: 'Add a visible author name on the article page.', cat: 'Content' },
   main_image: { why: 'A main image improves engagement, enables image search visibility, and is needed for rich results.', fix: 'Include a high-quality main image above the fold in every article.', cat: 'Content' },
-  amp_link: { why: 'AMP pages load faster on mobile and can appear in the Google Top Stories carousel.', fix: 'Implement AMP for news articles or ensure regular pages meet Core Web Vitals thresholds.', cat: 'Technical SEO' },
+  amp_link: { why: 'An AMP link signals an alternate fast-loading version of the page. AMP is no longer required for Top Stories — standard pages that meet Core Web Vitals thresholds qualify.', fix: 'AMP is optional. Focus on Core Web Vitals (LCP ≤ 2.5s, CLS ≤ 0.1, INP ≤ 200ms) for Top Stories eligibility. If you maintain AMP, ensure the <link rel="amphtml"> canonical relationship is correct.', cat: 'Technical SEO' },
 };
 
 function ck(id: string, label: string, status: 'pass' | 'warn' | 'fail' | 'info', detail: string, severity: 'critical' | 'warning' | 'info' = 'warning'): CheckItem {

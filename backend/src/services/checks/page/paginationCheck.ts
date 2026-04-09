@@ -78,17 +78,27 @@ export function runPaginationCheck(
 
     result.notes.push(`URL contains pagination parameter (${paramPattern}) — consider auditing the base URL instead`);
 
-    // Canonical on paginated page should point to base (without page param)
+    // Google's current guidance: each paginated URL should have a SELF-REFERENCING
+    // canonical (canonical = current page URL).  Canonicalizing page 2+ to page 1
+    // is the old (pre-2022) approach and is no longer recommended — it can cause
+    // incorrect content consolidation.
+    // Reference: https://developers.google.com/search/docs/specialty/ecommerce/pagination-and-incremental-page-loading
     if (canonicalUrl) {
       const base = stripPageParam(url);
       const normCanonical = canonicalUrl.replace(/\/+$/, '');
       const normBase = base.replace(/\/+$/, '');
-      if (normCanonical !== normBase && normCanonical !== url.replace(/\/+$/, '')) {
-        // Canonical points somewhere else entirely — just note it
-      } else if (normCanonical === url.replace(/\/+$/, '')) {
-        // Canonical self-references the paginated URL
+      const normSelf = url.replace(/\/+$/, '');
+
+      if (normCanonical === normSelf) {
+        // Self-referencing canonical — this is the CORRECT modern approach
+        result.canonicalPolicyOk = true;
+      } else if (normCanonical === normBase) {
+        // Canonical points to the base (non-paginated) URL — old practice, now discouraged
         result.canonicalPolicyOk = false;
-        result.notes.push('Canonical on paginated page points to itself — should point to base URL without page parameter');
+        result.notes.push('Canonical on paginated page points to the base URL (page 1) — Google now recommends self-referencing canonicals for paginated pages instead');
+      } else {
+        // Canonical points to some other URL entirely — flag it as a note
+        result.notes.push(`Canonical points to an unexpected URL: ${canonicalUrl}`);
       }
     }
   }

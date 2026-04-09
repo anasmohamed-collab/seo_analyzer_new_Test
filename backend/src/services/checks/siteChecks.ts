@@ -28,7 +28,7 @@ const MAX_CHILD_SITEMAPS = 5;
 const MAX_CHILD_SIZE = 5 * 1024 * 1024; // 5 MB
 
 // Re-use shared UA/header profiles from the fetch engine — single source of truth.
-import { UA_BROWSER, UA_GOOGLEBOT, BROWSER_HEADERS, GOOGLEBOT_HEADERS } from '../fetch/fetchEngine.js';
+import { UA_BROWSER, UA_GOOGLEBOT, BROWSER_HEADERS, GOOGLEBOT_HEADERS, isBotProtectionPage } from '../fetch/fetchEngine.js';
 import { gunzipSync } from 'node:zlib';
 
 const UA_FIREFOX = 'Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0';
@@ -298,13 +298,14 @@ function validateSitemapStandards(text: string, rootType: 'urlset' | 'sitemapind
 
 // ── Types ───────────────────────────────────────────────────────
 
-type RobotsStatus = 'FOUND' | 'NOT_FOUND' | 'BLOCKED' | 'ERROR';
+type RobotsStatus = 'FOUND' | 'NOT_FOUND' | 'BLOCKED' | 'BOT_PROTECTION' | 'ERROR';
 type SitemapStatus =
   | 'DISCOVERED'       // found in robots.txt, not yet fetched / fetch pending
   | 'FOUND'            // fetched + validated successfully
   | 'BLOCKED'          // 401/403 even after UA retry
+  | 'BOT_PROTECTION'   // HTTP 200 with WAF/challenge body (not real XML)
   | 'NOT_FOUND'        // 404/410 on all tested paths
-  | 'SOFT_404'         // HTTP 200 but HTML body (not XML)
+  | 'SOFT_404'         // HTTP 200 but generic HTML body (not XML)
   | 'INVALID_XML'      // no valid <urlset>/<sitemapindex> root
   | 'INVALID_FORMAT'   // XML present but structural violations
   | 'ERROR';           // network/timeout/5xx
@@ -353,7 +354,7 @@ interface SitemapResult {
 /** Dedicated Google News sitemap probe result — always checked independently. */
 export interface NewsSitemapResult {
   /** Was at least one news sitemap URL accessible and valid? */
-  status: 'FOUND' | 'BLOCKED' | 'NOT_FOUND' | 'ERROR';
+  status: 'FOUND' | 'BLOCKED' | 'BOT_PROTECTION' | 'NOT_FOUND' | 'ERROR';
   /** The URL where a news sitemap was found (or the last tried URL). */
   url: string | null;
   /** HTTP status returned for the found/blocked URL. */
@@ -404,9 +405,27 @@ async function checkRobots(origin: string): Promise<RobotsResult> {
       return result;
     }
 
-    if (!res.ok) {
+    if (res.status === 404 || res.status === 410) {
+      // Confirmed absence — only emit NOT_FOUND on these specific codes
       result.status = 'NOT_FOUND';
       result.notes.push(`robots.txt returned ${res.status}`);
+      return result;
+    }
+
+    if (!res.ok) {
+      // 5xx, timeout (status 0), network error (status -1) — operational failure,
+      // NOT proof that robots.txt is missing.
+      result.status = 'ERROR';
+      result.notes.push(`robots.txt could not be fetched (HTTP ${res.status || 'network error'})`);
+      return result;
+    }
+
+    // 200 OK — check whether the body is a bot-protection challenge rather than
+    // genuine robots.txt content.  WAF vendors (Cloudflare, Akamai, Imperva, …)
+    // often return 200 with a JS challenge or CAPTCHA page.
+    if (isBotProtectionPage(res.text)) {
+      result.status = 'BOT_PROTECTION';
+      result.notes.push('robots.txt URL returned a bot-protection challenge page (HTTP 200 with challenge body) — search engines cannot read the real robots.txt');
       return result;
     }
 
@@ -488,31 +507,37 @@ async function fetchSitemapWithRetry(
   // Attempt 1: Chrome browser UA (with full Sec-Fetch-* headers)
   console.log(`[sitemap:fetch] chrome-win10 for ${url}`);
   const res1 = await safeFetch(url, SITEMAP_TIMEOUT, { userAgent: UA_BROWSER });
-  retryLog.push(`chrome-win10: HTTP ${res1.status}`);
+  retryLog.push(`chrome-win10: HTTP ${res1.status}${res1.ok && isBotProtectionPage(res1.text) ? ' [challenge]' : ''}`);
   console.log(`[sitemap:fetch] chrome-win10 → HTTP ${res1.status}, redirected: ${res1.redirected}, finalUrl: ${res1.finalUrl}`);
 
-  if (res1.ok || (res1.status !== 401 && res1.status !== 403)) {
+  // Retry conditions: 401/403 denial OR 200 with bot-protection challenge body.
+  const res1Challenge = res1.ok && isBotProtectionPage(res1.text);
+  const res1Denied = res1.status === 401 || res1.status === 403;
+  if (!res1Challenge && !res1Denied) {
+    // Either genuine success or an unretryable status (404, 5xx, timeout) — return as-is
     return { res: res1, retryLog };
   }
 
   // Attempt 2: Firefox UA — different TLS fingerprint and Accept-Language
-  console.log(`[sitemap:fetch] firefox-linux for ${url} (was HTTP ${res1.status})`);
+  console.log(`[sitemap:fetch] firefox-linux for ${url} (was HTTP ${res1.status}${res1Challenge ? ' [challenge]' : ''})`);
   const res2 = await safeFetch(url, SITEMAP_TIMEOUT, { userAgent: UA_FIREFOX, extraHeaders: FIREFOX_HEADERS });
-  retryLog.push(`firefox-linux: HTTP ${res2.status}`);
+  retryLog.push(`firefox-linux: HTTP ${res2.status}${res2.ok && isBotProtectionPage(res2.text) ? ' [challenge]' : ''}`);
   console.log(`[sitemap:fetch] firefox-linux → HTTP ${res2.status}`);
 
-  if (res2.ok) return { res: res2, retryLog };
-  if (res2.status !== 401 && res2.status !== 403) return { res: res2, retryLog };
+  const res2Challenge = res2.ok && isBotProtectionPage(res2.text);
+  if (res2.ok && !res2Challenge) return { res: res2, retryLog };
+  if (!res2Challenge && res2.status !== 401 && res2.status !== 403) return { res: res2, retryLog };
 
   // Attempt 3: Googlebot — whitelisted by most news publishers
-  console.log(`[sitemap:fetch] googlebot-2.1 for ${url} (was HTTP ${res2.status})`);
+  console.log(`[sitemap:fetch] googlebot-2.1 for ${url} (was HTTP ${res2.status}${res2Challenge ? ' [challenge]' : ''})`);
   const res3 = await safeFetch(url, SITEMAP_TIMEOUT, { userAgent: UA_GOOGLEBOT });
-  retryLog.push(`googlebot-2.1: HTTP ${res3.status}`);
+  retryLog.push(`googlebot-2.1: HTTP ${res3.status}${res3.ok && isBotProtectionPage(res3.text) ? ' [challenge]' : ''}`);
   console.log(`[sitemap:fetch] googlebot-2.1 → HTTP ${res3.status}`);
 
-  if (res3.ok) return { res: res3, retryLog };
+  const res3Challenge = res3.ok && isBotProtectionPage(res3.text);
+  if (res3.ok && !res3Challenge) return { res: res3, retryLog };
 
-  // All profiles denied — return the one with most information
+  // All profiles denied or challenged — return the one with most information
   // (prefer a response that has a body over one that doesn't)
   const best = [res3, res2, res1].find(r => r.text.length > 0) ?? res1;
   return { res: best, retryLog };
@@ -579,6 +604,16 @@ function classifyAndValidate(
       console.log(`[sitemap:validate] ERROR: unexpected HTTP ${res.status} for ${url}`);
       return result;
     }
+  }
+
+  // ── Bot-protection check (must come before XML/HTML classification) ──
+  // WAF vendors return HTTP 200 with a challenge page.  Such a body is NOT
+  // a soft-404 or invalid-XML — it is an access-classification failure.
+  if (isBotProtectionPage(res.text)) {
+    result.status = 'BOT_PROTECTION';
+    result.errors.push(`${url} returned a bot-protection challenge page (HTTP 200 with challenge body)`);
+    console.log(`[sitemap:validate] BOT_PROTECTION: challenge page detected for ${url}`);
+    return result;
   }
 
   // ── XML content-first validation ──────────────────────────────
@@ -811,13 +846,14 @@ async function discoverAndValidateSitemaps(
   const totalTested = allResults.length;
   const robotsHadSitemaps = robotsSitemaps.length > 0;
   const allWere404 = totalTested > 0 && allResults.every(r => r.status === 'NOT_FOUND');
+  const hasBotProtection = allResults.some(r => r.status === 'BOT_PROTECTION');
   const hasBlocked = allResults.some(r => r.status === 'BLOCKED');
   const hasInvalidXml = allResults.some(r => r.status === 'INVALID_XML');
   const hasInvalidFormat = allResults.some(r => r.status === 'INVALID_FORMAT');
   const hasSoft404 = allResults.some(r => r.status === 'SOFT_404');
   const hasError = allResults.some(r => r.status === 'ERROR');
 
-  console.log(`[sitemap] FINAL: ${totalTested} URLs tested. 404s: ${allWere404}. blocked: ${hasBlocked}. invalid_xml: ${hasInvalidXml}. invalid_format: ${hasInvalidFormat}. soft_404: ${hasSoft404}. error: ${hasError}. robots_sitemaps: ${robotsHadSitemaps}`);
+  console.log(`[sitemap] FINAL: ${totalTested} URLs tested. 404s: ${allWere404}. bot_protection: ${hasBotProtection}. blocked: ${hasBlocked}. invalid_xml: ${hasInvalidXml}. invalid_format: ${hasInvalidFormat}. soft_404: ${hasSoft404}. error: ${hasError}. robots_sitemaps: ${robotsHadSitemaps}`);
 
   // Critical rule: if robots.txt declared sitemaps, NEVER report NOT_FOUND.
   // Instead report DISCOVERED (found but inaccessible) or the specific failure.
@@ -828,9 +864,9 @@ async function discoverAndValidateSitemaps(
     );
 
     if (robotsResult) {
-      // If the robots.txt sitemap was blocked, return BLOCKED (not NOT_FOUND)
-      if (robotsResult.status === 'BLOCKED') {
-        console.log(`[sitemap] RESULT: DISCOVERED in robots.txt but BLOCKED`);
+      // If the robots.txt sitemap was blocked or behind a challenge, return that status
+      if (robotsResult.status === 'BLOCKED' || robotsResult.status === 'BOT_PROTECTION') {
+        console.log(`[sitemap] RESULT: DISCOVERED in robots.txt but ${robotsResult.status}`);
         return { ...robotsResult, discoveredFrom: 'robots.txt' };
       }
       // For any other failure, return DISCOVERED status with the error details
@@ -849,7 +885,12 @@ async function discoverAndValidateSitemaps(
     }
   }
 
-  // Return the most informative failure
+  // Return the most informative failure (BOT_PROTECTION > BLOCKED > structural issues)
+  if (hasBotProtection) {
+    const bot = allResults.find(r => r.status === 'BOT_PROTECTION')!;
+    console.log(`[sitemap] RESULT: BOT_PROTECTION — challenge page detected`);
+    return bot;
+  }
   if (hasBlocked) {
     const blocked = allResults.find(r => r.status === 'BLOCKED')!;
     console.log(`[sitemap] RESULT: BLOCKED — at least one URL returned 401/403`);
@@ -968,6 +1009,7 @@ async function checkNewsSitemapPresence(origin: string): Promise<NewsSitemapResu
 
   let lastBlockedUrl: string | null = null;
   let lastBlockedStatus: number | null = null;
+  let lastBotProtectionUrl: string | null = null;
 
   for (const url of candidates) {
     if (!isSafeUrl(url)) continue;
@@ -1015,8 +1057,16 @@ async function checkNewsSitemapPresence(origin: string): Promise<NewsSitemapResu
       continue;
     }
 
-    // Successful fetch — inspect the body
+    // Successful fetch — check for bot-protection challenge BEFORE XML parsing.
+    // WAF vendors return HTTP 200 with a challenge body that is not real sitemap XML.
     const body = res.text;
+    if (isBotProtectionPage(body)) {
+      console.log(`[news-sitemap] BOT_PROTECTION: ${url} → HTTP 200 with challenge body`);
+      lastBotProtectionUrl = url;
+      lastBlockedStatus = res.status;
+      continue; // treat like an access denial — keep trying other paths
+    }
+
     const root = xmlRoot(body);
     if (!root) {
       console.log(`[news-sitemap] INVALID_XML: ${url} — no valid root element`);
@@ -1058,13 +1108,19 @@ async function checkNewsSitemapPresence(origin: string): Promise<NewsSitemapResu
     return result;
   }
 
-  // Nothing found — report BLOCKED if we hit access-denied, else NOT_FOUND
+  // Nothing found — differentiate hard access-denial from challenge-page blocks
   if (lastBlockedUrl) {
     result.status     = 'BLOCKED';
     result.url        = lastBlockedUrl;
     result.httpStatus = lastBlockedStatus;
     result.notes.push(`News sitemap access blocked (HTTP ${lastBlockedStatus}). Ensure sitemap URLs are publicly accessible without authentication.`);
     console.log(`[news-sitemap] Final status: BLOCKED at ${lastBlockedUrl}`);
+  } else if (lastBotProtectionUrl) {
+    result.status     = 'BOT_PROTECTION';
+    result.url        = lastBotProtectionUrl;
+    result.httpStatus = lastBlockedStatus;
+    result.notes.push('News sitemap URL returned a bot-protection challenge page (HTTP 200 with challenge body) — search engines and this tool cannot read the real sitemap.');
+    console.log(`[news-sitemap] Final status: BOT_PROTECTION at ${lastBotProtectionUrl}`);
   } else {
     result.notes.push(`No news sitemap found at any of ${NEWS_SITEMAP_PATHS.length} standard paths. For Google News publishers, add a /news-sitemap.xml with the news namespace.`);
     console.log('[news-sitemap] Final status: NOT_FOUND');
