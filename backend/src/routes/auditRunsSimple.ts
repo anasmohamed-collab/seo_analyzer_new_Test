@@ -18,7 +18,7 @@ import { scoreResult, scoreSiteChecks } from '../services/checks/scoring.js';
 import { computeLayeredScore } from '../services/checks/scoring/orchestrator.js';
 import type { AuditData } from '../services/checks/scoring/types.js';
 import { runFetchEngine } from '../services/fetch/fetchEngine.js';
-import type { BlockedConfidence } from '../services/fetch/fetchEngine.js';
+import type { BlockedConfidence, ProfileAttempt } from '../services/fetch/fetchEngine.js';
 
 export const auditRunsRouter = Router();
 
@@ -49,24 +49,29 @@ function isSafeUrl(raw: string): boolean {
 //      (runs BEFORE status checks — CF returns 200 with challenge body)
 //   3. Explicit HTTP 404/410 → NOT_FOUND
 //   4. Explicit HTTP 5xx → SERVER_ERROR
-//   5. HIGH/MEDIUM confidence denial → CRAWLER_BLOCKED
-//   6. Fallback → FETCH_ERROR (transient / unknown)
+//   5. Parser failure → PARSE_ERROR (bytes received but decode failed; not a security block)
+//   6. HIGH/MEDIUM confidence denial → CRAWLER_BLOCKED
+//   7. Fallback → FETCH_ERROR (transient / unknown)
 //
 // HIGH confidence is never overridden by FETCH_ERROR fallback.
+// PARSE_ERROR sits between server errors and blocked: the page IS reachable but
+// the body could not be decoded — this is a server-side encoding issue, not blocking.
 
-type PageState =
+export type PageState =
   | 'OK'
   | 'BOT_PROTECTION_CHALLENGE'
   | 'CRAWLER_BLOCKED'
   | 'NOT_FOUND'
   | 'SERVER_ERROR'
+  | 'PARSE_ERROR'
   | 'FETCH_ERROR';
 
-function classifyPageState(
+export function classifyPageState(
   httpStatus: number,
   fetchOk: boolean,
   blockedConfidence: BlockedConfidence,
   challengeDetected: boolean,
+  profilesTried: ProfileAttempt[] = [],
 ): PageState {
   // 1. Real content received
   if (fetchOk) return 'OK';
@@ -79,19 +84,26 @@ function classifyPageState(
   if (httpStatus === 404 || httpStatus === 410) return 'NOT_FOUND';
   if (httpStatus >= 500)                         return 'SERVER_ERROR';
 
-  // 4. Confidence-driven access denial (401/403 or normalised 403 from engine)
+  // 4. Parser failure — bytes were received and an HTTP response was sent, but
+  //    the body could not be decoded (e.g. corrupt gzip). This is NOT a security
+  //    block; the page is reachable but the server sent malformed content.
+  const hasParserFailure = profilesTried.some(a => a.failure_kind === 'parser_failure');
+  if (hasParserFailure) return 'PARSE_ERROR';
+
+  // 5. Confidence-driven access denial (401/403 or normalised 403 from engine)
   if (blockedConfidence === 'HIGH' || blockedConfidence === 'MEDIUM') return 'CRAWLER_BLOCKED';
 
-  // 5. Fallback — transient network issue or unknown failure
+  // 6. Fallback — transient network issue or unknown failure
   return 'FETCH_ERROR';
 }
 
-const PAGE_STATE_MESSAGES: Record<PageState, string> = {
+export const PAGE_STATE_MESSAGES: Record<PageState, string> = {
   OK:                      'Page accessible',
-  BOT_PROTECTION_CHALLENGE:'Bot protection challenge detected — page returned HTTP 200 but content is a WAF/Cloudflare challenge, not real page content.',
+  BOT_PROTECTION_CHALLENGE:'Bot protection challenge detected — the server returned a WAF/Cloudflare challenge page instead of real content. The page IS accessible to real browsers.',
   CRAWLER_BLOCKED:         'Crawler blocked — all fetch profiles denied access (HTTP 401/403).',
   NOT_FOUND:               'Page not found (404/410).',
   SERVER_ERROR:            'Server error (5xx).',
+  PARSE_ERROR:             'Page response could not be decoded — server sent a malformed body (e.g. corrupt gzip). The page may still be accessible to real browsers.',
   FETCH_ERROR:             'Page could not be fetched — may be a transient network issue.',
 };
 
@@ -117,7 +129,8 @@ async function auditSingleUrl(
   } = fetchResult;
 
   // Body-aware classification: challenge signal beats raw HTTP status.
-  const pageState = classifyPageState(httpStatus, fetchOk, blockedConfidence, challengeDetected);
+  // profilesTried is passed so parser failures get PARSE_ERROR instead of FETCH_ERROR.
+  const pageState = classifyPageState(httpStatus, fetchOk, blockedConfidence, challengeDetected, profilesTried);
 
   // fetchOk=true means a profile returned real 2xx content — run all SEO checks.
   // Only skip checks when no profile succeeded AND html is absent/unusable.
@@ -163,7 +176,9 @@ async function auditSingleUrl(
           ? [`All ${profilesTried.length} crawler profiles (Chrome, Firefox, Googlebot) received HTTP ${httpStatus}. Consider whitelisting the crawler IP or enabling Googlebot-compatible access.`]
           : pageState === 'NOT_FOUND'
             ? [`Page returned HTTP ${httpStatus} — verify the URL is correct and the page exists.`]
-            : [`Page could not be fetched — may be a transient network issue. ${blockedReason ?? ''}`],
+            : pageState === 'PARSE_ERROR'
+              ? [`Server returned a body that could not be decoded (HTTP ${httpStatus}). Check Content-Encoding headers and gzip configuration on the server.`]
+              : [`Page could not be fetched — may be a transient network issue. ${blockedReason ?? ''}`],
     };
   }
   const urlOnlyType = detectPageType(finalUrl);

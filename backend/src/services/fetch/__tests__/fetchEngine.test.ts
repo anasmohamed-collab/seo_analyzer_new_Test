@@ -372,3 +372,85 @@ describe('runFetchEngine — confidence thresholds for P1 issues', () => {
     expect(r.blockedConfidence).toBe('MEDIUM');
   });
 });
+
+describe('runFetchEngine — content-type / format scenarios', () => {
+  it('HTML body on a sitemap URL: fetchOk=true, no challenge (engine does not care about format)', async () => {
+    // The fetch engine succeeds if it gets real 2xx + body ≥ 50 bytes.
+    // Content-type mismatch (HTML vs XML) is detected by the sitemap layer, not here.
+    const fetchFn = mockFetchForProfiles({
+      'chrome-win10': makeResponse(200, REAL_HTML, { 'content-type': 'text/html' }),
+    });
+    const r = await runFetchEngine('https://example.com/sitemap.xml', { fetchFn });
+
+    expect(r.fetchOk).toBe(true);
+    expect(r.challengeDetected).toBe(false);
+    expect(r.blockedConfidence).toBe('NONE');
+    expect(r.html).toContain('<html');
+  });
+
+  it('200 with tiny body (<50 bytes): classified as empty_body, loop stops (not WAF-retryable)', async () => {
+    // empty_body is structural (content-level), not a security denial.
+    // The engine does not retry with other profiles for it.
+    const fetchFn = mockFetchForProfiles({
+      'chrome-win10':  makeResponse(200, 'ok'), // < 50 bytes → empty_body
+      'firefox-linux': makeResponse(200, REAL_HTML, { 'content-type': 'text/html' }),
+    });
+    const r = await runFetchEngine('https://example.com/page', { fetchFn });
+
+    expect(r.fetchOk).toBe(false);
+    expect(r.profilesTried).toHaveLength(1); // loop stopped after Chrome
+    expect(r.profilesTried[0].failure_kind).toBe('empty_body');
+  });
+
+  it('real 403 (no challenge body): challengeDetected=false, blockedConfidence=HIGH', async () => {
+    const fetchFn = mockFetchForProfiles({ default: makeResponse(403, '<html><body>Forbidden</body></html>') });
+    const r = await runFetchEngine('https://example.com/page', { fetchFn });
+
+    expect(r.fetchOk).toBe(false);
+    expect(r.challengeDetected).toBe(false);   // no WAF pattern in body
+    expect(r.blockedConfidence).toBe('HIGH');
+    expect(r.profilesTried.every(a => a.failure_kind === 'access_denied')).toBe(true);
+    expect(r.profilesTried.every(a => a.cf_challenge === false)).toBe(true);
+  });
+
+  it('redirect chain: only first profile (Chrome) tracks hops', async () => {
+    let chromeCall = 0;
+    const fetchFn = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const ua = (init?.headers as Record<string, string>)['User-Agent'] ?? '';
+      if (!ua.includes('Chrome')) return makeResponse(200, REAL_HTML);
+      chromeCall++;
+      if (chromeCall === 1) {
+        return {
+          status: 301, ok: false, url: 'https://example.com/page',
+          redirected: false, headers: new Headers({ location: 'https://example.com/final' }),
+          text: async () => '', arrayBuffer: async () => new ArrayBuffer(0),
+        } as unknown as Response;
+      }
+      return makeResponse(200, REAL_HTML, { 'content-type': 'text/html' });
+    }) as unknown as typeof fetch;
+
+    const r = await runFetchEngine('https://example.com/page', { fetchFn });
+    expect(r.fetchOk).toBe(true);
+    expect(r.redirectChain).toHaveLength(1);
+    expect(r.finalUrl).toBe('https://example.com/final');
+  });
+});
+
+describe('runFetchEngine — parser failure edge cases', () => {
+  it('parser_failure stops loop (structural failure, not retried with other profiles)', async () => {
+    const corrupt = Buffer.from([0x1f, 0x8b, 0x00, 0x00, 0xff, 0xff]); // invalid gzip
+    const fetchFn = vi.fn(async () =>
+      makeResponse(200, corrupt.buffer as ArrayBuffer, { 'content-type': 'application/gzip' }),
+    ) as unknown as typeof fetch;
+
+    const r = await runFetchEngine('https://example.com/sitemap.xml.gz', { fetchFn });
+
+    expect(r.fetchOk).toBe(false);
+    expect(r.profilesTried[0].failure_kind).toBe('parser_failure');
+    // Loop breaks on parser_failure — only Chrome tried
+    expect(r.profilesTried).toHaveLength(1);
+    // Not a security block
+    expect(r.blockedConfidence).not.toBe('HIGH');
+    expect(r.challengeDetected).toBe(false);
+  });
+});
