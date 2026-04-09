@@ -213,23 +213,42 @@ describe('runFetchEngine — blocked cases', () => {
     expect(r.profilesTried.every(a => a.failure_kind === 'access_denied')).toBe(true);
   });
 
-  it('WAF challenge (200 + CF HTML): treated as blocked, not real content', async () => {
+  it('WAF challenge (200 + CF HTML): challengeDetected=true, httpStatus normalised to 403', async () => {
     const fetchFn = mockFetchForProfiles({ default: makeResponse(200, CF_CHALLENGE_HTML) });
     const r = await runFetchEngine('https://example.com/page', { fetchFn });
 
     expect(r.fetchOk).toBe(false);
+    expect(r.challengeDetected).toBe(true);
+    // Status must be normalised to 403 (not 200) so downstream classifiers work
+    expect(r.httpStatus).toBe(403);
     expect(r.blockedConfidence).toBe('HIGH');
     expect(r.profilesTried.every(a => a.cf_challenge === true)).toBe(true);
     expect(r.profilesTried.every(a => a.failure_kind === 'waf_challenge')).toBe(true);
   });
 
-  it('WAF challenge (403 + CF HTML): same as above', async () => {
+  it('WAF challenge (403 + CF HTML): challengeDetected=true', async () => {
     const fetchFn = mockFetchForProfiles({ default: makeResponse(403, CF_CHALLENGE_HTML) });
     const r = await runFetchEngine('https://example.com/page', { fetchFn });
 
     expect(r.fetchOk).toBe(false);
+    expect(r.challengeDetected).toBe(true);
+    expect(r.httpStatus).toBe(403);
     expect(r.profilesTried[0].cf_challenge).toBe(true);
     expect(r.profilesTried[0].failure_kind).toBe('waf_challenge');
+  });
+
+  it('WAF challenge on 200 does NOT produce FETCH_ERROR (regression test for alkhaleej.ae)', async () => {
+    // Cloudflare IUAM returns HTTP 200 but body is a challenge page.
+    // Must NOT fall through to FETCH_ERROR — must be BOT_PROTECTION_CHALLENGE.
+    const fetchFn = mockFetchForProfiles({ default: makeResponse(200, CF_CHALLENGE_HTML) });
+    const r = await runFetchEngine('https://www.alkhaleej.ae/', { fetchFn });
+
+    expect(r.fetchOk).toBe(false);
+    expect(r.challengeDetected).toBe(true);
+    // httpStatus normalised away from 200
+    expect(r.httpStatus).not.toBe(200);
+    // confidence is HIGH — body signal confirmed across all profiles
+    expect(r.blockedConfidence).toBe('HIGH');
   });
 
   it('404 not found: HIGH confidence immediately, stops after Chrome', async () => {

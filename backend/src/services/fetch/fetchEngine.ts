@@ -112,6 +112,12 @@ export interface FetchEngineResult {
   /** One entry per UA profile attempted — full evidence trail */
   profilesTried: ProfileAttempt[];
   blockedConfidence: BlockedConfidence;
+  /**
+   * true when at least one profile detected a WAF/CF challenge page in the body.
+   * Crucially, this can be true even when httpStatus === 200 — Cloudflare's IUAM
+   * and Managed Challenge modes return 200 with a JS challenge body.
+   */
+  challengeDetected: boolean;
   /** Human-readable reason, null when not blocked */
   blockedReason: string | null;
 }
@@ -577,18 +583,34 @@ export async function runFetchEngine(
     }
   }
 
-  // Use last-seen status when all profiles failed
+  // ── Status normalization (body-aware) ───────────────────────────
+  // When all profiles failed we want httpStatus to reflect the EFFECTIVE block
+  // type, not whatever raw code the WAF sent.  Cloudflare returns 200 with a
+  // challenge body — downstream classifiers must see 403 so they don't fall
+  // through to the generic FETCH_ERROR branch.
   if (!fetchOk && httpStatus === 0 && profilesTried.length > 0) {
-    httpStatus = profilesTried.at(-1)!.status;
+    const hasDenial = profilesTried.some(
+      a => a.failure_kind === 'access_denied' || a.failure_kind === 'waf_challenge',
+    );
+    httpStatus = hasDenial
+      ? 403  // normalise WAF/CF 200-challenges to blocked status
+      : (profilesTried.at(-1)!.status || 0);
   }
+
+  // ── Body-based challenge signal ──────────────────────────────────
+  // True when ANY profile found a challenge page (regardless of HTTP status).
+  // This is the primary signal for BOT_PROTECTION_CHALLENGE classification.
+  const challengeDetected = profilesTried.some(
+    a => a.cf_challenge || a.failure_kind === 'waf_challenge',
+  );
 
   const { confidence, reason } = computeBlockedConfidence(profilesTried);
 
   if (!fetchOk) {
     const summary = profilesTried
-      .map(a => `  ${a.profile}: HTTP ${a.status} / ${a.failure_kind}${a.cf_challenge ? ' [CF]' : ''}${a.error ? ` — ${a.error}` : ''}`)
+      .map(a => `  ${a.profile}: HTTP ${a.status} / ${a.failure_kind}${a.cf_challenge ? ' [CF-challenge]' : ''}${a.error ? ` — ${a.error}` : ''}`)
       .join('\n');
-    console.log(`[fetch] BLOCKED confidence=${confidence} for ${url} — ${reason}\n${summary}`);
+    console.log(`[fetch] BLOCKED confidence=${confidence}${challengeDetected ? ' CHALLENGE' : ''} for ${url} — ${reason}\n${summary}`);
   }
 
   return {
@@ -597,6 +619,7 @@ export async function runFetchEngine(
     elapsedMs:         Date.now() - overallStart,
     winningProfile,
     profilesTried,
+    challengeDetected,
     blockedConfidence: confidence,
     blockedReason:     reason,
   };
