@@ -121,9 +121,9 @@ export function scoreResult(data: CheckData): ScoringResult {
   // ── Canonical ──────────────────────────────────────────────────
   if (data.canonical) {
     if (!data.canonical.exists) {
-      escalate('FAIL');
+      escalate('WARN');
       recs.push({
-        priority: 'P0', area: 'canonical',
+        priority: 'P1', area: 'canonical',
         message: 'Missing rel=canonical tag',
         fixHint: 'Add <link rel="canonical" href="..."> in <head> pointing to the preferred URL.',
       });
@@ -506,8 +506,8 @@ export function scoreResult(data: CheckData): ScoringResult {
       escalate('WARN');
       recs.push({
         priority: 'P1', area: 'pagination',
-        message: 'Paginated page canonical points to itself instead of base URL',
-        fixHint: 'Set the canonical on paginated pages to the base (non-paginated) URL.',
+        message: 'Paginated page canonical points to the base URL (page 1) instead of self-referencing',
+        fixHint: 'Per Google\'s current guidance, each paginated URL should have a self-referencing canonical (canonical = current page URL). Canonicalizing page 2+ to page 1 is no longer recommended and may cause incorrect content consolidation.',
       });
     }
   }
@@ -573,22 +573,29 @@ export function scoreSiteChecks(data: SiteChecksData | null): Recommendation[] {
 
   if (data.robots) {
     if (data.robots.status === 'NOT_FOUND') {
+      // Only emit this when we have a confirmed 404/410 — not on network errors
       recs.push({
         priority: 'P1', area: 'robots',
-        message: 'robots.txt not found',
+        message: 'robots.txt not found (HTTP 404)',
         fixHint: 'Create a robots.txt at the root of your domain with Sitemap: directives.',
       });
     } else if (data.robots.status === 'BLOCKED') {
       recs.push({
         priority: 'P1', area: 'robots',
-        message: 'robots.txt returned 401/403',
-        fixHint: 'Ensure robots.txt is publicly accessible.',
+        message: 'robots.txt access denied (HTTP 401/403)',
+        fixHint: 'Ensure robots.txt is publicly accessible without authentication.',
+      });
+    } else if (data.robots.status === 'BOT_PROTECTION') {
+      recs.push({
+        priority: 'P1', area: 'robots',
+        message: 'robots.txt URL is served behind a bot-protection challenge page',
+        fixHint: 'Ensure robots.txt is directly accessible without WAF challenge gates — search engines need to read it without solving CAPTCHAs.',
       });
     } else if (data.robots.status === 'ERROR') {
       recs.push({
         priority: 'P2', area: 'robots',
-        message: 'robots.txt could not be checked',
-        fixHint: 'Verify the domain is reachable.',
+        message: 'robots.txt could not be fetched (network or server error)',
+        fixHint: 'Verify the domain is reachable. This may be a transient network issue — re-run the audit to confirm.',
       });
     }
 
@@ -655,6 +662,12 @@ export function scoreSiteChecks(data: SiteChecksData | null): Recommendation[] {
         priority: 'P1', area: 'sitemap',
         message: 'Sitemap access is blocked (HTTP 401/403, tried browser + Googlebot UA)',
         fixHint: 'Ensure sitemap URLs are publicly accessible without authentication.',
+      });
+    } else if (data.sitemap.status === 'BOT_PROTECTION') {
+      recs.push({
+        priority: 'P1', area: 'sitemap',
+        message: 'Sitemap URL returned a bot-protection challenge page (HTTP 200 with challenge body)',
+        fixHint: 'The sitemap URL is behind a WAF challenge. Ensure it is directly accessible without CAPTCHA or interstitial gates — search engines cannot parse challenge pages as XML.',
       });
     } else if (data.sitemap.status === 'SOFT_404') {
       recs.push({
@@ -742,8 +755,14 @@ export function scoreSiteChecks(data: SiteChecksData | null): Recommendation[] {
     } else if (ns.status === 'BLOCKED') {
       recs.push({
         priority: 'P1', area: 'news',
-        message: `News sitemap access blocked (HTTP 401/403) at ${ns.url ?? 'unknown path'}`,
+        message: `News sitemap access denied (HTTP 401/403) at ${ns.url ?? 'unknown path'}`,
         fixHint: 'Ensure the news sitemap URL is publicly accessible without authentication. Both browsers and Googlebot must be able to fetch it.',
+      });
+    } else if (ns.status === 'BOT_PROTECTION') {
+      recs.push({
+        priority: 'P1', area: 'news',
+        message: `News sitemap URL is behind a bot-protection challenge at ${ns.url ?? 'unknown path'}`,
+        fixHint: 'The news sitemap URL returned a challenge/CAPTCHA page. Ensure it is directly accessible — Googlebot cannot solve challenges to read sitemap XML.',
       });
     } else if (ns.status === 'FOUND') {
       if (!ns.hasNewsNamespace) {

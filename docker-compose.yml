@@ -57,12 +57,16 @@ services:
     build:
       context: ./scrapling-sidecar
     restart: unless-stopped
+    environment:
+      # Limit parallel headless sessions to avoid OOM; increase if host has ≥8 GB RAM
+      MAX_STEALTH_CONCURRENT: ${MAX_STEALTH_CONCURRENT:-2}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
       interval: 30s
-      timeout: 5s
-      start_period: 10s
-      retries: 3
+      timeout: 10s
+      # Longer start_period: browser binary init takes several seconds on first run
+      start_period: 60s
+      retries: 5
 
 volumes:
   postgres_data:

@@ -133,8 +133,11 @@ async function auditSingleUrl(
   const pageState = classifyPageState(httpStatus, fetchOk, blockedConfidence, challengeDetected, profilesTried);
 
   // fetchOk=true means a profile returned real 2xx content — run all SEO checks.
-  // Only skip checks when no profile succeeded AND html is absent/unusable.
-  const hasUsableHtml = fetchOk && html.length > 500 && /<!doctype|<html|<head|<body/i.test(html);
+  // Gate on valid HTML structure, not an arbitrary byte count.
+  // fetchEngine already guarantees html.length >= 50 when fetchOk=true, so the
+  // structure check is sufficient to confirm this is parseable HTML (not XML,
+  // JSON, or binary), without falsely excluding thin/lightweight pages.
+  const hasUsableHtml = fetchOk && /<!doctype|<html|<head|<body/i.test(html);
 
   if (!hasUsableHtml) {
     const urlOnlyType = detectPageType(finalUrl);
@@ -171,7 +174,7 @@ async function auditSingleUrl(
       status: returnStatus,
       error: PAGE_STATE_MESSAGES[pageState],
       recommendations: pageState === 'BOT_PROTECTION_CHALLENGE'
-        ? [`Cloudflare/WAF challenge page returned instead of real content (HTTP ${httpStatus} with challenge body). Enable the Scrapling headless-browser sidecar (SCRAPLING_SIDECAR_URL) to bypass JS challenges.`]
+        ? [`WAF/challenge page detected (HTTP ${httpStatus} with challenge body). The crawler tried ${profilesTried.length} UA profiles and the Scrapling headless-browser sidecar. If the sidecar is not configured, set SCRAPLING_SIDECAR_URL to enable automatic JS-challenge bypass.`]
         : pageState === 'CRAWLER_BLOCKED'
           ? [`All ${profilesTried.length} crawler profiles (Chrome, Firefox, Googlebot) received HTTP ${httpStatus}. Consider whitelisting the crawler IP or enabling Googlebot-compatible access.`]
           : pageState === 'NOT_FOUND'

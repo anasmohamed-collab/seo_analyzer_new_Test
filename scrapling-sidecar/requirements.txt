@@ -1,3 +1,7 @@
 flask==3.1.*
 gunicorn==23.*
 scrapling>=0.2.9,<1
+# Camoufox is the headless-browser backend used by StealthyFetcher.
+# The browser binary is downloaded separately during Docker build
+# via `python -m camoufox fetch`.
+camoufox>=0.4.0

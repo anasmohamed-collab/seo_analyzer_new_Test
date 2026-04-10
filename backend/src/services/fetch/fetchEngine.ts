@@ -134,20 +134,74 @@ export interface FetchEngineOptions {
   fetchFn?: typeof fetch;
 }
 
-// ── CF / WAF challenge detection ─────────────────────────────────
+// ── Bot-protection / challenge-page detection ────────────────────
 
 /**
- * Returns true when html looks like a Cloudflare challenge page.
- * Patterns are CF-specific — no legitimate page matches any of them.
+ * Vendor-agnostic check for WAF challenge / CAPTCHA / interstitial pages.
+ *
+ * Returns true when the HTML body looks like any kind of bot-protection gate
+ * rather than real page content.  Covers:
+ *   Cloudflare (IUAM / Managed Challenge / Turnstile),
+ *   Akamai Bot Manager, Imperva/Incapsula, DataDome, PerimeterX/HUMAN,
+ *   AWS WAF, hCaptcha interstitials, and generic challenge-phrase titles.
+ *
+ * Patterns are chosen to be high-precision (very unlikely to match real pages).
+ */
+export function isBotProtectionPage(html: string): boolean {
+  if (!html || html.length < 10) return false;
+
+  // ── Cloudflare ──────────────────────────────────────────────────
+  if (/window\._cf_chl_opt\b/.test(html))                           return true; // CF JS challenge
+  if (/<title>\s*Just a moment\.\.\.\s*<\/title>/i.test(html))      return true; // CF IUAM title
+  if (/\/cdn-cgi\/challenge-platform\//.test(html))                  return true; // CF challenge CDN
+  if (/id="cf-browser-verification"/.test(html))                     return true; // Older CF check
+  if (/class="cf-turnstile"/.test(html))                             return true; // CF Turnstile
+  if (/<title>\s*Attention Required!\s*<\/title>/i.test(html))       return true; // CF firewall block
+
+  // ── Akamai Bot Manager ──────────────────────────────────────────
+  // Both cookies together are a strong signal; either alone can appear on normal pages.
+  if (/_abck=/.test(html) && /ak_bmsc=/.test(html))                  return true;
+  if (/sensor_data.*akamai/i.test(html))                             return true;
+
+  // ── Imperva / Incapsula ─────────────────────────────────────────
+  if (/<!-- Incapsula incident ID:/.test(html))                      return true;
+  // Both session cookies together (incap_ses_ and visid_incap_) are vendor-specific
+  if (/incap_ses_\w+/.test(html) && /visid_incap_\w+/.test(html))   return true;
+
+  // ── DataDome ───────────────────────────────────────────────────
+  if (/tag\.captcha-delivery\.com/.test(html))                       return true;
+  if (/window\.ddjskey\s*=/.test(html))                              return true;
+
+  // ── PerimeterX / HUMAN ─────────────────────────────────────────
+  if (/_pxAppId\s*=/.test(html))                                     return true;
+  if (/px-captcha|class="pxCaptcha"/.test(html))                     return true;
+
+  // ── AWS WAF challenge ───────────────────────────────────────────
+  if (/aws-waf-token/.test(html))                                    return true;
+  if (/awswaf.*checksum/i.test(html))                                return true;
+
+  // ── hCaptcha interstitial (full-page gate, not embedded widget) ─
+  if (/hcaptcha\.com\/1\/api\.js/.test(html) &&
+      /verify|bot|human/i.test(html.slice(0, 2000)))                 return true;
+
+  // ── Generic challenge phrases in <title> ────────────────────────
+  // Match only when the entire title is a standard challenge phrase, minimising
+  // false-positives on legitimate pages that happen to use similar words.
+  const titleMatch = /<title[^>]*>([\s\S]{0,200}?)<\/title>/i.exec(html);
+  if (titleMatch) {
+    const title = titleMatch[1].trim();
+    if (/^(verify you are human|human verification|bot check|ddos protection(?: by \w+)?|please verify you are( a)? human|you have been blocked|browser integrity check|security check required|checking your browser\.\.\.|please wait\.\.\.|one more step)$/i.test(title)) return true;
+  }
+
+  return false;
+}
+
+/**
+ * @deprecated Retained for backward-compatibility — delegates to isBotProtectionPage().
+ * New code should call isBotProtectionPage() directly.
  */
 export function isCloudflareChallengePage(html: string): boolean {
-  if (!html) return false;
-  if (/window\._cf_chl_opt\b/.test(html))                      return true; // CF JS challenge
-  if (/<title>\s*Just a moment\.\.\.\s*<\/title>/i.test(html)) return true; // CF IUAM title
-  if (/\/cdn-cgi\/challenge-platform\//.test(html))             return true; // CF challenge CDN
-  if (/id="cf-browser-verification"/.test(html))                return true; // Older CF check
-  if (/class="cf-turnstile"/.test(html))                        return true; // CF Turnstile
-  return false;
+  return isBotProtectionPage(html);
 }
 
 // ── Network-error classifier ─────────────────────────────────────
@@ -309,14 +363,29 @@ function computeBlockedConfidence(
 
 // ── Scrapling sidecar ─────────────────────────────────────────────
 
+/**
+ * Call the Scrapling sidecar service.
+ *
+ * @param lastFailureKind - failure kind from the last native profile attempt.
+ *   When 'waf_challenge' we pass mode='stealth' so the sidecar skips its standard
+ *   Tier-1 attempt and goes straight to the headless browser.  For other failure
+ *   kinds we use mode='auto' (Tier-1 first, Tier-2 on challenge detection).
+ */
 async function tryScrapling(
   url: string,
   sidecarBase: string,
   signal: AbortSignal,
   fetchFn: typeof fetch,
   maxBytes: number,
+  lastFailureKind?: FailureKind,
 ): Promise<{ attempt: ProfileAttempt; html: string }> {
   const startMs = Date.now();
+
+  // Choose mode: 'stealth' when we already confirmed a WAF challenge;
+  // 'auto' otherwise (sidecar will auto-escalate if it detects a challenge).
+  const mode: 'auto' | 'stealth' =
+    lastFailureKind === 'waf_challenge' ? 'stealth' : 'auto';
+
   const attempt: ProfileAttempt = {
     profile: 'scrapling', attempted_url: url, final_url: url,
     status: 0, ok: false, failure_kind: 'timeout',
@@ -328,7 +397,7 @@ async function tryScrapling(
     const sidecarRes = await fetchFn(`${sidecarBase}/fetch`, {
       method: 'POST', signal,
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, timeout: 20 }),
+      body: JSON.stringify({ url, timeout: 25, mode }),
     });
 
     if (!sidecarRes.ok) {
@@ -340,33 +409,65 @@ async function tryScrapling(
     }
 
     const data = await sidecarRes.json() as {
-      html?: string; status?: number;
-      headers?: Record<string, string>; final_url?: string;
+      html?: string;
+      status?: number;
+      headers?: Record<string, string>;
+      url?: string;
+      final_url?: string;
+      elapsed_ms?: number;
+      challenge_detected?: boolean;
+      bypassed?: boolean;
+      mode_used?: string;
+      error?: string;
     };
+
+    if (data.error) {
+      // Sidecar returned a structured error (e.g. StealthyFetcher unavailable)
+      attempt.failure_kind = 'server_error';
+      attempt.error        = data.error;
+      attempt.elapsed_ms   = Date.now() - startMs;
+      return { attempt, html: '' };
+    }
 
     const rawHtml  = data.html ?? '';
     const html     = rawHtml.length > maxBytes ? rawHtml.slice(0, maxBytes) : rawHtml;
     const status   = data.status ?? 0;
-    const cfCheck  = isCloudflareChallengePage(html);
 
     attempt.status       = status;
-    attempt.final_url    = data.final_url ?? url;
+    attempt.final_url    = data.url ?? data.final_url ?? url;
     attempt.content_type = data.headers?.['content-type'] ?? '';
     attempt.x_robots_tag = data.headers?.['x-robots-tag'] ?? '';
     attempt.html_length  = html.length;
-    attempt.cf_challenge = cfCheck;
     attempt.elapsed_ms   = Date.now() - startMs;
 
-    if (cfCheck) {
+    // Use the sidecar's own challenge_detected signal when available;
+    // fall back to our local detector as safety net.
+    const challengeSignal = data.challenge_detected ?? isBotProtectionPage(html);
+    attempt.cf_challenge = challengeSignal;
+
+    if (challengeSignal) {
+      // Sidecar confirmed a challenge page — even stealth couldn't bypass it.
       attempt.failure_kind = 'waf_challenge';
+      console.log(
+        `[fetch] scrapling(${data.mode_used ?? mode}): challenge NOT bypassed for ${url}`,
+      );
       return { attempt, html: '' };
     }
+
     if (status >= 200 && status < 300 && html.length >= 50) {
       attempt.ok           = true;
       attempt.failure_kind = 'success';
+      const bypassedStr = data.bypassed ? ' [WAF bypassed]' : '';
+      console.log(
+        `[fetch] scrapling(${data.mode_used ?? mode}): HTTP ${status}${bypassedStr} for ${url}`,
+      );
       return { attempt, html };
     }
-    attempt.failure_kind = status === 0 ? 'timeout' : (status >= 400 && status < 500 ? 'access_denied' : 'server_error');
+
+    attempt.failure_kind =
+      status === 0 ? 'timeout' :
+      status >= 400 && status < 500 ? 'access_denied' :
+      'server_error';
     return { attempt, html: '' };
 
   } catch (err: unknown) {
@@ -494,7 +595,7 @@ export async function runFetchEngine(
         break; // redirect loop is structural — no point trying other profiles
       }
 
-      const cfChallenge = isCloudflareChallengePage(text);
+      const cfChallenge = isBotProtectionPage(text);
 
       attempt.status         = resStatus;
       attempt.final_url      = resFinalUrl;
@@ -564,9 +665,9 @@ export async function runFetchEngine(
       lastKind === 'timeout'
     );
     if (tryIt) {
-      console.log(`[fetch] Scrapling sidecar for ${url}`);
+      console.log(`[fetch] Scrapling sidecar (mode=${lastKind === 'waf_challenge' ? 'stealth' : 'auto'}) for ${url}`);
       const { attempt: sa, html: saHtml } = await tryScrapling(
-        finalUrl || url, scraplingBase, signal, fetchFn, maxBytes,
+        finalUrl || url, scraplingBase, signal, fetchFn, maxBytes, lastKind,
       );
       profilesTried.push(sa);
 
