@@ -210,17 +210,21 @@ export function scoreTechnicalQuality(data: AuditData): ScoringSignal[] {
       availability: 'implemented',
     });
 
-    // H1 structure
+    // H1 structure — Critical: missing / empty / multiple H1s all score 0
     signals.push({
       id: 'h1_structure',
       label: 'H1 Heading',
       category: 'quality',
-      score: meta.h1Ok ? 1 : 0.3,
-      weight: 0.05,
+      score: meta.h1Ok ? 1 : 0,
+      weight: 0.08,
       rawValue: { h1: meta.h1, count: meta.h1Count },
       explanation: meta.h1Ok
         ? 'Proper H1 structure'
-        : meta.h1Count === 0 ? 'Missing H1 heading' : `${meta.h1Count} H1 tags — should have exactly one`,
+        : meta.h1Count === 0
+          ? 'Missing H1 heading'
+          : meta.h1 == null
+            ? 'H1 tag present but contains no meaningful text'
+            : `${meta.h1Count} H1 tags — should have exactly one`,
       availability: 'implemented',
     });
 

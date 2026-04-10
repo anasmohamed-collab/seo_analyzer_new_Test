@@ -261,29 +261,18 @@ export function runContentMetaCheck(
     descLenOk = true;
   }
 
-  // H1
+  // H1 — Critical checks: missing, empty, or multiple H1s all fail
   const h1s = extractH1s(html);
+  const nonEmptyH1s = h1s.filter(t => t.length > 0);
   let h1Ok = false;
-  if (pageType === 'article' || pageType === 'section') {
-    if (h1s.length === 1) {
-      h1Ok = true;
-    } else if (h1s.length === 0) {
-      warnings.push('No H1 heading found');
-    } else {
-      warnings.push(`Multiple H1 headings (${h1s.length}) — article/section pages should have exactly 1`);
-    }
-  } else if (pageType === 'home') {
-    if (h1s.length === 0) {
-      warnings.push('No H1 heading found');
-    } else {
-      h1Ok = true;
-      if (h1s.length > 1) {
-        warnings.push(`Multiple H1 headings (${h1s.length}) on home page`);
-      }
-    }
+  if (h1s.length === 0) {
+    warnings.push('No H1 heading found');
+  } else if (nonEmptyH1s.length === 0) {
+    warnings.push('H1 tag present but contains no meaningful text');
+  } else if (nonEmptyH1s.length > 1) {
+    warnings.push(`Multiple H1 headings (${nonEmptyH1s.length}) — use exactly one H1 per page`);
   } else {
-    h1Ok = h1s.length >= 1;
-    if (h1s.length === 0) warnings.push('No H1 heading found');
+    h1Ok = true;
   }
 
   // Robots meta
@@ -319,7 +308,7 @@ export function runContentMetaCheck(
     description: desc,
     descLen,
     descLenOk,
-    h1: h1s[0] ?? null,
+    h1: nonEmptyH1s[0] ?? null,
     h1Count: h1s.length,
     h1Ok,
     robotsMeta,

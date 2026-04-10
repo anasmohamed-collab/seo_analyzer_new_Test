@@ -497,7 +497,7 @@ function generateRecommendations(analysis: TechnicalSEOAnalysis): string[] {
   }
 
   if (!analysis.meta.h1) {
-    recommendations.push('Add an H1 heading to your page');
+    recommendations.push('CRITICAL: Missing H1 tag — add an H1 heading to your page');
   }
 
   if (analysis.meta.word_count < 300) {
@@ -545,7 +545,7 @@ function generateRecommendations(analysis: TechnicalSEOAnalysis): string[] {
   }
 
   if (analysis.content_analysis.headings.h1.length > 1) {
-    recommendations.push('Use only one H1 heading per page for better SEO');
+    recommendations.push('CRITICAL: Multiple H1 tags detected — use only one H1 heading per page');
   }
 
   if (analysis.content_analysis.headings.h2.length < 2 && analysis.meta.word_count > 300) {

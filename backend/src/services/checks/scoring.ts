@@ -361,13 +361,19 @@ export function scoreResult(data: CheckData): ScoringResult {
       });
     }
     if (!data.contentMeta.h1Ok) {
-      escalate('WARN');
+      escalate('FAIL');
+      const h1Count = data.contentMeta.h1Count ?? 0;
+      const h1Text  = data.contentMeta.h1 ?? null;
+      const h1Msg =
+        h1Count === 0
+          ? 'Critical: Missing H1 tag — every page must have exactly one H1'
+          : h1Text === null
+            ? 'Critical: H1 tag is empty — H1 must contain meaningful text'
+            : `Critical: Multiple H1 tags detected (${h1Count}) — use exactly one H1 per page`;
       recs.push({
-        priority: 'P1', area: 'meta',
-        message: data.contentMeta.h1Count === 0
-          ? 'Missing H1 heading — consider adding one H1 that matches the page topic'
-          : `Multiple H1 headings found (${data.contentMeta.h1Count}) — best practice is one H1 per page`,
-        fixHint: 'Best practice is exactly one <h1> tag per page matching the main topic. Google does not treat missing or multiple H1s as a hard blocker, but a clear H1 improves clarity for crawlers and users.',
+        priority: 'P0', area: 'meta',
+        message: h1Msg,
+        fixHint: 'Each page must have exactly one <h1> tag with descriptive text. The H1 should match the main topic of the page and differ from the <title> tag.',
       });
     }
     if (data.contentMeta.duplicateTitle) {

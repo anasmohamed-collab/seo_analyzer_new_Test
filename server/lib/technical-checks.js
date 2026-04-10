@@ -341,7 +341,7 @@ export function generateRecommendations(a) {
   if (a.technical_seo.missing_description) recs.push('CRITICAL: Add a meta description to your page');
   else if (!a.meta.description || a.meta.description.length < 10) recs.push('Add a meta description (150-160 characters recommended)');
   else if (a.meta.description.length > 170) recs.push('Meta description is too long, keep it under 160 characters');
-  if (!a.meta.h1) recs.push('Add an H1 heading to your page');
+  if (!a.meta.h1) recs.push('CRITICAL: Missing H1 tag — add an H1 heading to your page');
   if (a.meta.word_count < 300) recs.push('Consider adding more content (minimum 300 words recommended)');
   if (!a.technical_seo.robots_txt_valid) recs.push('Add a robots.txt file to guide search engine crawlers');
   if (!a.technical_seo.sitemap_xml_valid) recs.push('Add a sitemap.xml file to help search engines discover your pages');
@@ -353,7 +353,7 @@ export function generateRecommendations(a) {
   if (a.technical_seo.broken_internal_links > 0) recs.push(`Fix ${a.technical_seo.broken_internal_links} broken internal links`);
   if (a.technical_seo.broken_external_links > 0) recs.push(`Fix ${a.technical_seo.broken_external_links} broken external links`);
   if (!a.technical_seo.structured_data_valid && a.technical_seo.structured_data.length > 0) recs.push('Fix invalid structured data (JSON-LD)');
-  if (a.content_analysis.headings.h1.length > 1) recs.push('Use only one H1 heading per page');
+  if (a.content_analysis.headings.h1.length > 1) recs.push('CRITICAL: Multiple H1 tags detected — use only one H1 heading per page');
   if (a.content_analysis.headings.h2.length < 2 && a.meta.word_count > 300) recs.push('Add more H2 headings to structure content');
   if (a.content_analysis.content_uniqueness_score < 40) recs.push('Improve content uniqueness');
   if (!a.performance.viewport_meta) recs.push('Add viewport meta tag for mobile-friendliness');
