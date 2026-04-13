@@ -2,6 +2,7 @@ import process from 'node:process';
 import express from 'express';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { readFileSync as _readFileSync } from 'node:fs';
 import { seoIntelligenceRouter } from './routes/seo-intelligence.js';
 import { seoCrawlerRouter } from './routes/seo-site-crawler.js';
 import { newsSeoRouter } from './routes/news-seo.js';
@@ -9,6 +10,32 @@ import { unifiedAuditRouter } from './routes/unified-audit.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+
+// --------------- Load .env file if present (fallback for platforms that don't inject env vars) ---------------
+try {
+  const envPath = join(__dirname, '..', '.env');
+  const envContent = _readFileSync(envPath, 'utf8');
+  for (const line of envContent.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx === -1) continue;
+    const key = trimmed.slice(0, eqIdx).trim();
+    const val = trimmed.slice(eqIdx + 1).trim();
+    if (key && val && !process.env[key]) {
+      process.env[key] = val;
+    }
+  }
+  console.log('[env] Loaded variables from .env file');
+} catch {
+  // No .env file — rely on platform-injected environment variables (normal in production)
+}
+
+// --------------- Debug: log which DB-related env vars are present ---------------
+const _dbVars = Object.keys(process.env).filter(k =>
+  k.includes('DATABASE') || k.includes('POSTGRES') || k.includes('PG_')
+);
+console.log('[env] DB-related env vars present:', _dbVars.length > 0 ? _dbVars.join(', ') : 'none');
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
