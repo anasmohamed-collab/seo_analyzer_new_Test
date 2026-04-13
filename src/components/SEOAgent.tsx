@@ -289,8 +289,8 @@ function buildHomepageChecklist(row: AuditResultRow, siteChecks: Record<string, 
     const descLen = (meta.descLen as number) ?? 0;
     metaGroup.push(ck('description', 'Meta description exists and is valid', meta.descLenOk ? 'pass' : 'warn',
       meta.description ? `${descLen} chars` : 'Missing meta description', 'warning'));
-    metaGroup.push(ck('h1', 'H1 heading exists', meta.h1Ok ? 'pass' : 'warn',
-      meta.h1 ? `"${String(meta.h1).substring(0, 60)}"` : 'No H1 found', 'warning'));
+    metaGroup.push(ck('h1', 'H1 heading exists', meta.h1Ok ? 'pass' : 'fail',
+      meta.h1Ok ? `"${String(meta.h1).substring(0, 60)}"` : !meta.h1 ? 'No H1 found' : `Multiple H1 tags (${meta.h1Count as number})`, 'critical'));
     if (meta.duplicateTitle) metaGroup.push(ck('dup_title', 'Unique title', 'warn', 'Duplicate title found in this audit', 'warning'));
   }
   if (metaGroup.length > 0) groups.push({ id: 'metadata', title: 'Content & Metadata', icon: <FileText className="w-4 h-4" />, checks: metaGroup });
@@ -382,8 +382,8 @@ function buildArticleChecklist(row: AuditResultRow): CheckGroup[] {
       meta.title ? 'warning' : 'critical'));
     metaGroup.push(ck('description', 'Meta description exists', meta.descLenOk ? 'pass' : 'warn',
       meta.description ? `${(meta.descLen as number) ?? 0} chars` : 'Missing meta description', 'warning'));
-    metaGroup.push(ck('h1', 'H1 heading exists', meta.h1Ok ? 'pass' : 'warn',
-      meta.h1 ? `"${String(meta.h1).substring(0, 60)}"` : 'No H1 found', 'warning'));
+    metaGroup.push(ck('h1', 'H1 heading exists', meta.h1Ok ? 'pass' : 'fail',
+      meta.h1Ok ? `"${String(meta.h1).substring(0, 60)}"` : !meta.h1 ? 'No H1 found' : `Multiple H1 tags (${meta.h1Count as number})`, 'critical'));
     const wc = meta.wordCount as number | undefined;
     if (wc !== undefined) {
       metaGroup.push(ck('word_count', 'Word count (min 300)', wc >= 300 ? 'pass' : 'warn', `${wc} words`, wc < 300 ? 'warning' : 'info'));
@@ -540,8 +540,8 @@ function buildAuthorChecklist(row: AuditResultRow): CheckGroup[] {
       meta.title ? `"${String(meta.title).substring(0, 60)}" (${(meta.titleLen as number) ?? 0} chars)` : 'Missing <title>', meta.title ? 'warning' : 'critical'));
     metaGroup.push(ck('description', 'Meta description', meta.descLenOk ? 'pass' : 'warn',
       meta.description ? `${(meta.descLen as number) ?? 0} chars` : 'Missing meta description', 'warning'));
-    metaGroup.push(ck('h1', 'H1 heading', meta.h1Ok ? 'pass' : 'warn',
-      meta.h1 ? `"${String(meta.h1).substring(0, 60)}"` : 'No H1 found', 'warning'));
+    metaGroup.push(ck('h1', 'H1 heading', meta.h1Ok ? 'pass' : 'fail',
+      meta.h1Ok ? `"${String(meta.h1).substring(0, 60)}"` : !meta.h1 ? 'No H1 found' : `Multiple H1 tags (${meta.h1Count as number})`, 'critical'));
   }
   if (metaGroup.length > 0) groups.push({ id: 'metadata', title: 'Content & Metadata', icon: <FileText className="w-4 h-4" />, checks: metaGroup });
 
@@ -609,8 +609,8 @@ function buildVideoChecklist(row: AuditResultRow): CheckGroup[] {
       meta.title ? `"${String(meta.title).substring(0, 60)}" (${(meta.titleLen as number) ?? 0} chars)` : 'Missing <title>', meta.title ? 'warning' : 'critical'));
     metaGroup.push(ck('description', 'Meta description', meta.descLenOk ? 'pass' : 'warn',
       meta.description ? `${(meta.descLen as number) ?? 0} chars` : 'Missing meta description', 'warning'));
-    metaGroup.push(ck('h1', 'H1 heading', meta.h1Ok ? 'pass' : 'warn',
-      meta.h1 ? `"${String(meta.h1).substring(0, 60)}"` : 'No H1 found', 'warning'));
+    metaGroup.push(ck('h1', 'H1 heading', meta.h1Ok ? 'pass' : 'fail',
+      meta.h1Ok ? `"${String(meta.h1).substring(0, 60)}"` : !meta.h1 ? 'No H1 found' : `Multiple H1 tags (${meta.h1Count as number})`, 'critical'));
   }
   if (metaGroup.length > 0) groups.push({ id: 'metadata', title: 'Content & Metadata', icon: <FileText className="w-4 h-4" />, checks: metaGroup });
 
@@ -702,8 +702,8 @@ function buildSectionChecklist(row: AuditResultRow, _siteChecks: Record<string, 
       meta.title ? `"${String(meta.title).substring(0, 60)}" (${(meta.titleLen as number) ?? 0} chars)` : 'Missing <title>', meta.title ? 'warning' : 'critical'));
     metaGroup.push(ck('description', 'Meta description', meta.descLenOk ? 'pass' : 'warn',
       meta.description ? `${(meta.descLen as number) ?? 0} chars` : 'Missing meta description', 'warning'));
-    metaGroup.push(ck('h1', 'H1 heading', meta.h1Ok ? 'pass' : 'warn',
-      meta.h1 ? `"${String(meta.h1).substring(0, 60)}"` : 'No H1 found', 'warning'));
+    metaGroup.push(ck('h1', 'H1 heading', meta.h1Ok ? 'pass' : 'fail',
+      meta.h1Ok ? `"${String(meta.h1).substring(0, 60)}"` : !meta.h1 ? 'No H1 found' : `Multiple H1 tags (${meta.h1Count as number})`, 'critical'));
   }
   if (metaGroup.length > 0) groups.push({ id: 'metadata', title: 'Content & Metadata', icon: <FileText className="w-4 h-4" />, checks: metaGroup });
 

@@ -380,13 +380,13 @@ function buildContentSection(t) {
     t.meta.description ? `${descLen} characters` : 'Missing',
     !t.meta.description ? 'Add a meta description' : descLen > 170 ? 'Shorten to under 160 characters' : descLen < 10 ? 'Make it more descriptive (150-160 chars)' : null));
 
-  checks.push(ck('h1_tag', 'H1 heading', !!t.meta.h1, 'high',
+  checks.push(ck('h1_tag', 'H1 heading', !!t.meta.h1, 'critical',
     t.meta.h1 ? `"${t.meta.h1.substring(0, 80)}"` : 'No H1 found',
-    t.meta.h1 ? null : 'Add an H1 heading'));
+    t.meta.h1 ? null : 'CRITICAL: Add an H1 heading to your page'));
 
   if (t.content_analysis.headings.h1.length > 1) {
-    checks.push(ck('multiple_h1', 'Single H1', false, 'medium',
-      `${t.content_analysis.headings.h1.length} H1 tags found`, 'Use only one H1 per page'));
+    checks.push(ck('multiple_h1', 'Single H1', false, 'critical',
+      `${t.content_analysis.headings.h1.length} H1 tags found`, 'CRITICAL: Multiple H1 tags detected — use only one H1 heading per page'));
   }
 
   checks.push(ck('word_count', 'Word count', t.meta.word_count >= 300, 'medium',
