@@ -15,7 +15,10 @@
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { setDefaultResultOrder } from 'node:dns';
 import pg from 'pg';
+
+setDefaultResultOrder('ipv4first'); // prevent ENETUNREACH on IPv6-disabled container networks
 
 const { Client } = pg;
 const __dirname = dirname(fileURLToPath(import.meta.url));

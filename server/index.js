@@ -1,4 +1,6 @@
 import process from 'node:process';
+import { setDefaultResultOrder } from 'node:dns';
+setDefaultResultOrder('ipv4first'); // prevent ENETUNREACH on IPv6-disabled container networks
 import express from 'express';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
