@@ -31,6 +31,12 @@ try {
   // No .env file — rely on platform-injected environment variables (normal in production)
 }
 
+// Hard-coded fallback: used when .env file is not available in the container
+if (!process.env.DATABASE_URL) {
+  process.env.DATABASE_URL = 'postgresql://postgres:HdcvS57wmDMviDvV@db.cltnpsfbxlyjikzyllxy.supabase.co:5432/postgres?sslmode=require';
+  console.log('[env] Using hard-coded DATABASE_URL fallback');
+}
+
 // --------------- Debug: log which DB-related env vars are present ---------------
 const _dbVars = Object.keys(process.env).filter(k =>
   k.includes('DATABASE') || k.includes('POSTGRES') || k.includes('PG_')
