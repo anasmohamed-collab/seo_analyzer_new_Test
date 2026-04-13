@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useMemo } from 'react';
+import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
 import {
   Search, AlertCircle, CheckCircle, Loader2, ChevronDown, ChevronRight,
   AlertTriangle, XCircle, Shield, Map, Copy, Check, Plus,
@@ -1527,16 +1527,52 @@ const POLL_INTERVAL = 2000;
 const POLL_MAX = 60_000;
 const POLL_MAX_ERRORS = 5;
 
-export default function SEOAgent() {
-  const [homeUrl, setHomeUrl] = useState('');
-  const [articleUrl, setArticleUrl] = useState('');
-  const [optionals, setOptionals] = useState<Record<string, string>>({});
+/* ── Project-layer props (all optional — zero impact when not provided) ── */
+
+interface SEOAgentFormValues {
+  homeUrl?: string;
+  articleUrl?: string;
+  sectionUrl?: string;
+  tagUrl?: string;
+  searchUrl?: string;
+  authorUrl?: string;
+  videoArticleUrl?: string;
+}
+
+interface SEOAgentProps {
+  /** Pre-fill form fields from a saved project's last_form_values */
+  initialFormValues?: SEOAgentFormValues;
+  /** Pre-load a past audit result for display (bypasses running a new audit) */
+  initialRunData?: AuditRunData;
+  /** Called once when a DB-mode audit run is initiated; siteId is the project id */
+  onAuditStarted?: (siteId: string, values: SEOAgentFormValues) => void;
+}
+
+export default function SEOAgent({
+  initialFormValues,
+  initialRunData,
+  onAuditStarted,
+}: SEOAgentProps = {}) {
+  const [homeUrl, setHomeUrl] = useState(initialFormValues?.homeUrl ?? '');
+  const [articleUrl, setArticleUrl] = useState(initialFormValues?.articleUrl ?? '');
+  const [optionals, setOptionals] = useState<Record<string, string>>(() => {
+    if (!initialFormValues) return {};
+    const { homeUrl: _h, articleUrl: _a, ...rest } = initialFormValues;
+    return Object.fromEntries(
+      Object.entries(rest).filter(([, v]) => typeof v === 'string' && v.trim())
+    ) as Record<string, string>;
+  });
   const [showOptional, setShowOptional] = useState(false);
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState('');
   const [error, setError] = useState('');
-  const [runData, setRunData] = useState<AuditRunData | null>(null);
+  const [runData, setRunData] = useState<AuditRunData | null>(initialRunData ?? null);
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // When a past audit is loaded from history, display it immediately
+  useEffect(() => {
+    if (initialRunData) setRunData(initialRunData);
+  }, [initialRunData]);
 
   const stopPolling = useCallback(() => {
     if (pollRef.current) { clearTimeout(pollRef.current); pollRef.current = null; }
@@ -1664,7 +1700,12 @@ export default function SEOAgent() {
         return;
       }
 
-      const { auditRunId } = json as { siteId: string; auditRunId: string };
+      const { siteId, auditRunId } = json as { siteId: string; auditRunId: string };
+      // Notify project layer of the site id so it can save form values
+      if (siteId && onAuditStarted) {
+        const vals: SEOAgentFormValues = { homeUrl: homeUrl.trim(), articleUrl: articleUrl.trim(), ...optionals };
+        onAuditStarted(siteId, vals);
+      }
       setProgress('Audit started — checking site & pages...');
       pollRef.current = setTimeout(() => pollResults(auditRunId, Date.now()), POLL_INTERVAL);
     } catch {

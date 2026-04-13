@@ -360,6 +360,51 @@ projectsRouter.get('/projects/:id/audits/latest', async (req: Request, res: Resp
   }
 });
 
+// ── PATCH /api/projects/:id/form-values ──────────────────────────
+// Saves the last-used form inputs for a project so the UI can
+// pre-fill the analyzer form when the project is re-selected.
+// Called by the frontend after an audit run is started (DB mode).
+// Never touches audit_runs or audit_results — pure metadata update.
+
+projectsRouter.patch('/projects/:id/form-values', async (req: Request, res: Response) => {
+  const db = requireDb(res);
+  if (!db) return;
+
+  const allowed = ['homeUrl', 'articleUrl', 'sectionUrl', 'tagUrl', 'searchUrl', 'authorUrl', 'videoArticleUrl'];
+  const body = req.body ?? {};
+
+  // Accept only known keys; discard everything else
+  const formValues: Record<string, string> = {};
+  for (const key of allowed) {
+    if (typeof body[key] === 'string' && body[key].trim()) {
+      formValues[key] = body[key].trim();
+    }
+  }
+
+  if (!formValues.homeUrl) {
+    res.status(400).json({ error: 'homeUrl is required' });
+    return;
+  }
+
+  try {
+    const { rows } = await db.query(
+      `UPDATE sites
+       SET last_form_values = $1, updated_at = NOW()
+       WHERE id = $2
+       RETURNING id, project_name, domain, last_form_values`,
+      [JSON.stringify(formValues), req.params.id],
+    );
+    if (!rows.length) {
+      res.status(404).json({ error: 'Project not found' });
+      return;
+    }
+    res.json({ project: rows[0] });
+  } catch (err) {
+    console.error('PATCH /api/projects/:id/form-values error:', err);
+    res.status(500).json({ error: 'Failed to save form values' });
+  }
+});
+
 // ── GET /api/audits/compare?a=<id>&b=<id> ────────────────────────
 
 projectsRouter.get('/audits/compare', async (req: Request, res: Response) => {
