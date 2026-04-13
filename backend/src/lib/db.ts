@@ -33,7 +33,7 @@ export function getDb(): pg.Pool | null {
   const poolConfig: any = {
     connectionString: url,
     // Allow self-signed certs on local Linux servers; for cloud with real certs set to 'require'
-    ssl: url.includes('sslmode=require') ? { rejectUnauthorized: false } : false,
+    ssl: (url.includes('sslmode=require') || url.includes('supabase.com') || url.includes('supabase.co')) ? { rejectUnauthorized: false } : false,
     family: 4,              // force IPv4 — containers often can't reach IPv6 addresses
     max: 10,                // max pool size
     idleTimeoutMillis: 30_000,

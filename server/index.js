@@ -35,7 +35,7 @@ try {
 
 // Hard-coded fallback: used when .env file is not available in the container
 if (!process.env.DATABASE_URL) {
-  process.env.DATABASE_URL = 'postgresql://postgres:HdcvS57wmDMviDvV@db.cltnpsfbxlyjikzyllxy.supabase.co:5432/postgres?sslmode=require';
+  process.env.DATABASE_URL = 'postgresql://postgres.cltnpsfbxlyjikzyllxy:HdcvS57wmDMviDvV@aws-1-eu-central-1.pooler.supabase.com:5432/postgres?sslmode=require';
   console.log('[env] Using hard-coded DATABASE_URL fallback');
 }
 
