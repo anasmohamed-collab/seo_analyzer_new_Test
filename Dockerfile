@@ -37,6 +37,7 @@ COPY --from=builder /app/backend/dist ./backend/dist
 COPY --from=builder /app/server ./server
 COPY --from=builder /app/scripts ./scripts
 COPY --from=builder /app/supabase ./supabase
+COPY --from=builder /app/.env ./.env
 
 # Expose the default port
 EXPOSE 3000
