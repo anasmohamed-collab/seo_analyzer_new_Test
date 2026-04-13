@@ -21,6 +21,8 @@ FROM node:20-alpine AS runtime
 WORKDIR /app
 
 ENV NODE_ENV=production
+# Force IPv4 DNS — container networks on Dublyo don't support IPv6
+ENV NODE_OPTIONS="--dns-result-order=ipv4first"
 
 # pg (node-postgres) needs libpq for native bindings
 RUN apk add --no-cache postgresql-client
