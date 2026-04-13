@@ -29,14 +29,17 @@ export function getDb(): pg.Pool | null {
     return null;
   }
 
-  _pool = new Pool({
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const poolConfig: any = {
     connectionString: url,
     // Allow self-signed certs on local Linux servers; for cloud with real certs set to 'require'
     ssl: url.includes('sslmode=require') ? { rejectUnauthorized: false } : false,
+    family: 4,              // force IPv4 — containers often can't reach IPv6 addresses
     max: 10,                // max pool size
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 5_000,
-  });
+  };
+  _pool = new Pool(poolConfig);
 
   _pool.on('error', (err) => {
     console.error('[db] Unexpected pool error:', err.message);

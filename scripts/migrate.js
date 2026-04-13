@@ -76,6 +76,7 @@ try {
 const client = new Client({
   connectionString: DATABASE_URL,
   connectionTimeoutMillis: 8000,
+  family: 4,  // force IPv4 — containers often can't reach IPv6 addresses
   ssl: DATABASE_URL.includes('sslmode=require') || DATABASE_URL.includes('supabase.co')
     ? { rejectUnauthorized: false }
     : false,
