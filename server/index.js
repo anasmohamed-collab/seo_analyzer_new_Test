@@ -81,10 +81,24 @@ app.use('/api/seo-site-crawler', seoCrawlerRouter);
 app.use('/api/news-seo', newsSeoRouter);
 app.use('/api/unified-audit', unifiedAuditRouter);
 
-// Phase 1: DB-backed audit routes (loaded from compiled backend)
-// Auto-compile if dist is missing so the server works out-of-the-box.
+// Auto-run database migrations on startup when DATABASE_URL is configured.
+// The migration script is idempotent — already-applied migrations are skipped.
+// This runs synchronously so the server is ready only after the DB is set up.
 import { existsSync as _existsSync } from 'node:fs';
 import { execSync as _execSync } from 'node:child_process';
+
+if (DATABASE_URL) {
+  console.log('Running database migrations…');
+  try {
+    _execSync('node scripts/migrate.js', { cwd: join(__dirname, '..'), stdio: 'inherit' });
+    console.log('Migrations complete.');
+  } catch (migrateErr) {
+    console.error('Migration failed — server will continue but DB features may not work:', migrateErr.message);
+  }
+}
+
+// Phase 1: DB-backed audit routes (loaded from compiled backend)
+// Auto-compile if dist is missing so the server works out-of-the-box.
 
 const backendDistEntry = join(__dirname, '..', 'backend', 'dist', 'routes', 'auditRunsSimple.js');
 if (!_existsSync(backendDistEntry)) {
