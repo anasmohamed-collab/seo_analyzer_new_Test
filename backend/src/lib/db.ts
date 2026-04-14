@@ -43,7 +43,10 @@ export function getDb(): pg.Pool | null {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const poolConfig: any = {
     connectionString,
-    ssl: useSSL ? { rejectUnauthorized: false } : false,
+    ssl: useSSL ? {
+      rejectUnauthorized: false,
+      checkServerIdentity: () => undefined,  // bypass hostname verification for self-signed certs
+    } : false,
     family: 4,              // force IPv4 — containers often can't reach IPv6 addresses
     max: 10,
     idleTimeoutMillis: 30_000,
