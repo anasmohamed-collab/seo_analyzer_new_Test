@@ -1,13 +1,56 @@
 /**
- * Minimal HTML attribute parsing utilities.
+ * HTML attribute parsing utilities shared by all SEO audit checks.
  *
- * These helpers exist because raw-HTML SEO checks cannot rely on a full DOM
- * parser being available (the backend is Node.js without a browser environment).
- * They handle the three legal HTML5 attribute-value quoting styles so that
- * individual checks don't each re-invent fragile regex logic.
+ * ## Why this file exists
  *
- * Scope: intentionally minimal.  Only add to this file when a new check needs
- * attribute extraction that isn't already covered.
+ * Raw-HTML checks run in a plain Node.js process — no DOM, no browser.  Every
+ * ad-hoc `html.match(/<tag[^>]*attr=["']value["']…/)` regex that gets written
+ * directly inside a check function tends to:
+ *   - break on valid but unquoted attribute values  (e.g. `rel=canonical`)
+ *   - miss reversed attribute order                 (e.g. `href` before `rel`)
+ *   - diverge from every other check's handling of the same edge cases
+ *
+ * This module is the single authoritative place for that logic.
+ *
+ * ## Adding a new extraction check
+ *
+ * Do NOT write a new `/<tag[^>]*attr=["']value["']/` regex inline.  Instead:
+ *
+ *   • For `<link>` attributes   → use `walkLinkTags(html, visitor)`
+ *   • For `<meta>` attributes   → use `walkMetaTags(html, visitor)`
+ *   • For any single attribute  → call `getAttrValue(attrString, name)`
+ *
+ * Both walkers pass the full attribute string of each matching tag to your
+ * visitor callback so you can call `getAttrValue` on whatever attributes you
+ * need.  The visitor can return `false` to stop iteration early.
+ *
+ * Example — extracting the first `<link rel="canonical">` href:
+ *
+ *   let canonical: string | null = null;
+ *   walkLinkTags(html, (attrs) => {
+ *     if (getAttrValue(attrs, 'rel')?.toLowerCase() === 'canonical') {
+ *       canonical = getAttrValue(attrs, 'href');
+ *       return false;
+ *     }
+ *   });
+ *
+ * ## Intentional non-uses
+ *
+ * `extractCharset()` in contentMetaCheck.ts is NOT ported here because its
+ * legacy http-equiv form requires parsing a *nested* `charset=` token inside a
+ * `content="text/html; charset=UTF-8"` attribute value — a fundamentally
+ * different problem from simple attribute extraction.
+ *
+ * The two `og:type` / `article:published_time` regexes in
+ * `detectPageTypeWithHtml()` in canonicalCheck.ts are page-classification
+ * heuristics (not user-facing extraction).  They are candidates for migration
+ * to `walkMetaTags` in a future pass but are intentionally left as-is to keep
+ * that change scoped.
+ *
+ * ## Scope
+ *
+ * Keep this file minimal.  Add only when a new check's extraction needs are
+ * not already covered by the existing exports.
  */
 
 /**

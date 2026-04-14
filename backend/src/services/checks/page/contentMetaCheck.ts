@@ -201,6 +201,12 @@ function hasViewport(html: string): boolean {
 }
 
 function extractCharset(html: string): string | null {
+  // HTML5 form: <meta charset="UTF-8"> or <meta charset=UTF-8>
+  // The ["']? already makes the quote optional, so unquoted charset= is handled.
+  // NOT migrated to walkMetaTags because the fallback (http-equiv) requires
+  // parsing a charset= token *inside* a content attribute value
+  // (e.g. content="text/html; charset=UTF-8") — a nested extraction problem
+  // that walkMetaTags + getAttrValue does not solve.
   const m = html.match(/<meta[^>]*charset=["']?([^"'\s>]+)/i);
   if (m) return m[1];
   const m2 = html.match(/<meta[^>]*http-equiv=["']content-type["'][^>]*content=["'][^"']*charset=([^"'\s;]+)/i);

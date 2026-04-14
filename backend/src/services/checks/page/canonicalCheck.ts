@@ -145,7 +145,10 @@ export function detectPageTypeWithHtml(url: string, html: string): PageType {
   const hasVideoSchema = schemaTypes.has('VideoObject');
   const hasPersonSchema = schemaTypes.has('Person') || schemaTypes.has('ProfilePage');
 
-  // Check OG type
+  // Check OG type — used only as a page-classification heuristic here, not
+  // as user-facing extraction.  These two ordered regexes predate the shared
+  // htmlAttr.ts helpers; a future pass could migrate them to walkMetaTags but
+  // the impact is limited to classification accuracy, not audit output.
   const ogTypeMatch = html.match(/<meta[^>]*property=["']og:type["'][^>]*content=["']([^"']+)["']/i)
     ?? html.match(/<meta[^>]*content=["']([^"']+)["'][^>]*property=["']og:type["']/i);
   const ogType = ogTypeMatch?.[1]?.toLowerCase() ?? '';
@@ -153,7 +156,7 @@ export function detectPageTypeWithHtml(url: string, html: string): PageType {
   // Check for <article> semantic element
   const hasArticleElement = /<article[\s>]/i.test(html);
 
-  // Check for article:published_time OG tag (strong article signal)
+  // Presence-only signal — no value extraction needed, so a simple regex is fine.
   const hasPublishedTime = /<meta[^>]*property=["']article:published_time["']/i.test(html);
 
   // If URL said 'author' and schema confirms Person, keep it
