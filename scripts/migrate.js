@@ -76,13 +76,24 @@ try {
   dbHost = DATABASE_URL.slice(0, 40) + '...';
 }
 
+// pg-connection-string currently treats sslmode=require as verify-full, rejecting
+// self-signed certs. Strip sslmode from the URL and set ssl explicitly.
+let _connStr = DATABASE_URL;
+let _useSSL = false;
+try {
+  const _u = new URL(DATABASE_URL);
+  _useSSL = _u.searchParams.get('sslmode') !== 'disable';
+  _u.searchParams.delete('sslmode');
+  _connStr = _u.toString();
+} catch {
+  _useSSL = !DATABASE_URL.includes('sslmode=disable');
+}
+
 const client = new Client({
-  connectionString: DATABASE_URL,
-  connectionTimeoutMillis: 8000,
+  connectionString: _connStr,
+  connectionTimeoutMillis: 10000,
   family: 4,  // force IPv4 — containers often can't reach IPv6 addresses
-  ssl: DATABASE_URL.includes('sslmode=require') || DATABASE_URL.includes('supabase.co') || DATABASE_URL.includes('supabase.com')
-    ? { rejectUnauthorized: false }
-    : false,
+  ssl: _useSSL ? { rejectUnauthorized: false } : false,
 });
 
 section('SEO Analyzer — Database Migration');

@@ -3,10 +3,6 @@
  *
  * Reads DATABASE_URL from the environment.
  * Returns null when not configured so the server falls back to in-memory mode.
- *
- * DATABASE_URL format:
- *   postgresql://user:password@host:5432/dbname
- *   postgresql://user:password@host:5432/dbname?sslmode=require   (remote / cloud)
  */
 
 import process from 'node:process';
@@ -29,15 +25,29 @@ export function getDb(): pg.Pool | null {
     return null;
   }
 
+  // pg-connection-string currently treats sslmode=require as verify-full, which
+  // rejects self-signed certificates (Dublyo, local dev). Strip sslmode from the
+  // URL and set ssl explicitly so we control certificate verification ourselves.
+  let connectionString = url;
+  let useSSL = false;
+  try {
+    const parsed = new URL(url);
+    const sslmode = parsed.searchParams.get('sslmode');
+    useSSL = sslmode !== 'disable';
+    parsed.searchParams.delete('sslmode');
+    connectionString = parsed.toString();
+  } catch {
+    useSSL = !url.includes('sslmode=disable');
+  }
+
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const poolConfig: any = {
-    connectionString: url,
-    // Allow self-signed certs on local Linux servers; for cloud with real certs set to 'require'
-    ssl: (url.includes('sslmode=require') || url.includes('supabase.com') || url.includes('supabase.co')) ? { rejectUnauthorized: false } : false,
+    connectionString,
+    ssl: useSSL ? { rejectUnauthorized: false } : false,
     family: 4,              // force IPv4 — containers often can't reach IPv6 addresses
-    max: 10,                // max pool size
+    max: 10,
     idleTimeoutMillis: 30_000,
-    connectionTimeoutMillis: 5_000,
+    connectionTimeoutMillis: 10_000,
   };
   _pool = new Pool(poolConfig);
 
