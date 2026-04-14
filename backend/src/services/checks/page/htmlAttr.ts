@@ -49,24 +49,50 @@ export function getAttrValue(attrs: string, name: string): string | null {
 }
 
 /**
- * Iterate every `<link>` tag in `html`, passing each tag's attribute string
- * to the `visitor` callback.  The visitor may return `false` to stop early
- * (useful when searching for the first match).
+ * Shared implementation for walking void HTML elements (tags with no closing
+ * tag, e.g. <link>, <meta>).  Factored out so walkLinkTags and walkMetaTags
+ * don't duplicate code.
  *
- * Handles self-closing (`<link … />`) and regular (`<link … >`) forms.
- * Tag and attribute names are matched case-insensitively by the caller via
- * `getAttrValue`.
- *
- * URLs are percent-encoded in real HTML and should never contain a bare `>`,
- * so the `[^>]` character class in the regex is safe for href values.
+ * Handles self-closing (`<tag … />`) and regular (`<tag … >`) forms.
+ * Attribute values should not contain a bare `>` in valid HTML (they use
+ * `&gt;`), so the `[^>]` character class is safe for href/content values.
  */
-export function walkLinkTags(
+function walkVoidTags(
   html: string,
+  tagName: string,
   visitor: (attrs: string) => boolean | void,
 ): void {
-  const re = /<link\b([^>]*?)(?:\/?>)/gi;
+  const escaped = tagName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`<${escaped}\\b([^>]*?)(?:\\/?>)`, 'gi');
   let m: RegExpExecArray | null;
   while ((m = re.exec(html)) !== null) {
     if (visitor(m[1]) === false) break;
   }
 }
+
+/**
+ * Iterate every `<link>` tag in `html`, passing each tag's attribute string
+ * to the `visitor` callback.  The visitor may return `false` to stop early
+ * (useful when searching for the first match).
+ */
+export function walkLinkTags(
+  html: string,
+  visitor: (attrs: string) => boolean | void,
+): void {
+  walkVoidTags(html, 'link', visitor);
+}
+
+/**
+ * Iterate every `<meta>` tag in `html`, passing each tag's attribute string
+ * to the `visitor` callback.  The visitor may return `false` to stop early.
+ *
+ * Covers `<meta name="…" content="…">`, `<meta property="…" content="…">`,
+ * and `<meta charset="…">` forms in any attribute order and quoting style.
+ */
+export function walkMetaTags(
+  html: string,
+  visitor: (attrs: string) => boolean | void,
+): void {
+  walkVoidTags(html, 'meta', visitor);
+}
+
