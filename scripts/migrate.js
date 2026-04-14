@@ -93,7 +93,10 @@ const client = new Client({
   connectionString: _connStr,
   connectionTimeoutMillis: 10000,
   family: 4,  // force IPv4 — containers often can't reach IPv6 addresses
-  ssl: _useSSL ? { rejectUnauthorized: false } : false,
+  ssl: _useSSL ? {
+    rejectUnauthorized: false,
+    checkServerIdentity: () => undefined,  // bypass hostname verification for self-signed certs
+  } : false,
 });
 
 section('SEO Analyzer — Database Migration');
