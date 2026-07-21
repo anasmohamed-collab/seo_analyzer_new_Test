@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 # rollback.sh — flip `current` back to a previous release (contract §7).
 #
-# Code-only and instant: the symlink is flipped, nothing is deleted, and
-# runner state is NOT modified. The SQLite schema is never blindly
-# downgraded: after the flip, the rolled-back release is asked to open the
-# state database (`status`). If the schema is NEWER than the rolled-back
-# code supports, the script reports it and instructs the operator to also
-# restore the matching state backup (the migration's .backup-v<N> file or
-# the pre-upgrade archive) instead of guessing.
+# Code-only and instant: the symlink is flipped ATOMICALLY (mv -T; the
+# remove-then-move fallback exists only for --destdir test mode — in
+# production a failed atomic flip aborts with the previous release still
+# active), nothing is deleted, and runner state is NOT modified. The
+# SQLite schema is never blindly downgraded: after the flip, and only when
+# a state database file already exists, the rolled-back release is asked
+# to open it (`status` — older code never migrates a newer schema and no
+# file is created because the check is gated on the file existing). If the
+# schema is NEWER than the rolled-back code supports, the script reports
+# it and instructs the operator to also restore the matching state backup
+# (the migration's .backup-v<N> file or the pre-upgrade archive) instead
+# of guessing.
 #
 # Staged-test overrides: --destdir.
 set -Eeuo pipefail
@@ -63,8 +68,14 @@ link_tmp=$OPT_DIR/.current.tmp.$$
 rm -rf -- "$link_tmp"
 ln -s -- "$TARGET_DIR" "$link_tmp"
 if ! mv -Tf -- "$link_tmp" "$OPT_DIR/current" 2>/dev/null; then
-  rm -rf -- "$OPT_DIR/current"
-  mv -- "$link_tmp" "$OPT_DIR/current"
+  if [ -n "$DESTDIR" ]; then
+    # DESTDIR-only test fallback; production never uses remove-then-move.
+    rm -rf -- "$OPT_DIR/current"
+    mv -- "$link_tmp" "$OPT_DIR/current"
+  else
+    rm -rf -- "$link_tmp"
+    fail "atomic symlink replacement failed — rollback aborted; 'current' still points at $current_stamp. Manual recovery: ln -sfn '$TARGET_DIR' '$OPT_DIR/current' (nothing was deleted; state and configuration are untouched)"
+  fi
 fi
 log "'current' now points at release $TARGET_STAMP (release $current_stamp is retained)"
 

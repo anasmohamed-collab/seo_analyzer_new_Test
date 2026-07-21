@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { openStateDb } from '../src/db.js';
 import {
   RUNNER_ROOT,
   bashMissing,
@@ -32,6 +33,10 @@ function installedFixture() {
     stateDir: path.join(destdir, 'var', 'lib', 'seo-audit-runner'),
     logDir: path.join(destdir, 'var', 'log', 'seo-audit-runner'),
   };
+  // The transactional installer never creates SQLite state — seed the
+  // durable state the way a first real run would.
+  const db = openStateDb(path.join(paths.stateDir, 'runner-state.sqlite'));
+  db.close();
   // Sentinels that must survive uninstall.
   fs.writeFileSync(path.join(paths.stateDir, 'backups', 'keep-me.tar.gz'), 'BACKUP');
   fs.writeFileSync(path.join(paths.logDir, 'keep.log'), 'LOG');

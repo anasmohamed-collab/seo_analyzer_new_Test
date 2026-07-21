@@ -47,6 +47,9 @@ const USAGE = `Usage: seo-audit-runner <command> [options]
 
 Commands:
   validate-config           Validate configuration, state directory, state DB
+  validate-release          Non-mutating release validation: configuration +
+                            node:sqlite availability; never creates state,
+                            never opens or migrates the state database
   list-projects             List projects with a dedupe preview (read-only)
   run --all                 Audit every project (after deduplication)
   run --project <id>        Audit a single project by ID
@@ -153,6 +156,8 @@ async function main() {
   switch (command) {
     case 'validate-config':
       return validateConfigCommand(config, logger);
+    case 'validate-release':
+      return validateReleaseCommand(config);
     case 'list-projects':
       return listProjectsCommand(config, logger);
     case 'run':
@@ -178,7 +183,8 @@ async function main() {
 
 // ── validate-config ─────────────────────────────────────────────
 
-function validateConfigCommand(config, logger) {
+// Shared, secret-free configuration summary (values are pre-redacted).
+function configSummaryLines(config) {
   const lines = [
     'Configuration OK',
     `  SEO_API_BASE_URL        = ${config.apiBaseUrlRedacted}`,
@@ -205,6 +211,44 @@ function validateConfigCommand(config, logger) {
   } else {
     lines.push('  Slack method: none (notifications cannot be delivered)');
   }
+  return lines;
+}
+
+// ── validate-release (strictly non-mutating) ────────────────────
+//
+// Used by deploy/install.sh as its pre-activation gate. Verifies the
+// configuration parses and that node:sqlite provides the required API —
+// against an IN-MEMORY database only. It never creates the state
+// directory, never opens the state database file, and never migrates.
+async function validateReleaseCommand(config) {
+  const lines = configSummaryLines(config);
+  try {
+    const sqlite = await import('node:sqlite');
+    if (typeof sqlite.DatabaseSync !== 'function') {
+      throw new Error('DatabaseSync is not available');
+    }
+    const db = new sqlite.DatabaseSync(':memory:');
+    try {
+      db.exec('CREATE TABLE probe (id INTEGER PRIMARY KEY)');
+      db.prepare('INSERT INTO probe (id) VALUES (?)').run(1);
+      const row = db.prepare('SELECT id FROM probe').get();
+      if (!row || Number(row.id) !== 1) throw new Error('basic query round-trip failed');
+    } finally {
+      db.close();
+    }
+    lines.push(`  node:sqlite: OK (in-memory check, Node ${process.versions.node})`);
+  } catch (err) {
+    process.stdout.write(lines.join('\n') + '\n');
+    return fail(`node:sqlite is unavailable or broken on this runtime: ${err.message}`);
+  }
+  lines.push('  state directory: not created, not opened (release validation is non-mutating)');
+  lines.push('Release validation OK');
+  process.stdout.write(lines.join('\n') + '\n');
+  return EXIT_CODES.OK;
+}
+
+function validateConfigCommand(config, logger) {
+  const lines = configSummaryLines(config);
 
   try {
     fs.mkdirSync(config.stateDir, { recursive: true });

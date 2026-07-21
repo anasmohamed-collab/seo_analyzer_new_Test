@@ -1,21 +1,47 @@
 #!/usr/bin/env bash
-# install.sh — Phase 4B installer for the SEO audit runner (Linux layout).
+# install.sh — TRANSACTIONAL installer for the SEO audit runner (Linux
+# layout). Fresh installation = host provisioning + first release staging.
 #
-# Installs ONLY the runner: code under /opt/seo-audit-runner/, an isolated
-# Node.js runtime, the command wrapper at /usr/local/bin/seo-audit-runner,
-# the configuration skeleton under /etc/seo-audit-runner/, and the runner's
-# own state/log/runtime directories. It NEVER:
+# Phase model (activation happens only after every validation gate passes;
+# a failure leaves either the previous complete installation active, or —
+# on a fresh install — no active installation at all):
+#
+#   1. PREFLIGHT  arguments, privileges, source completeness, Node version,
+#                 release checksum, current-installation metadata. No writes.
+#   2. STAGE      provisioning (directories, sentinels) and CANDIDATE
+#                 artifacts staged under hidden .stage paths inside their
+#                 final directories: release, isolated runtime, wrapper,
+#                 systemd units, env template (only when absent).
+#   3. VALIDATE   non-mutating checks against the STAGED artifacts: staged
+#                 runtime version + node:sqlite API (in-memory only),
+#                 release checksum re-verification, entrypoint execution
+#                 (--help), wrapper syntax + byte identity, unit byte
+#                 identity, and the runner's read-only `validate-release`
+#                 command. Nothing here creates SQLite files or migrates.
+#   4. ACTIVATE   atomic renames only. Previous artifacts (current symlink
+#                 target, wrapper, runtime, units) are saved first and are
+#                 restored automatically on any later failure. Production
+#                 NEVER uses a non-atomic remove-then-move fallback; that
+#                 fallback exists only for explicit --destdir test mode.
+#   5. VERIFY     confirm the active release identity (symlink target,
+#                 stamp, checksum, entrypoint presence) WITHOUT touching
+#                 state.
+#   6. CLEANUP    remove staged temporaries and the saved previous
+#                 artifacts.
+#
+# It NEVER:
 #   - touches the main SEO application (runtime, Docker, env, PostgreSQL),
 #   - installs or upgrades any system-wide or application Node.js runtime
 #     (an acceptable Node binary must already exist; see --node),
-#   - installs systemd units, timers, or cron entries (Phase 4C),
-#   - enables any scheduling,
+#   - enables any scheduling (units are installed DISABLED),
+#   - creates or migrates the runner's SQLite state (validation is
+#     strictly non-mutating; state is created on first real use),
 #   - overwrites an existing runner.env, SQLite state, backups, or logs,
 #   - prints secret values.
 #
-# Safe to run repeatedly: re-running with unchanged runner sources is a
-# no-op for the code (same release kept); directories, permissions, the
-# wrapper, and the isolated runtime are re-asserted idempotently.
+# Safe to run repeatedly: re-running with unchanged runner sources keeps
+# the active release; directories, permissions, the wrapper, and the
+# isolated runtime are re-asserted idempotently.
 #
 # Layout and permission contract: deploy/README-deploy.md §1/§3/§5.
 #
@@ -24,6 +50,10 @@
 #   SEO_RUNNER_INSTALL_ASSUME_ROOT=1  execute the user/ownership steps even
 #                                     without euid 0 (system commands are
 #                                     expected to be mocked on $PATH)
+#   SEO_RUNNER_INSTALL_FAIL_AT=<step> inject a failure at a named step
+#   SEO_RUNNER_INSTALL_SIMULATE_NONATOMIC=1  treat atomic symlink
+#                                     replacement as unsupported (forces
+#                                     the production abort path)
 set -Eeuo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -44,7 +74,8 @@ usage() {
   cat <<'EOF'
 Usage: install.sh [options]
 
-Installs the SEO audit runner into the approved Linux layout:
+Installs the SEO audit runner into the approved Linux layout,
+transactionally (stage -> validate -> activate -> verify):
 
   /opt/seo-audit-runner/releases/<stamp>/   immutable release (code)
   /opt/seo-audit-runner/current             symlink -> active release
@@ -68,13 +99,21 @@ Options:
                     requires root.
   --help            Show this help.
 
-No systemd units are installed and no scheduling is enabled by this script
-(that is Phase 4C, and timers stay disabled even then).
+No systemd units are enabled and no scheduling is activated by this
+script; the runner's SQLite state is never created or migrated by
+installation (validation is non-mutating).
 EOF
 }
 
 log()  { printf 'install.sh: %s\n' "$*"; }
 fail() { printf 'install.sh: ERROR: %s\n' "$*" >&2; exit 1; }
+
+# Failure-injection hook for the transactional-install tests.
+fail_point() { # <step-name>
+  if [ "${SEO_RUNNER_INSTALL_FAIL_AT:-}" = "$1" ]; then
+    fail "injected failure at step '$1' (SEO_RUNNER_INSTALL_FAIL_AT test hook)"
+  fi
+}
 
 # ── Argument parsing (unknown flags are rejected) ──────────────────
 while [ "$#" -gt 0 ]; do
@@ -145,22 +184,90 @@ LOG_DIR=$DESTDIR/var/log/seo-audit-runner
 RUN_DIR=$DESTDIR/run/seo-audit-runner
 BIN_DIR=$DESTDIR/usr/local/bin
 WRAPPER_DST=$BIN_DIR/seo-audit-runner
+SYSTEMD_DST=$DESTDIR/etc/systemd/system
+UNIT_NAMES=
 
-# ── Failure cleanup: never leave a half-copied release behind ──────
-CLEANUP_RELEASE=
+# ── Transaction state (read by the EXIT trap) ──────────────────────
+REL_STAGE= NODE_STAGE= WRAP_STAGE= ENV_STAGE= PROBE_DIR= PREV_SAVE=
+NEW_REL_DIR=
+ACT_NODE=0 ACT_RELEASE=0 ACT_LINK=0 ACT_WRAPPER=0 ACT_UNITS=0 ACT_ENV=0
+PREV_STAMP=
+
+# Atomically point $OPT_DIR/current at <target>. Production requires the
+# atomic 'mv -T' rename; the remove-then-move fallback is DESTDIR-only.
+flip_link() { # <target>
+  local link_tmp=$OPT_DIR/.current.tmp.$$
+  rm -rf -- "$link_tmp"
+  ln -s -- "$1" "$link_tmp" || { rm -rf -- "$link_tmp"; return 1; }
+  if ! mv -Tf -- "$link_tmp" "$OPT_DIR/current" 2>/dev/null; then
+    if [ -n "$DESTDIR" ] && [ "${SEO_RUNNER_INSTALL_SIMULATE_NONATOMIC:-0}" != "1" ]; then
+      # DESTDIR-only test fallback (see the atomic-capability gate below).
+      rm -rf -- "$OPT_DIR/current"
+      mv -- "$link_tmp" "$OPT_DIR/current"
+    else
+      rm -rf -- "$link_tmp"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# ── Failure handling: restore every previously active artifact ─────
 on_exit() {
   status=$1
   if [ "$status" -ne 0 ]; then
-    if [ -n "$CLEANUP_RELEASE" ] && [ -e "$CLEANUP_RELEASE" ]; then
-      rm -rf -- "$CLEANUP_RELEASE"
-      printf 'install.sh: removed partially copied release %s\n' "$CLEANUP_RELEASE" >&2
+    # 1. Put the previous installation back (reverse activation order).
+    if [ "$ACT_LINK" -eq 1 ]; then
+      if [ -n "$PREV_STAMP" ] && [ -d "$RELEASES_DIR/$PREV_STAMP" ]; then
+        if flip_link "$RELEASES_DIR/$PREV_STAMP"; then
+          printf 'install.sh: restored previous release %s as current\n' "$PREV_STAMP" >&2
+        else
+          printf 'install.sh: MANUAL RECOVERY REQUIRED: run  ln -sfn %s %s/current  (state and configuration are untouched)\n' \
+            "$RELEASES_DIR/$PREV_STAMP" "$OPT_DIR" >&2
+        fi
+      else
+        rm -rf -- "$OPT_DIR/current"
+      fi
     fi
-    printf 'install.sh: installation FAILED (exit %s) — no scheduling was enabled, existing state was not modified\n' "$status" >&2
+    if [ "$ACT_WRAPPER" -eq 1 ]; then
+      if [ -f "$PREV_SAVE/wrapper" ]; then cp -p -- "$PREV_SAVE/wrapper" "$WRAPPER_DST" || true
+      else rm -f -- "$WRAPPER_DST"; fi
+    fi
+    if [ "$ACT_UNITS" -eq 1 ]; then
+      for unit in $UNIT_NAMES; do
+        if [ -f "$PREV_SAVE/units/$unit" ]; then cp -p -- "$PREV_SAVE/units/$unit" "$SYSTEMD_DST/$unit" || true
+        else rm -f -- "$SYSTEMD_DST/$unit"; fi
+      done
+    fi
+    if [ "$ACT_NODE" -eq 1 ]; then
+      if [ -f "$PREV_SAVE/node" ]; then cp -p -- "$PREV_SAVE/node" "$NODE_DST" || true
+      else rm -f -- "$NODE_DST"; fi
+    fi
+    if [ "$ACT_ENV" -eq 1 ]; then
+      # Only ever activated when no runner.env existed before this run.
+      rm -f -- "$ENV_DST"
+    fi
+    if [ "$ACT_RELEASE" -eq 1 ] && [ -n "$NEW_REL_DIR" ] && [ -d "$NEW_REL_DIR" ]; then
+      rm -rf -- "$NEW_REL_DIR"
+    fi
+    # 2. Remove staged temporaries (validated-candidate artifacts only).
+    if [ -n "$REL_STAGE" ]; then rm -rf -- "$REL_STAGE"; fi
+    if [ -n "$NODE_STAGE" ]; then rm -f -- "$NODE_STAGE"; fi
+    if [ -n "$WRAP_STAGE" ]; then rm -f -- "$WRAP_STAGE"; fi
+    if [ -n "$ENV_STAGE" ]; then rm -f -- "$ENV_STAGE"; fi
+    for unit in $UNIT_NAMES; do rm -f -- "$SYSTEMD_DST/.$unit.stage.$$"; done
+    if [ -n "$PROBE_DIR" ]; then rm -rf -- "$PROBE_DIR"; fi
+    if [ -n "$PREV_SAVE" ]; then rm -rf -- "$PREV_SAVE"; fi
+    printf 'install.sh: installation FAILED (exit %s) — previous artifacts restored where they existed; no scheduling was enabled, existing state and configuration were not modified\n' "$status" >&2
   fi
 }
 trap 'on_exit $?' EXIT
 
-# ── Source tree sanity ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# PHASE 1 — PREFLIGHT (no filesystem writes)
+# ═══════════════════════════════════════════════════════════════════
+
+# Source tree completeness.
 for required in \
   bin/seo-audit-runner.js \
   src \
@@ -171,7 +278,7 @@ for required in \
   [ -e "$SOURCE_DIR/$required" ] || fail "runner source tree is incomplete: missing $required (use --source <dir>)"
 done
 
-# ── Node.js detection and validation (never installs Node) ─────────
+# Node.js detection and validation (never installs Node).
 if [ -z "$NODE_BIN" ]; then
   if [ -x "$NODE_DST" ]; then
     NODE_BIN=$NODE_DST
@@ -189,8 +296,38 @@ NODE_VERSION=$(printf '%s\n' "$node_info" | sed -n 's/^NODE_VERSION=//p')
 NODE_SQLITE_FLAG=$(printf '%s\n' "$node_info" | sed -n 's/^NODE_SQLITE_FLAG=//p')
 log "Node.js $NODE_VERSION accepted (${NODE_SQLITE_FLAG:-no experimental flag needed})"
 
-# ── Dedicated system user (idempotent; no login shell, no home dir
-#    beyond the approved state path) ────────────────────────────────
+# Release checksum of the SOURCE (recomputed later on the staged copy).
+release_checksum() { # <dir>
+  (
+    cd -- "$1" &&
+    find bin src package.json README.md docs -type f -print0 2>/dev/null \
+      | LC_ALL=C sort -z \
+      | xargs -0 sha256sum \
+      | sha256sum \
+      | awk '{print $1}'
+  )
+}
+new_checksum=$(release_checksum "$SOURCE_DIR")
+
+# Current installation metadata.
+current_checksum=
+if [ -f "$OPT_DIR/current/.release-checksum" ]; then
+  current_checksum=$(cat -- "$OPT_DIR/current/.release-checksum")
+fi
+if [ -f "$OPT_DIR/current/.release-stamp" ]; then
+  PREV_STAMP=$(cat -- "$OPT_DIR/current/.release-stamp")
+fi
+
+need_release=1
+if [ -n "$current_checksum" ] && [ "$new_checksum" = "$current_checksum" ]; then
+  need_release=0
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# PHASE 2 — STAGE (provisioning + candidate artifacts; nothing active)
+# ═══════════════════════════════════════════════════════════════════
+
+# Dedicated system user (idempotent; no login shell).
 if [ "$privileged" -eq 1 ]; then
   if getent passwd "$RUNNER_USER" >/dev/null 2>&1; then
     log "system user '$RUNNER_USER' already exists — kept as is"
@@ -204,8 +341,9 @@ else
   log "not privileged — skipping system user creation and ownership changes (staged install)"
 fi
 
-# ── Directories (mkdir -p preserves existing content; permissions
-#    follow deploy/README-deploy.md §1) ────────────────────────────
+# Directories (mkdir -p preserves existing content; permissions follow
+# deploy/README-deploy.md §1).
+fail_point provision-dirs
 ensure_dir() { # <path> <mode> <owner:group>
   mkdir -p -- "$1"
   chmod "$2" -- "$1"
@@ -241,7 +379,30 @@ write_sentinel "$ETC_DIR"   etc   0644 root:root
 write_sentinel "$STATE_DIR" state 0600 "$RUNNER_USER:$RUNNER_USER"
 write_sentinel "$LOG_DIR"   log   0640 "$RUNNER_USER:$RUNNER_USER"
 
-# ── Isolated Node runtime (copy of the validated binary) ───────────
+# ── Atomic-capability gate (decided BEFORE anything is activated) ──
+fail_point atomic-probe
+ATOMIC_OK=1
+PROBE_DIR=$OPT_DIR/.atomic-probe.$$
+mkdir -p -- "$PROBE_DIR/a" "$PROBE_DIR/b"
+ln -s -- "$PROBE_DIR/a" "$PROBE_DIR/link"  2>/dev/null || ATOMIC_OK=0
+ln -s -- "$PROBE_DIR/b" "$PROBE_DIR/link2" 2>/dev/null || ATOMIC_OK=0
+if [ "$ATOMIC_OK" -eq 1 ] && ! mv -Tf -- "$PROBE_DIR/link2" "$PROBE_DIR/link" 2>/dev/null; then
+  ATOMIC_OK=0
+fi
+rm -rf -- "$PROBE_DIR"
+PROBE_DIR=
+if [ "${SEO_RUNNER_INSTALL_SIMULATE_NONATOMIC:-0}" = "1" ]; then
+  ATOMIC_OK=0
+fi
+if [ "$ATOMIC_OK" -ne 1 ]; then
+  if [ -z "$DESTDIR" ] || [ "${SEO_RUNNER_INSTALL_SIMULATE_NONATOMIC:-0}" = "1" ]; then
+    fail "atomic symlink replacement (mv -T) is not supported on this filesystem — aborting BEFORE activation. Nothing was activated; the previous installation (if any) is untouched. Production activation requires atomic replacement."
+  fi
+  log "WARNING: atomic symlink replacement unavailable — the DESTDIR-only test fallback will be used for the 'current' link"
+fi
+
+# ── Stage the isolated Node runtime (copy of the validated binary) ─
+install_node=0
 if [ "$NODE_BIN" = "$NODE_DST" ]; then
   log "isolated Node runtime already in place at $NODE_DST"
 else
@@ -253,129 +414,204 @@ else
       log "isolated Node runtime $existing_version already installed — kept"
     fi
   fi
-  if [ "$install_node" -eq 1 ]; then
-    node_tmp=$NODE_DST.tmp.$$
-    cp -- "$NODE_BIN" "$node_tmp"
-    chmod 0755 -- "$node_tmp"
-    maybe_chown root:root "$node_tmp"
-    mv -f -- "$node_tmp" "$NODE_DST"
-    log "installed isolated Node runtime v$NODE_VERSION at $NODE_DST"
-  fi
+fi
+if [ "$install_node" -eq 1 ]; then
+  fail_point stage-runtime
+  NODE_STAGE=$OPT_DIR/node/bin/.node.stage.$$
+  cp -- "$NODE_BIN" "$NODE_STAGE"
+  chmod 0755 -- "$NODE_STAGE"
+  maybe_chown root:root "$NODE_STAGE"
 fi
 
-# ── Release install (immutable; new release only when content changed) ──
-release_checksum() {
-  (
-    cd -- "$SOURCE_DIR" &&
-    find bin src package.json README.md docs -type f -print0 2>/dev/null \
-      | LC_ALL=C sort -z \
-      | xargs -0 sha256sum \
-      | sha256sum \
-      | awk '{print $1}'
-  )
-}
-
-new_checksum=$(release_checksum)
-current_checksum=
-if [ -f "$OPT_DIR/current/.release-checksum" ]; then
-  current_checksum=$(cat -- "$OPT_DIR/current/.release-checksum")
-fi
-
-if [ -n "$current_checksum" ] && [ "$new_checksum" = "$current_checksum" ]; then
-  active_stamp=unknown
-  if [ -f "$OPT_DIR/current/.release-stamp" ]; then
-    active_stamp=$(cat -- "$OPT_DIR/current/.release-stamp")
-  fi
-  log "runner code unchanged — keeping active release $active_stamp"
-else
+# ── Stage the release (immutable; only when content changed) ───────
+stamp=
+if [ "$need_release" -eq 1 ]; then
+  fail_point stage-release
   stamp=$(date -u +%Y%m%d%H%M%S)
-  REL_DIR=$RELEASES_DIR/$stamp
   suffix=0
-  while [ -e "$REL_DIR" ]; do
+  while [ -e "$RELEASES_DIR/$stamp" ] || [ -e "$RELEASES_DIR/.stage.$stamp.$$" ]; do
     suffix=$((suffix + 1))
-    REL_DIR=$RELEASES_DIR/$stamp-$suffix
+    stamp=${stamp%%-*}-$suffix
   done
-  CLEANUP_RELEASE=$REL_DIR
+  REL_STAGE=$RELEASES_DIR/.stage.$stamp.$$
 
-  mkdir -p -- "$REL_DIR"
-  cp -R -- "$SOURCE_DIR/bin" "$REL_DIR/bin"
-  cp -R -- "$SOURCE_DIR/src" "$REL_DIR/src"
-  cp -- "$SOURCE_DIR/package.json" "$REL_DIR/package.json"
+  mkdir -p -- "$REL_STAGE"
+  cp -R -- "$SOURCE_DIR/bin" "$REL_STAGE/bin"
+  cp -R -- "$SOURCE_DIR/src" "$REL_STAGE/src"
+  cp -- "$SOURCE_DIR/package.json" "$REL_STAGE/package.json"
   if [ -f "$SOURCE_DIR/README.md" ]; then
-    cp -- "$SOURCE_DIR/README.md" "$REL_DIR/README.md"
+    cp -- "$SOURCE_DIR/README.md" "$REL_STAGE/README.md"
   fi
   if [ -d "$SOURCE_DIR/docs" ]; then
-    cp -R -- "$SOURCE_DIR/docs" "$REL_DIR/docs"
+    cp -R -- "$SOURCE_DIR/docs" "$REL_STAGE/docs"
   fi
   # Deliberately NOT copied: state/, .env, test/, node_modules (none exist),
   # deploy scripts (they administer the host, they are not runner code).
-  printf '%s\n' "$new_checksum" > "$REL_DIR/.release-checksum"
-  printf '%s\n' "${REL_DIR##*/}" > "$REL_DIR/.release-stamp"
+  printf '%s\n' "$new_checksum" > "$REL_STAGE/.release-checksum"
+  printf '%s\n' "$stamp" > "$REL_STAGE/.release-stamp"
 
-  find "$REL_DIR" -type d -exec chmod 0755 {} +
-  find "$REL_DIR" -type f -exec chmod 0644 {} +
-  chmod 0755 -- "$REL_DIR/bin/seo-audit-runner.js"
+  # Staged-copy integrity: the checksum of the copy must equal the source.
+  fail_point release-checksum
+  staged_checksum=$(release_checksum "$REL_STAGE")
+  [ "$staged_checksum" = "$new_checksum" ] \
+    || fail "staged release checksum mismatch (source $new_checksum, staged $staged_checksum) — the copy is incomplete; nothing was activated"
+
+  fail_point release-permissions
+  find "$REL_STAGE" -type d -exec chmod 0755 {} +
+  find "$REL_STAGE" -type f -exec chmod 0644 {} +
+  chmod 0755 -- "$REL_STAGE/bin/seo-audit-runner.js"
   if [ "$privileged" -eq 1 ]; then
-    chown -R root:root -- "$REL_DIR"
+    chown -R root:root -- "$REL_STAGE"
   fi
-
-  # Atomic flip of the `current` symlink where the platform allows it.
-  link_tmp=$OPT_DIR/.current.tmp.$$
-  rm -rf -- "$link_tmp"
-  ln -s -- "$REL_DIR" "$link_tmp"
-  if ! mv -Tf -- "$link_tmp" "$OPT_DIR/current" 2>/dev/null; then
-    # Fallback for filesystems without atomic symlink replacement (e.g. the
-    # rootless test environment): replace non-atomically, still only inside
-    # /opt/seo-audit-runner/.
-    rm -rf -- "$OPT_DIR/current"
-    mv -- "$link_tmp" "$OPT_DIR/current"
-  fi
-  CLEANUP_RELEASE=
-  log "installed release ${REL_DIR##*/} and updated the 'current' symlink"
-fi
-
-# ── Configuration: template only when absent, existing env preserved ──
-if [ -f "$ENV_DST" ]; then
-  log "existing runner.env preserved (content not modified)"
 else
-  env_tmp=$ENV_DST.tmp.$$
-  cp -- "$SOURCE_DIR/config/seo-audit-runner.env.example" "$env_tmp"
-  chmod 0640 -- "$env_tmp"
-  maybe_chown "root:$RUNNER_USER" "$env_tmp"
-  mv -- "$env_tmp" "$ENV_DST"
-  log "created $ENV_DST from the template — edit it (API URL, Slack settings) before the first live run"
+  log "runner code unchanged — keeping active release ${PREV_STAMP:-unknown}"
 fi
-# Re-assert the contract permissions on the env file (never its content).
-chmod 0640 -- "$ENV_DST"
-maybe_chown "root:$RUNNER_USER" "$ENV_DST"
 
-# ── Command wrapper ────────────────────────────────────────────────
-wrapper_tmp=$WRAPPER_DST.tmp.$$
-cp -- "$SOURCE_DIR/deploy/seo-audit-runner-wrapper.sh" "$wrapper_tmp"
-chmod 0755 -- "$wrapper_tmp"
-maybe_chown root:root "$wrapper_tmp"
-mv -f -- "$wrapper_tmp" "$WRAPPER_DST"
-log "installed command wrapper at $WRAPPER_DST"
+# ── Stage the command wrapper ──────────────────────────────────────
+fail_point stage-wrapper
+WRAP_STAGE=$BIN_DIR/.seo-audit-runner.stage.$$
+cp -- "$SOURCE_DIR/deploy/seo-audit-runner-wrapper.sh" "$WRAP_STAGE"
+chmod 0755 -- "$WRAP_STAGE"
+maybe_chown root:root "$WRAP_STAGE"
 
-# ── systemd units: INSTALLED but NEVER enabled or started ──────────
-# This script deliberately never invokes systemctl. After a system
-# install, run `systemctl daemon-reload` yourself; enabling any timer is
-# a separate explicit administrator decision gated by
-# docs/PRODUCTION_GATES.md (all timers ship disabled).
-SYSTEMD_DST=$DESTDIR/etc/systemd/system
+# ── Stage the systemd units (installed but NEVER enabled) ──────────
+fail_point stage-units
 if [ -d "$SOURCE_DIR/deploy/systemd" ]; then
   mkdir -p -- "$SYSTEMD_DST"
   for unit in "$SOURCE_DIR"/deploy/systemd/*.service "$SOURCE_DIR"/deploy/systemd/*.timer; do
     [ -f "$unit" ] || continue
     unit_name=${unit##*/}
-    unit_tmp=$SYSTEMD_DST/.$unit_name.tmp.$$
-    cp -- "$unit" "$unit_tmp"
-    chmod 0644 -- "$unit_tmp"
-    maybe_chown root:root "$unit_tmp"
-    mv -f -- "$unit_tmp" "$SYSTEMD_DST/$unit_name"
+    UNIT_NAMES="$UNIT_NAMES $unit_name"
+    cp -- "$unit" "$SYSTEMD_DST/.$unit_name.stage.$$"
+    chmod 0644 -- "$SYSTEMD_DST/.$unit_name.stage.$$"
+    maybe_chown root:root "$SYSTEMD_DST/.$unit_name.stage.$$"
+  done
+fi
+
+# ── Stage the configuration template (only when no env exists) ─────
+env_created=0
+if [ -f "$ENV_DST" ]; then
+  log "existing runner.env preserved (content not modified)"
+else
+  fail_point stage-env
+  env_created=1
+  ENV_STAGE=$ETC_DIR/.runner.env.stage.$$
+  cp -- "$SOURCE_DIR/config/seo-audit-runner.env.example" "$ENV_STAGE"
+  chmod 0640 -- "$ENV_STAGE"
+  maybe_chown "root:$RUNNER_USER" "$ENV_STAGE"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# PHASE 3 — VALIDATE (non-mutating; staged artifacts only)
+# ═══════════════════════════════════════════════════════════════════
+fail_point validate
+
+# The runtime that the installation will actually use.
+VNODE=${NODE_STAGE:-$NODE_DST}
+[ -x "$VNODE" ] || VNODE=$NODE_BIN
+
+if ! vnode_info=$(bash "$SCRIPT_DIR/check-node.sh" "$VNODE"); then
+  fail "staged Node runtime failed validation ($VNODE) — nothing was activated"
+fi
+VNODE_FLAG=$(printf '%s\n' "$vnode_info" | sed -n 's/^NODE_SQLITE_FLAG=//p')
+
+# Required node:sqlite API, proven on the staged runtime, in memory only.
+if ! "$VNODE" ${VNODE_FLAG:+"$VNODE_FLAG"} -e 'import("node:sqlite").then((m)=>{if(typeof m.DatabaseSync!=="function")process.exit(1);const db=new m.DatabaseSync(":memory:");db.exec("CREATE TABLE probe(id INTEGER)");db.close();process.exit(0);},()=>process.exit(1));' >/dev/null 2>&1; then
+  fail "the staged Node runtime lacks a working node:sqlite (DatabaseSync) — nothing was activated"
+fi
+
+# Release under validation: the staged one, or the already-active one.
+REL_V=$REL_STAGE
+[ -n "$REL_V" ] || REL_V=$OPT_DIR/current
+
+# Entrypoint must load and execute (--help never touches state).
+if ! "$VNODE" ${VNODE_FLAG:+"$VNODE_FLAG"} "$REL_V/bin/seo-audit-runner.js" --help >/dev/null 2>&1; then
+  fail "the staged release entrypoint failed to execute (--help) — nothing was activated"
+fi
+
+# Wrapper: syntax plus byte identity with the shipped wrapper.
+bash -n "$WRAP_STAGE" || fail "staged wrapper failed the bash syntax check — nothing was activated"
+cmp -s -- "$WRAP_STAGE" "$SOURCE_DIR/deploy/seo-audit-runner-wrapper.sh" \
+  || fail "staged wrapper differs from the shipped wrapper — nothing was activated"
+
+# Units: byte identity with the shipped unit files.
+for unit in $UNIT_NAMES; do
+  cmp -s -- "$SYSTEMD_DST/.$unit.stage.$$" "$SOURCE_DIR/deploy/systemd/$unit" \
+    || fail "staged unit $unit differs from the shipped unit — nothing was activated"
+done
+
+# Configuration expectations via the runner's own read-only command.
+# validate-release never creates state and never opens the state database.
+ENV_FOR_VALIDATION=$ENV_DST
+[ -f "$ENV_FOR_VALIDATION" ] || ENV_FOR_VALIDATION=$ENV_STAGE
+if [ -n "$ENV_FOR_VALIDATION" ] && [ -f "$ENV_FOR_VALIDATION" ]; then
+  if ! "$VNODE" ${VNODE_FLAG:+"$VNODE_FLAG"} "$REL_V/bin/seo-audit-runner.js" validate-release --env-file "$ENV_FOR_VALIDATION"; then
+    fail "pre-activation release validation failed (validate-release) — nothing was activated"
+  fi
+fi
+log "pre-activation validation passed (runtime, entrypoint, wrapper, units, configuration)"
+
+# ═══════════════════════════════════════════════════════════════════
+# PHASE 4 — ACTIVATE (atomic renames; previous artifacts saved first)
+# ═══════════════════════════════════════════════════════════════════
+PREV_SAVE=$OPT_DIR/.prev.$$
+mkdir -p -- "$PREV_SAVE/units"
+
+# Isolated Node runtime.
+if [ -n "$NODE_STAGE" ]; then
+  fail_point activate-runtime
+  if [ -f "$NODE_DST" ]; then cp -p -- "$NODE_DST" "$PREV_SAVE/node"; fi
+  mv -f -- "$NODE_STAGE" "$NODE_DST"
+  NODE_STAGE=
+  ACT_NODE=1
+  log "installed isolated Node runtime v$NODE_VERSION at $NODE_DST"
+fi
+
+# Release directory + current symlink.
+if [ "$need_release" -eq 1 ]; then
+  fail_point activate-release
+  NEW_REL_DIR=$RELEASES_DIR/$stamp
+  mv -- "$REL_STAGE" "$NEW_REL_DIR"
+  REL_STAGE=
+  ACT_RELEASE=1
+
+  fail_point symlink-swap
+  flip_link "$NEW_REL_DIR" \
+    || fail "atomic activation of the 'current' symlink failed — the previous release is being restored"
+  ACT_LINK=1
+  log "installed release $stamp and updated the 'current' symlink"
+fi
+
+# Command wrapper.
+fail_point activate-wrapper
+if [ -f "$WRAPPER_DST" ]; then cp -p -- "$WRAPPER_DST" "$PREV_SAVE/wrapper"; fi
+mv -f -- "$WRAP_STAGE" "$WRAPPER_DST"
+WRAP_STAGE=
+ACT_WRAPPER=1
+log "installed command wrapper at $WRAPPER_DST"
+
+# systemd units (never enabled, never started).
+if [ -n "$UNIT_NAMES" ]; then
+  fail_point activate-units
+  ACT_UNITS=1
+  for unit in $UNIT_NAMES; do
+    if [ -f "$SYSTEMD_DST/$unit" ]; then cp -p -- "$SYSTEMD_DST/$unit" "$PREV_SAVE/units/$unit"; fi
+    mv -f -- "$SYSTEMD_DST/.$unit.stage.$$" "$SYSTEMD_DST/$unit"
   done
   log "installed systemd units into $SYSTEMD_DST (all timers DISABLED; run 'systemctl daemon-reload' manually)"
 fi
+
+# Configuration template (only when no runner.env existed).
+if [ "$env_created" -eq 1 ]; then
+  fail_point activate-env
+  mv -- "$ENV_STAGE" "$ENV_DST"
+  ENV_STAGE=
+  ACT_ENV=1
+  log "created $ENV_DST from the template — edit it (API URL, Slack settings) before the first live run"
+fi
+# Re-assert the contract permissions on the env file (never its content).
+chmod 0640 -- "$ENV_DST"
+maybe_chown "root:$RUNNER_USER" "$ENV_DST"
 
 # Reference copies of the optional cron/logrotate examples (documentation
 # only — nothing is installed into /etc/cron.d or /etc/logrotate.d).
@@ -389,35 +625,36 @@ for example in cron.example logrotate.example; do
   fi
 done
 
-# ── Post-install validation (safe: no audit is triggered; validate-config
-#    only checks configuration and opens the runner-owned SQLite state) ──
-if [ -n "$DESTDIR" ]; then
-  # Staged tree: point the wrapper at the staged paths. Explicit variables
-  # win over runner.env values (the runner's env-file loader never overrides
-  # existing environment variables).
-  if SEO_AUDIT_RUNNER_ROOT="$OPT_DIR" \
-     SEO_AUDIT_RUNNER_ENV_FILE="$ENV_DST" \
-     SEO_AUDIT_RUNNER_USER= \
-     RUNNER_STATE_DIR="$STATE_DIR" \
-     RUNNER_STATE_DB_PATH="$STATE_DIR/runner-state.sqlite" \
-     bash "$WRAPPER_DST" validate-config; then
-    log "post-install validation OK (staged)"
-  else
-    fail "post-install validation failed (staged run of 'seo-audit-runner validate-config')"
-  fi
-else
-  if runuser -u "$RUNNER_USER" -- "$WRAPPER_DST" validate-config; then
-    log "post-install validation OK (ran as $RUNNER_USER)"
-  else
-    fail "post-install validation failed ('seo-audit-runner validate-config' as $RUNNER_USER)"
-  fi
-fi
+# ═══════════════════════════════════════════════════════════════════
+# PHASE 5 — FINAL VERIFY (identity only; state is never touched)
+# ═══════════════════════════════════════════════════════════════════
+fail_point final-verify
+expected_stamp=$stamp
+[ -n "$expected_stamp" ] || expected_stamp=$PREV_STAMP
+
+active_stamp=$(cat -- "$OPT_DIR/current/.release-stamp" 2>/dev/null || true)
+[ "$active_stamp" = "$expected_stamp" ] \
+  || fail "final verification failed: active release is '${active_stamp:-none}', expected '$expected_stamp'"
+active_checksum=$(cat -- "$OPT_DIR/current/.release-checksum" 2>/dev/null || true)
+[ "$active_checksum" = "$new_checksum" ] \
+  || fail "final verification failed: active release checksum does not match the installed source"
+[ -f "$OPT_DIR/current/bin/seo-audit-runner.js" ] \
+  || fail "final verification failed: active release has no entrypoint"
+[ -x "$WRAPPER_DST" ] || [ -f "$WRAPPER_DST" ] \
+  || fail "final verification failed: command wrapper missing"
+log "post-install validation OK (active release $expected_stamp verified; state untouched)"
+
+# ═══════════════════════════════════════════════════════════════════
+# PHASE 6 — CLEANUP (validated temporaries only)
+# ═══════════════════════════════════════════════════════════════════
+rm -rf -- "$PREV_SAVE"
+PREV_SAVE=
 
 log "installation complete"
 log "  code:    $OPT_DIR/current"
 log "  node:    $NODE_DST (v$NODE_VERSION${NODE_SQLITE_FLAG:+, wrapper adds $NODE_SQLITE_FLAG})"
 log "  command: $WRAPPER_DST"
 log "  config:  $ENV_DST"
-log "  state:   $STATE_DIR (preserved across installs)"
+log "  state:   $STATE_DIR (preserved across installs; created on first real use)"
 log "systemd units installed DISABLED — NO timer was enabled and NO scheduling is active."
 log "Next steps: edit $ENV_DST, run 'seo-audit-runner doctor', then see deploy/SERVER-HANDOVER.md before enabling any timer."

@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { openStateDb } from '../src/db.js';
 import {
   RUNNER_ROOT,
   bashMissing,
@@ -67,6 +68,9 @@ function installedFixture() {
     siblingFile: path.join(destdir, 'var', 'lib', 'other-app', 'keep.txt'),
     canary: path.join(work, 'canary.txt'),
   };
+  // The transactional installer never creates SQLite state — seed it.
+  const db = openStateDb(fx.stateDb);
+  db.close();
   fs.mkdirSync(fx.sibling, { recursive: true });
   fs.writeFileSync(fx.siblingFile, 'SIBLING');
   fs.writeFileSync(fx.canary, 'CANARY');
