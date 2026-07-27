@@ -1,12 +1,15 @@
 /**
  * Scheduler-tick worker.
  *
- * Designed for the systemd model "a timer starts the worker; the runner
- * determines due jobs from its own state database": the tick timer runs
- * `seo-audit-runner worker --once` every few minutes as the seo-runner
- * user. One tick:
+ * Designed for the single systemd model "one timer starts the worker; the
+ * runner determines everything else from its own state database":
+ * seo-runner-tick.timer runs `seo-audit-runner worker --once` every few
+ * minutes as the seo-runner user, and it is the ONLY scheduling authority
+ * on the host. One tick therefore owns the complete cycle:
  *
- *   1. crash recovery — dead RUNNING jobs become FAILED;
+ *   1. crash recovery — dead RUNNING jobs become FAILED; a job whose
+ *      execution was claimed and abandoned (stale lease, or a lease from a
+ *      previous boot) is recovered rather than left stuck;
  *   2. enqueue — every enabled schedule whose latest occurrence is due
  *      (within the catch-up window) gets AT MOST one job, enforced by the
  *      unique (schedule_id, occurrence_key) index;
@@ -15,7 +18,9 @@
  *      (`run --all|--project <id>`) with structured argv — no shell, no
  *      eval, no string interpolation. The child takes the runner's
  *      process lock, so a worker job can never overlap a manual run: the
- *      child exits 4 and the job returns to QUEUED for the next tick.
+ *      child exits 4 and the job returns to QUEUED for the next tick;
+ *   4. notification retry — queued/failed Slack deliveries are retried
+ *      last (see `retryNotifications` below), so no second timer is needed.
  *
  * The worker never runs as root (systemd User=seo-runner; the CLI refuses
  * root via the wrapper). Job exit codes map to job states in jobs.js.
@@ -112,11 +117,13 @@ export function enqueueDueSchedules({
  * One worker tick. Returns a summary object.
  * `executeJob` is injectable for tests; production uses spawnJobExecutor().
  *
- * `retryNotifications` is the seam for the single-timer model: when supplied
- * it is awaited at the end of the tick, after job execution, so one timer can
- * own both audits and notification retries. It is null by default and the CLI
- * does not wire it yet — `retry-notifications` remains the only active retry
- * path until that migration lands. Notification failures never fail a tick.
+ * `retryNotifications` implements the single-timer model: when supplied it is
+ * awaited at the end of the tick, after job execution, so the one tick timer
+ * owns both audits and notification retries. The CLI wires it via
+ * `createTickNotificationRetry` whenever Slack is configured; it stays null
+ * when it is not (nothing could be delivered, so nothing can be retried), and
+ * for tests. `retry-notifications` remains available as a manual command.
+ * Notification failures never fail a tick or the audits in it.
  */
 export async function workerTick({
   scheduleStore,

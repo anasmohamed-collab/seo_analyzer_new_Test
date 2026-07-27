@@ -1,9 +1,22 @@
 # seo-runner-tick.timer — scheduler tick every 5 minutes.
-# SHIPS DISABLED. Enable this INSTEAD OF seo-audit-runner.timer when
-# schedules are managed through `seo-audit-runner schedule ...`
-# (backend-controlled model). Missed ticks need no catch-up: the next
-# tick evaluates due occurrences itself (catch-up window 24h, at most one
-# job per occurrence).
+#
+# THE SINGLE scheduling authority for this runner: the only timer shipped,
+# and enabling it is the only supported way to automate the runner on a
+# systemd host. Never combine it with a cron entry for any
+# seo-audit-runner command — cron (deploy/cron.example) is the documented
+# alternative for hosts WITHOUT systemd, and the two are mutually
+# exclusive.
+#
+# SHIPS DISABLED. Enable only after the pre-enable validation in
+# deploy/SERVER-HANDOVER.md §7 and the production gates in
+# docs/PRODUCTION_GATES.md (Gates 5-7) have passed:
+#   sudo systemctl enable --now seo-runner-tick.timer
+#
+# Audit times are NOT configured here — they live in the runner's own
+# schedules (`seo-audit-runner schedule ...`). Missed ticks need no
+# catch-up: the next tick evaluates due occurrences itself (catch-up
+# window 24h, at most one job per occurrence), which is why
+# Persistent=false is correct here.
 [Unit]
 Description=SEO runner scheduler tick (every 5 minutes)
 

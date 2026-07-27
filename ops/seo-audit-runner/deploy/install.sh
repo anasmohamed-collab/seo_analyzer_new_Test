@@ -8,7 +8,9 @@
 #   - touches the main SEO application (runtime, Docker, env, PostgreSQL),
 #   - installs or upgrades any system-wide or application Node.js runtime
 #     (an acceptable Node binary must already exist; see --node),
-#   - installs systemd units, timers, or cron entries (Phase 4C),
+#   - enables or starts any systemd unit (the single tick timer is copied
+#     in DISABLED; `systemctl enable` stays an administrator decision),
+#   - creates any cron entry (deploy/cron.example is documentation only),
 #   - enables any scheduling,
 #   - overwrites an existing runner.env, SQLite state, backups, or logs,
 #   - prints secret values.
@@ -90,8 +92,8 @@ Options:
                     requires root.
   --help            Show this help.
 
-No systemd units are installed and no scheduling is enabled by this script
-(that is Phase 4C, and timers stay disabled even then).
+The single production timer (seo-runner-tick.timer) is copied in DISABLED
+and no scheduling is enabled by this script.
 EOF
 }
 
@@ -380,10 +382,12 @@ mv -f -- "$wrapper_tmp" "$WRAPPER_DST"
 log "installed command wrapper at $WRAPPER_DST"
 
 # ── systemd units: INSTALLED but NEVER enabled or started ──────────
-# This script deliberately never invokes systemctl. After a system
-# install, run `systemctl daemon-reload` yourself; enabling any timer is
-# a separate explicit administrator decision gated by
-# docs/PRODUCTION_GATES.md (all timers ship disabled).
+# Exactly one scheduling authority is shipped: seo-runner-tick.timer ->
+# seo-runner-tick.service -> `seo-audit-runner worker --once`. This script
+# deliberately never invokes systemctl. After a system install, run
+# `systemctl daemon-reload` yourself; enabling the tick timer is a separate
+# explicit administrator decision gated by docs/PRODUCTION_GATES.md (the
+# timer ships disabled).
 SYSTEMD_DST=$DESTDIR/etc/systemd/system
 if [ -d "$SOURCE_DIR/deploy/systemd" ]; then
   mkdir -p -- "$SYSTEMD_DST"
@@ -396,7 +400,29 @@ if [ -d "$SOURCE_DIR/deploy/systemd" ]; then
     maybe_chown root:root "$unit_tmp"
     mv -f -- "$unit_tmp" "$SYSTEMD_DST/$unit_name"
   done
-  log "installed systemd units into $SYSTEMD_DST (all timers DISABLED; run 'systemctl daemon-reload' manually)"
+  log "installed the tick timer and service into $SYSTEMD_DST (timer DISABLED; run 'systemctl daemon-reload' manually)"
+fi
+
+# Superseded units from an earlier multi-timer install are a duplicate
+# scheduling hazard: report them, but never disable or delete them here
+# (that is an administrator decision, and this script never runs systemctl
+# — deploy/uninstall.sh removes them as part of a full uninstall).
+legacy_found=
+for unit in seo-audit-runner.timer seo-audit-runner.service \
+            seo-runner-retry.timer seo-runner-retry.service; do
+  if [ -f "$SYSTEMD_DST/$unit" ]; then
+    legacy_found=${legacy_found:+$legacy_found }$unit
+  fi
+done
+if [ -n "$legacy_found" ]; then
+  printf 'install.sh: WARNING: superseded unit file(s) present in %s: %s\n' "$SYSTEMD_DST" "$legacy_found" >&2
+  printf 'install.sh: WARNING: they are NOT part of the single tick model and must not run alongside\n' >&2
+  printf 'install.sh: WARNING: seo-runner-tick.timer. Disable and remove them manually:\n' >&2
+  printf 'install.sh: WARNING:   sudo systemctl disable --now %s\n' "$legacy_found" >&2
+  for unit in $legacy_found; do
+    printf 'install.sh: WARNING:   sudo rm -f %s\n' "$SYSTEMD_DST/$unit" >&2
+  done
+  printf 'install.sh: WARNING:   sudo systemctl daemon-reload\n' >&2
 fi
 
 # Reference copies of the optional cron/logrotate examples (documentation
@@ -441,5 +467,7 @@ log "  node:    $NODE_DST (v$NODE_VERSION${NODE_SQLITE_FLAG:+, wrapper adds $NOD
 log "  command: $WRAPPER_DST"
 log "  config:  $ENV_DST"
 log "  state:   $STATE_DIR (preserved across installs)"
-log "systemd units installed DISABLED — NO timer was enabled and NO scheduling is active."
-log "Next steps: edit $ENV_DST, run 'seo-audit-runner doctor', then see deploy/SERVER-HANDOVER.md before enabling any timer."
+log "  timer:   seo-runner-tick.timer (the ONLY scheduling authority) — installed DISABLED"
+log "seo-runner-tick.timer is DISABLED — NO timer was enabled and NO scheduling is active."
+log "Next steps: edit $ENV_DST, run 'seo-audit-runner doctor', then complete the pre-enable"
+log "validation in deploy/SERVER-HANDOVER.md §7 before enabling seo-runner-tick.timer."

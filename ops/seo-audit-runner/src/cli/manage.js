@@ -20,6 +20,10 @@ import {
 import { workerTick } from '../worker.js';
 import { runHealthChecks, formatHealthReport } from '../health.js';
 import { EXIT_CODES } from '../report.js';
+import { acquireLock, LockError } from '../lock.js';
+import { StateStore } from '../stateStore.js';
+import { createSlackSender } from '../slackClient.js';
+import { retryPendingNotifications } from '../notificationPipeline.js';
 
 const usageError = (message) => {
   process.stderr.write(`${message}\n`);
@@ -226,6 +230,46 @@ export function scheduleCommand(config, logger, values, positionals) {
 
 // ── worker ─────────────────────────────────────────────────────────
 
+/** Retry batch size for the notification step of one tick. */
+export const TICK_NOTIFICATION_RETRY_LIMIT = 50;
+
+/**
+ * Notification-retry step of a tick, or null when Slack is not configured
+ * (nothing can be delivered, so there is nothing to retry).
+ *
+ * The single-timer model makes the tick the only scheduling authority, so
+ * the tick — not a second timer — owns retryable notification delivery.
+ * The step takes the same single-instance lock as `run` and
+ * `retry-notifications`, which is what prevents a double send when an
+ * administrator happens to run one of those by hand at the same moment;
+ * losing that race only postpones the retry to the next tick.
+ */
+export function createTickNotificationRetry({ config, logger, db, limit = TICK_NOTIFICATION_RETRY_LIMIT }) {
+  if (!config.slackMethod) return null;
+  return async () => {
+    let lock;
+    try {
+      lock = acquireLock({ stateDir: config.stateDir });
+    } catch (err) {
+      if (err instanceof LockError) {
+        logger?.info?.('Notification retry skipped this tick: another runner instance holds the lock');
+        return { sent: 0 };
+      }
+      throw err;
+    }
+    try {
+      return await retryPendingNotifications({
+        stateStore: new StateStore(db),
+        slackSender: createSlackSender({ config, logger }),
+        logger,
+        options: { limit },
+      });
+    } finally {
+      lock.release();
+    }
+  };
+}
+
 export async function workerCommand(config, logger, values) {
   if (!values.once) {
     return usageError('worker requires --once (one scheduler tick; run it from the tick timer)');
@@ -238,11 +282,13 @@ export async function workerCommand(config, logger, values) {
       jobStore: new JobStore(db),
       logger,
       redact: (s) => logger.redact(s),
+      retryNotifications: createTickNotificationRetry({ config, logger, db }),
     });
     process.stdout.write(
       `worker tick: recovered=${summary.recovered} enqueued=${summary.enqueued} ` +
         `executed=${summary.executed} succeeded=${summary.succeeded} ` +
-        `failed=${summary.failed} deferred=${summary.deferred}\n`,
+        `failed=${summary.failed} deferred=${summary.deferred} ` +
+        `notificationsRetried=${summary.notificationsRetried}\n`,
     );
     // The tick itself succeeded; failed JOBS are reported by health/status
     // and retried explicitly — a tick only fails on infrastructure errors.

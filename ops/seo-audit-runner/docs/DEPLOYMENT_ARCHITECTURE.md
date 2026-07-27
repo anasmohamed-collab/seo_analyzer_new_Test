@@ -79,28 +79,42 @@ documented degraded mode, see `deploy/README-deploy.md`).
   wrapper — never via the interactive user's `PATH`, never via the main
   application's runtime, and never via a system-wide Node upgrade.
 
-## 4. Scheduling contract
+## 4. Scheduling contract — a single automation model
 
-- Full audit (`run --all`): **daily at 03:00 Africa/Cairo**.
-- Slack notification retry (`retry-notifications`): **hourly**.
-- **Both timers are disabled by default at install time**, and installation
-  never enables scheduling automatically. Enabling is a separate, explicit
-  administrator action (`systemctl enable --now …`) allowed only after the
-  production gates pass (see `docs/PRODUCTION_GATES.md`). If a later phase
-  adds an explicit opt-in installer flag, it must still enforce those gates.
+**One authority, one timer, one service:**
 
-Timezone handling — two supported options, pick exactly one per host:
+    seo-runner-tick.timer (*:0/5) → seo-runner-tick.service → worker --once
 
-1. Set the host timezone to Cairo: `timedatectl set-timezone Africa/Cairo`,
-   then use `OnCalendar=*-*-* 03:00:00`.
-2. Keep the host on UTC and pin the timezone in the calendar expression
-   (supported by systemd >= 235): `OnCalendar=*-*-* 03:00:00 Africa/Cairo`.
-   Verify with `systemd-analyze calendar '*-*-* 03:00:00 Africa/Cairo'`.
+That tick is the entire automation. Within one tick the runner, reading only
+its own SQLite state, performs: crash recovery → stale-execution recovery →
+enqueue of due schedule occurrences (at most one job per occurrence) →
+sequential execution of queued jobs under the process lock → retry of
+queued/failed Slack notifications. Nothing else is scheduled by anything
+else, which is what makes "did this audit run twice?" answerable.
 
-Never configure both cron and the systemd timer for the same runner command
-on the same host. The runner's lock makes an overlap safe (second instance
-exits with code 4), but duplicate scheduling produces alert noise and wasted
-audits.
+- **Audit times are runner state, not unit configuration.** They are created
+  with `seo-audit-runner schedule ...` and each carries its own IANA
+  timezone (default `Africa/Cairo`), so DST correctness belongs to the
+  runner and the host timezone is irrelevant. The 5-minute tick has nothing
+  to catch up (`Persistent=false`); the runner's own 24 h catch-up window,
+  bounded to one job per occurrence, handles downtime.
+- **No second timer.** There is no daily `run --all` timer and no
+  notification-retry timer; a superseded `seo-audit-runner.timer` or
+  `seo-runner-retry.timer` left on a host is a misconfiguration that
+  `install.sh` warns about, `smoke-test.sh` fails on, and `doctor` fails on
+  when enabled.
+- **The timer is disabled at install time** and installation never invokes
+  `systemctl`. Enabling is a separate, explicit administrator action
+  (`systemctl enable --now seo-runner-tick.timer`) allowed only after the
+  pre-enable validation in `deploy/SERVER-HANDOVER.md` §7 and the production
+  gates in `docs/PRODUCTION_GATES.md`. If a later phase adds an explicit
+  opt-in installer flag, it must still enforce those gates.
+- **Cron is a documented degraded mode for hosts without systemd only**
+  (`deploy/cron.example`: the same tick, every 5 minutes, fully commented
+  out). Cron and systemd are mutually exclusive for this runner. The
+  runner's lock makes an accidental overlap safe (second instance exits
+  with code 4), but duplicate scheduling produces alert noise and wasted
+  audits.
 
 ## 5. SQLite state ownership and persistence
 

@@ -110,12 +110,25 @@ test('env template does not pretend RUNNER_LOCK_DIR is supported (Phase 4F item)
   assert.ok(!/RUNNER_LOCK_DIR/.test(content), 'RUNNER_LOCK_DIR is not implemented until Phase 4F');
 });
 
-test('cron example ships fully commented or user-field formatted, never auto-installed', () => {
+test('cron example is documentation-only: every line commented, never auto-installed', () => {
   const content = fs.readFileSync(DEPLOY('cron.example'), 'utf8');
   assert.match(content, /never installed automatically/i);
-  // Every active line must be a comment or an /etc/cron.d line running as seo-runner.
+  const active = content.split('\n').filter((line) => line.trim() && !line.trim().startsWith('#'));
+  assert.deepEqual(active, [], 'cron.example must contain no uncommented line');
+});
+
+test('cron example documents exactly one tick command, mutually exclusive with systemd', () => {
+  const content = fs.readFileSync(DEPLOY('cron.example'), 'utf8');
+  assert.match(content, /mutually exclusive/i, 'cron must be declared mutually exclusive with systemd');
+  const commands = content.match(/\/usr\/local\/bin\/seo-audit-runner\s+\S+/g) ?? [];
+  assert.deepEqual(
+    [...new Set(commands)],
+    ['/usr/local/bin/seo-audit-runner worker'],
+    'the only cron model is the tick; `run --all` / `retry-notifications` lines re-introduce a second authority',
+  );
+  // Whatever is documented must still run as the dedicated user.
   for (const line of content.split('\n')) {
-    if (!line.trim() || line.trim().startsWith('#')) continue;
+    if (!line.includes('/usr/local/bin/seo-audit-runner')) continue;
     assert.match(line, /\sseo-runner\s+\/usr\/local\/bin\/seo-audit-runner\s/, `cron line must run as seo-runner: ${line}`);
   }
 });

@@ -50,11 +50,13 @@ Commands:
   list-projects             List projects with a dedupe preview (read-only)
   run --all                 Audit every project (after deduplication)
   run --project <id>        Audit a single project by ID
-  retry-notifications       Retry queued/failed Slack notifications
+  retry-notifications       Retry queued/failed Slack notifications (manual;
+                            the tick does this automatically)
   status                    Show runner-owned state (no audits triggered)
   health                    Fast health check   (exit 0 healthy / 1 unhealthy / 2 degraded)
   doctor                    Deep diagnostics    (adds integrity, disk, systemd checks)
-  worker --once             One scheduler tick: enqueue due schedules, run queued jobs
+  worker --once             One scheduler tick: recover, enqueue due schedules,
+                            run queued jobs, retry notifications
   job <action>              create | list | show | retry | cancel   (runner-owned queue)
   schedule <action>         create | update | enable | disable | delete | list
 

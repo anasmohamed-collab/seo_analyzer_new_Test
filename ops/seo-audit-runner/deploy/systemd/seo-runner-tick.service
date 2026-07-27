@@ -1,11 +1,30 @@
 # seo-runner-tick.service — one scheduler tick (`worker --once`).
-# Started by seo-runner-tick.timer. SHIPS DISABLED.
 #
-# The tick model: systemd only starts the worker; the runner decides which
-# jobs are due from its OWN state database (schedules + job queue managed
-# via `seo-audit-runner schedule|job ...`). One scheduled occurrence
-# creates at most one job (unique occurrence index), and job execution
-# takes the runner's process lock, so ticks can never overlap a manual run.
+# THE ONLY production unit of this runner. It is started exclusively by
+# seo-runner-tick.timer, and that timer is the SINGLE scheduling authority
+# for the whole automation: no second timer, no second service, and no
+# cron entry may drive this runner on the same host (deploy/cron.example
+# is documentation for systemd-less hosts and is mutually exclusive with
+# systemd). SHIPS DISABLED — enabling is an explicit administrator action
+# gated by docs/PRODUCTION_GATES.md.
+#
+# The tick model: systemd only starts the worker; the runner decides what
+# is due from its OWN state database (schedules + job queue managed via
+# `seo-audit-runner schedule|job ...`). One tick owns, in this order:
+#   1. crash recovery     — RUNNING jobs whose worker is gone -> FAILED;
+#   2. stale executions   — a claim that was abandoned is reclaimed, and an
+#                           outcome from a stale execution is never recorded
+#                           over the current owner's;
+#   3. due schedules      — one occurrence creates AT MOST one job (unique
+#                           (schedule_id, occurrence_key) index);
+#   4. queued jobs        — claimed atomically, executed sequentially; the
+#                           child takes the runner's process lock, so a tick
+#                           can never overlap a manual run (the child exits
+#                           4 and the job returns to QUEUED);
+#   5. notification retry — queued/failed Slack deliveries are retried at
+#                           the end of the tick; a failure there never fails
+#                           the tick or the audits in it.
+# Because the tick owns all five, no separate retry timer exists.
 [Unit]
 Description=SEO audit runner — scheduler tick (runner-managed schedules)
 Documentation=file:/opt/seo-audit-runner/current/README.md

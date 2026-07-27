@@ -145,52 +145,71 @@ Exit codes for `run`: `0` ok · `1` config/runner failure · `2` some audits
 failed · `3` criticals with `--fail-on-critical` · `4` another instance
 was already running (safe — the lock prevents overlap).
 
-## 7. Scheduling — choose ONE model
+## 7. Scheduling — one timer, and it ships disabled
 
-All timers ship **disabled**. Enable exactly one model per host; never
-both for full audits, and never cron and systemd together.
+There is **one** scheduling authority on this host:
 
-### Model A — classic fixed daily audit
+    seo-runner-tick.timer → seo-runner-tick.service → seo-audit-runner worker --once
 
-Daily full audit 03:00 Africa/Cairo + hourly Slack retry:
+Every 5 minutes that tick recovers crashed/abandoned jobs, enqueues due
+schedule occurrences (at most one job each), runs queued jobs
+sequentially, and retries queued Slack notifications. There is no daily
+audit timer and no retry timer — **audit times live in the runner's own
+schedules, not in a unit file.** Cron is only for hosts without systemd
+(`deploy/cron.example`) and must never run alongside the timer.
 
-```bash
-sudo systemctl enable --now seo-audit-runner.timer seo-runner-retry.timer
-```
-
-### Model B — runner-managed schedules (backend-controllable)
-
-A 5-minute scheduler tick executes jobs and schedules stored in the
-runner's own database (see `docs/JOBS_AND_SCHEDULES.md`):
+### Step 1 — define when audits happen
 
 ```bash
-# create + enable a schedule (stored disabled until you enable it)
+# created DISABLED; timezone defaults to Africa/Cairo
 sudo -u seo-runner seo-audit-runner schedule create --frequency daily --at 03:00 --all
 sudo -u seo-runner seo-audit-runner schedule enable <schedule-id>
-sudo -u seo-runner seo-audit-runner schedule list
-
-# turn on the tick (plus the hourly Slack retry)
-sudo systemctl enable --now seo-runner-tick.timer seo-runner-retry.timer
+sudo -u seo-runner seo-audit-runner schedule list      # next= column
 ```
 
-Timezone: schedules store an IANA timezone (default `Africa/Cairo`);
-occurrence times follow that zone through DST changes. Missed occurrences
-while the host was down are caught up **at most once** within 24 h.
+Occurrence times follow each schedule's stored IANA timezone through DST
+changes. Occurrences missed while the host was down are caught up **at
+most once** within 24 h.
 
-**Disable automation** (either model):
+### Step 2 — pre-enable validation (required)
+
+Enabling the timer is the moment automation starts touching production.
+All of the following must hold first — do not skip any line:
 
 ```bash
-sudo systemctl disable --now seo-audit-runner.timer seo-runner-tick.timer seo-runner-retry.timer
+sudo bash deploy/smoke-test.sh --with-dry-run          # RESULT: PASS
+sudo -u seo-runner seo-audit-runner doctor             # exit 0 or 2, no fail
+sudo -u seo-runner seo-audit-runner schedule list      # expected schedules ENABLED
+sudo -u seo-runner seo-audit-runner worker --once      # one tick by hand, watched
+sudo -u seo-runner seo-audit-runner job list --limit 5 # the tick's jobs SUCCEEDED
+systemctl list-unit-files 'seo-*'                      # ONLY the two tick units
 ```
 
-### Check the next scheduled run
+- [ ] Section 6 completed: one controlled `run --project <id>` reviewed
+- [ ] `docs/PRODUCTION_GATES.md` Gates 5–7 satisfied
+- [ ] No `/etc/cron.d/seo-audit-runner` entry on this host
+- [ ] No `seo-audit-runner.timer` / `seo-runner-retry.timer` left over from
+      an older install (`systemctl is-enabled` must not say `enabled`;
+      delete the unit files and `systemctl daemon-reload`)
+
+### Step 3 — enable the tick
 
 ```bash
-systemctl list-timers 'seo-*' 'seo-audit-runner*'      # systemd view
-sudo -u seo-runner seo-audit-runner schedule list       # model B: next= column
+sudo systemctl enable --now seo-runner-tick.timer
+systemctl list-timers 'seo-*'                          # confirm the next tick
 ```
 
-## 8. Job status, history, and retry (model B / backend control)
+**Disable automation** (the single off switch):
+
+```bash
+sudo systemctl disable --now seo-runner-tick.timer
+```
+
+Disabling a single schedule instead of all automation:
+`seo-audit-runner schedule disable <id>` — the tick keeps running and
+simply finds nothing due.
+
+## 8. Job status, history, and retry (backend control)
 
 ```bash
 sudo -u seo-runner seo-audit-runner job create --project <id>   # queue a manual job
@@ -211,11 +230,13 @@ CLI is the documented control channel for the backend
 journald is the primary log under systemd:
 
 ```bash
-journalctl -u seo-audit-runner.service -e        # last daily-audit run
+journalctl -u seo-runner-tick.service -e                 # the last tick
 journalctl -u seo-runner-tick.service --since today
-journalctl -u seo-runner-retry.service -e
-journalctl -u seo-audit-runner.service --since "2026-07-20" --until "2026-07-21"
+journalctl -u seo-runner-tick.service --since "2026-07-20" --until "2026-07-21"
 ```
+
+Everything the automation does — audits, job outcomes, notification
+retries — is in that one unit's journal, because one unit does all of it.
 
 `/var/log/seo-audit-runner/` is used only if YOU redirect output there
 (cron mode); in that case install `logrotate.example` as
@@ -224,7 +245,7 @@ journalctl -u seo-audit-runner.service --since "2026-07-20" --until "2026-07-21"
 ## 10. Restarting / recovery
 
 The runner is oneshot (no daemon to restart). To interrupt a running
-audit safely: `sudo systemctl stop seo-audit-runner.service` (SIGTERM →
+audit safely: `sudo systemctl stop seo-runner-tick.service` (SIGTERM →
 graceful abort, lock released). A crashed run leaves a stale lock that
 the next run reclaims automatically; an interrupted job is marked FAILED
 on the next tick and can be retried with `job retry`.
@@ -295,7 +316,8 @@ Copy into the handover ticket and tick off:
 - [ ] `deploy/smoke-test.sh --with-dry-run` prints `RESULT: PASS`
 - [ ] `seo-audit-runner doctor` exits 0 or 2 (warnings understood)
 - [ ] one controlled `run --project <id>` reviewed (results + Slack + app health)
-- [ ] scheduling model chosen (A or B) and enabled deliberately — or left disabled
+- [ ] §7 pre-enable validation done, then `seo-runner-tick.timer` enabled deliberately — or left disabled
+- [ ] no second scheduling authority: no cron entry, no leftover `seo-audit-runner.timer` / `seo-runner-retry.timer`
 - [ ] `deploy/backup.sh` produced an archive; `restore.sh` tested on a scratch copy
 - [ ] `deploy/rollback.sh` procedure read and understood
 - [ ] this document handed to the operating team
