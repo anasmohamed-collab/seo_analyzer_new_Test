@@ -151,6 +151,62 @@ test('ambiguous trigger: no second POST, outcome TRIGGER_OUTCOME_UNKNOWN', async
   assert.match(report.entries[0].detail, /running_count=1/);
 });
 
+test('an ambiguous trigger is verified with read-only calls only, never a second POST', async () => {
+  const requests = [];
+  let projectReads = 0;
+  const fetchImpl = async (url, init = {}) => {
+    const method = init.method ?? 'GET';
+    requests.push({ url: String(url), method });
+    if (method === 'POST') {
+      // The application may or may not have accepted this — the classic
+      // ambiguous outcome the runner must never resolve by POSTing again.
+      throw Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+    }
+    const u = String(url);
+    const body = u.endsWith('/api/projects')
+      ? { projects: [project()] }
+      : u.endsWith('/api/projects/p1')
+        ? // Pre-flight sees nothing running; the post-ambiguity check then
+          // observes a run that this POST may have started.
+          { project: { id: 'p1', running_count: ++projectReads === 1 ? 0 : 1 } }
+        : {};
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+  const apiClient = new ApiClient({ baseUrl: 'http://localhost:3000', fetchImpl, retryBaseDelayMs: 1 });
+
+  const report = await runAudits({ config: fastConfig, apiClient, options: {} });
+
+  assert.equal(report.entries[0].outcome, OUTCOME.TRIGGER_OUTCOME_UNKNOWN);
+  const posts = requests.filter((r) => r.method === 'POST');
+  assert.equal(posts.length, 1, `the trigger POST must be issued exactly once, saw: ${JSON.stringify(posts)}`);
+  assert.ok(
+    requests.filter((r) => r.method !== 'POST').every((r) => r.method === 'GET'),
+    'verification after an ambiguous trigger must use read-only requests only',
+  );
+});
+
+test('repeated ambiguous triggers still POST once per project and never retry', async () => {
+  const apiClient = stubClient({
+    projects: [project({ id: 'p1' }), project({ id: 'p2', domain: 'other.com', website_url: 'https://other.com' })],
+    startAudit: () => {
+      throw new AmbiguousTriggerError('socket hang up');
+    },
+    getRunResults: () => ({ status: 'COMPLETED', results: [] }),
+  });
+
+  const report = await runAudits({ config: fastConfig, apiClient, options: {} });
+
+  assert.equal(apiClient.calls.startAudit.length, 2, 'one POST per project, no retries');
+  assert.deepEqual(
+    report.entries.map((e) => e.outcome),
+    [OUTCOME.TRIGGER_OUTCOME_UNKNOWN, OUTCOME.TRIGGER_OUTCOME_UNKNOWN],
+  );
+  assert.equal(apiClient.calls.getRunResults.length, 0, 'an unidentified run is never polled');
+});
+
 test('dry run performs zero POST requests (verified through a real ApiClient)', async () => {
   const requests = [];
   const fetchImpl = async (url, init = {}) => {

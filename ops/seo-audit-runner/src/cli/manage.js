@@ -199,7 +199,13 @@ export function scheduleCommand(config, logger, values, positionals) {
     case 'delete':
       if (!id) return usageError('schedule delete requires a schedule id');
       return withDb(config, logger, (db) => {
-        new ScheduleStore(db).delete(id);
+        // Queued jobs from this schedule block the delete unless --force is
+        // given, in which case they are CANCELLED first. Running jobs always
+        // block it — see ScheduleStore.delete.
+        const { cancelledJobIds } = new ScheduleStore(db).delete(id, { force: Boolean(values.force) });
+        for (const jobId of cancelledJobIds) {
+          process.stdout.write(`cancelled queued job ${jobId} (schedule ${id} was deleted)\n`);
+        }
         process.stdout.write(`deleted schedule ${id}\n`);
         return EXIT_CODES.OK;
       });

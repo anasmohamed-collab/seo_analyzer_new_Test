@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { openStateDb } from '../src/db.js';
 import { JobStore, JOB_STATUS } from '../src/jobs.js';
 import { ScheduleStore } from '../src/schedules.js';
+import { currentHostId } from '../src/lock.js';
 import { workerTick, enqueueDueSchedules, jobArgs } from '../src/worker.js';
 
 const DEAD_PID = 2147483647;
@@ -46,7 +47,15 @@ test('a tick enqueues a due schedule occurrence and executes it', async () => {
   const exec = stubExec(0);
 
   const summary = await workerTick({ scheduleStore, jobStore, now, executeJob: exec });
-  assert.deepEqual(summary, { recovered: 0, enqueued: 1, executed: 1, succeeded: 1, failed: 0, deferred: 0 });
+  assert.deepEqual(summary, {
+    recovered: 0,
+    enqueued: 1,
+    executed: 1,
+    succeeded: 1,
+    failed: 0,
+    deferred: 0,
+    notificationsRetried: 0,
+  });
   assert.equal(exec.calls.length, 1);
   assert.equal(jobStore.list()[0].status, JOB_STATUS.SUCCEEDED);
   db.close();
@@ -158,5 +167,155 @@ test('maxJobs bounds one tick', async () => {
   const summary = await workerTick({ scheduleStore, jobStore, executeJob: exec, maxJobs: 2 });
   assert.equal(summary.executed, 2);
   assert.equal(jobStore.list({ status: JOB_STATUS.QUEUED }).length, 3);
+  db.close();
+});
+
+// ── conflict-aware enqueue ─────────────────────────────────────────
+
+test('a due occurrence is deferred while an overlapping job is queued, then enqueued later', async () => {
+  const { db, jobStore, scheduleStore } = fixture();
+  const now = new Date('2026-07-21T12:00:00Z');
+  dueSchedule(scheduleStore, now); // all-projects schedule
+  const manual = jobStore.create({ projectId: 'p1' }); // overlaps it
+
+  const deferredTick = enqueueDueSchedules({ scheduleStore, jobStore, now });
+  assert.equal(deferredTick.length, 0, 'the occurrence must not enqueue over active work');
+  assert.equal(jobStore.list().length, 1);
+
+  // Clear the conflict; the same occurrence still enqueues on the next tick.
+  jobStore.claimNext();
+  jobStore.finish(manual.id, { exitCode: 0 });
+  const created = enqueueDueSchedules({ scheduleStore, jobStore, now: new Date(now.getTime() + 60_000) });
+  assert.equal(created.length, 1);
+  assert.equal(created[0].occurrence_key, '2026-07-21');
+  db.close();
+});
+
+test('two schedules due at once never produce overlapping active jobs', async () => {
+  const { db, jobStore, scheduleStore } = fixture();
+  const now = new Date('2026-07-21T12:00:00Z');
+  const at = new Date(now.getTime() - 5 * 60 * 1000);
+  for (const projectId of [null, 'p1']) {
+    const s = scheduleStore.create({
+      frequency: 'daily',
+      atHour: at.getUTCHours(),
+      atMinute: at.getUTCMinutes(),
+      timezone: 'UTC',
+      projectId,
+    });
+    scheduleStore.setEnabled(s.id, true);
+  }
+
+  const created = enqueueDueSchedules({ scheduleStore, jobStore, now });
+  assert.equal(created.length, 1, 'the second, overlapping occurrence is deferred');
+  assert.equal(created[0].project_id, null, 'the older schedule wins deterministically');
+  db.close();
+});
+
+// ── execution identity in a tick ───────────────────────────────────
+
+test('a tick claims with a durable identity and renews the lease while the job runs', async () => {
+  const { db, jobStore, scheduleStore } = fixture();
+  const job = jobStore.create({ projectId: 'slow' });
+
+  let seenExecutionId = null;
+  const beats = [];
+  const originalHeartbeat = jobStore.heartbeat.bind(jobStore);
+  jobStore.heartbeat = (id, executionId, opts) => {
+    beats.push({ id, executionId });
+    return originalHeartbeat(id, executionId, opts);
+  };
+
+  const exec = async (claimed) => {
+    seenExecutionId = claimed.execution_id;
+    await new Promise((resolve) => setTimeout(resolve, 30)); // "long" audit
+    return { exitCode: 0, stderr: '' };
+  };
+
+  await workerTick({ scheduleStore, jobStore, executeJob: exec, heartbeatIntervalMs: 5 });
+
+  assert.ok(seenExecutionId, 'the executor receives the claimed job with its execution id');
+  assert.ok(beats.length > 0, 'the lease must be renewed while the child runs');
+  assert.ok(beats.every((b) => b.id === job.id && b.executionId === seenExecutionId));
+  assert.equal(jobStore.get(job.id).status, JOB_STATUS.SUCCEEDED);
+  db.close();
+});
+
+test('a tick recovers a job whose worker was lost to a host restart', async () => {
+  const { db, jobStore, scheduleStore } = fixture();
+  const job = jobStore.create({ projectId: 'rebooted' });
+  // Claimed by a live pid in a previous boot — only the boot id proves it is gone.
+  jobStore.claimNext({ workerPid: process.pid, hostId: currentHostId(), bootId: 'previous-boot' });
+
+  const summary = await workerTick({ scheduleStore, jobStore, executeJob: stubExec(0) });
+  assert.equal(summary.recovered, 1);
+  const recovered = jobStore.get(job.id);
+  assert.equal(recovered.status, JOB_STATUS.FAILED);
+  assert.match(recovered.error, /host restarted/);
+  db.close();
+});
+
+test('an outcome is not recorded for a job that was re-claimed mid-execution', async () => {
+  const { db, jobStore, scheduleStore } = fixture();
+  const job = jobStore.create({ projectId: 'stolen' });
+  const warnings = [];
+  const logger = { warn: (m) => warnings.push(m), info: () => {}, debug: () => {} };
+
+  const exec = async () => {
+    // While this execution runs, the job is declared abandoned and re-claimed.
+    jobStore.recoverInterrupted({ now: new Date(Date.now() + 60 * 60 * 1000) });
+    jobStore.retry(job.id);
+    jobStore.claimNext();
+    return { exitCode: 0, stderr: '' };
+  };
+
+  const summary = await workerTick({ scheduleStore, jobStore, executeJob: exec, logger });
+  assert.equal(summary.succeeded, 0, 'a stale execution must not mark the job SUCCEEDED');
+  assert.equal(jobStore.get(job.id).status, JOB_STATUS.RUNNING, 'the new owner still owns it');
+  assert.ok(warnings.some((w) => /outcome not recorded/.test(w)));
+  db.close();
+});
+
+// ── notification retry seam (Prompt 3 will own the timer) ──────────
+
+test('the notification retry hook runs after jobs and is off by default', async () => {
+  const { db, jobStore, scheduleStore } = fixture();
+  jobStore.create({ projectId: 'p1' });
+
+  const order = [];
+  const exec = async () => { order.push('job'); return { exitCode: 0, stderr: '' }; };
+
+  const withoutHook = await workerTick({ scheduleStore, jobStore, executeJob: exec });
+  assert.equal(withoutHook.notificationsRetried, 0, 'no retry happens unless a hook is supplied');
+  assert.deepEqual(order, ['job']);
+
+  jobStore.create({ projectId: 'p1' });
+  const summary = await workerTick({
+    scheduleStore,
+    jobStore,
+    executeJob: exec,
+    retryNotifications: async () => { order.push('notifications'); return { sent: 2, failed: 0 }; },
+  });
+  assert.equal(summary.notificationsRetried, 2);
+  assert.deepEqual(order, ['job', 'job', 'notifications'], 'notifications are retried after audits');
+  db.close();
+});
+
+test('a failing notification retry never fails the tick or the jobs in it', async () => {
+  const { db, jobStore, scheduleStore } = fixture();
+  jobStore.create({ projectId: 'p1' });
+  const warnings = [];
+
+  const summary = await workerTick({
+    scheduleStore,
+    jobStore,
+    executeJob: stubExec(0),
+    logger: { warn: (m) => warnings.push(m), info: () => {}, debug: () => {} },
+    retryNotifications: async () => { throw new Error('slack unreachable'); },
+  });
+
+  assert.equal(summary.succeeded, 1, 'the audit job outcome stands');
+  assert.equal(summary.notificationsRetried, 0);
+  assert.ok(warnings.some((w) => /Notification retry step failed/.test(w)));
   db.close();
 });

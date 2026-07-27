@@ -19,16 +19,23 @@
  *
  * The worker never runs as root (systemd User=seo-runner; the CLI refuses
  * root via the wrapper). Job exit codes map to job states in jobs.js.
+ *
+ * While a job runs, the worker renews its lease (`heartbeat_at`) once a
+ * minute. That is what lets a later tick tell "still working" apart from
+ * "claimed and abandoned" without guessing — see JobStore.recoverInterrupted.
  */
 
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { latestOccurrence, DEFAULT_CATCHUP_WINDOW_MS } from './schedules.js';
-import { JOB_STATUS } from './jobs.js';
+import { JOB_STATUS, JobError } from './jobs.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLI_ENTRYPOINT = path.resolve(__dirname, '..', 'bin', 'seo-audit-runner.js');
+
+/** Lease renewal interval; well under jobs.js DEFAULT_LEASE_MS. */
+export const DEFAULT_HEARTBEAT_INTERVAL_MS = 60_000;
 
 /** Build the argv for one job. Structured arguments only. */
 export function jobArgs(job) {
@@ -60,6 +67,12 @@ export function spawnJobExecutor({ signal } = {}) {
 /**
  * Enqueue due occurrences for all enabled schedules.
  * Returns the newly created jobs.
+ *
+ * Disabled schedules are never listed here, so disabling a schedule stops
+ * future enqueue immediately. An occurrence that overlaps work already
+ * QUEUED or RUNNING is DEFERRED, not dropped: its occurrence key stays
+ * unused, so the next tick retries it while it is still inside the catch-up
+ * window.
  */
 export function enqueueDueSchedules({
   scheduleStore,
@@ -74,6 +87,16 @@ export function enqueueDueSchedules({
     if (!occurrence) continue;
     const age = now.getTime() - occurrence.at.getTime();
     if (age > catchupWindowMs) continue; // too old — skipped, never batched
+
+    const conflict = jobStore.findActiveConflict({ projectId: schedule.project_id });
+    if (conflict) {
+      logger?.warn?.(
+        `Schedule ${schedule.id} occurrence ${occurrence.occurrenceKey} deferred: ` +
+          `job ${conflict.id} is already ${conflict.status} for an overlapping target`,
+      );
+      continue;
+    }
+
     const job = jobStore.createForOccurrence({ schedule, occurrenceKey: occurrence.occurrenceKey });
     if (job) {
       created.push(job);
@@ -88,6 +111,12 @@ export function enqueueDueSchedules({
 /**
  * One worker tick. Returns a summary object.
  * `executeJob` is injectable for tests; production uses spawnJobExecutor().
+ *
+ * `retryNotifications` is the seam for the single-timer model: when supplied
+ * it is awaited at the end of the tick, after job execution, so one timer can
+ * own both audits and notification retries. It is null by default and the CLI
+ * does not wire it yet — `retry-notifications` remains the only active retry
+ * path until that migration lands. Notification failures never fail a tick.
  */
 export async function workerTick({
   scheduleStore,
@@ -98,14 +127,24 @@ export async function workerTick({
   catchupWindowMs = DEFAULT_CATCHUP_WINDOW_MS,
   maxJobs = 10,
   executeJob = null,
+  heartbeatIntervalMs = DEFAULT_HEARTBEAT_INTERVAL_MS,
+  retryNotifications = null,
 }) {
-  const summary = { recovered: 0, enqueued: 0, executed: 0, succeeded: 0, failed: 0, deferred: 0 };
+  const summary = {
+    recovered: 0,
+    enqueued: 0,
+    executed: 0,
+    succeeded: 0,
+    failed: 0,
+    deferred: 0,
+    notificationsRetried: 0,
+  };
   const exec = executeJob ?? spawnJobExecutor();
 
-  const recovered = jobStore.recoverInterrupted();
+  const recovered = jobStore.recoverInterrupted({ now });
   summary.recovered = recovered.length;
   for (const job of recovered) {
-    logger?.warn?.(`Recovered interrupted job ${job.id} -> FAILED`);
+    logger?.warn?.(`Recovered interrupted job ${job.id} -> FAILED (${job.error})`);
   }
 
   summary.enqueued = enqueueDueSchedules({ scheduleStore, jobStore, now, catchupWindowMs, logger }).length;
@@ -114,8 +153,42 @@ export async function workerTick({
     const job = jobStore.claimNext();
     if (!job) break;
     logger?.info?.(`Executing job ${job.id} (${job.project_id ? `project ${job.project_id}` : 'all projects'})`);
-    const { exitCode, stderr } = await exec(job);
-    const finished = jobStore.finish(job.id, { exitCode, error: exitCode === 0 ? null : stderr, redact });
+
+    // Renew the lease while the child runs, so a long audit is never
+    // mistaken for an abandoned claim.
+    const lease = setInterval(() => {
+      try {
+        jobStore.heartbeat(job.id, job.execution_id);
+      } catch (err) {
+        logger?.debug?.(`Heartbeat for job ${job.id} failed: ${err.message}`);
+      }
+    }, heartbeatIntervalMs);
+    lease.unref?.();
+
+    let exitCode;
+    let stderr;
+    try {
+      ({ exitCode, stderr } = await exec(job));
+    } finally {
+      clearInterval(lease);
+    }
+
+    let finished;
+    try {
+      finished = jobStore.finish(job.id, {
+        exitCode,
+        error: exitCode === 0 ? null : stderr,
+        redact,
+        executionId: job.execution_id,
+      });
+    } catch (err) {
+      if (!(err instanceof JobError)) throw err;
+      // The job was recovered or re-claimed while this execution ran; its
+      // current owner decides the outcome, not this one.
+      logger?.warn?.(`Job ${job.id} outcome not recorded: ${err.message}`);
+      continue;
+    }
+
     summary.executed += 1;
     if (finished.status === JOB_STATUS.SUCCEEDED) summary.succeeded += 1;
     else if (finished.status === JOB_STATUS.QUEUED) {
@@ -124,5 +197,15 @@ export async function workerTick({
       break; // the lock holder is still active — stop this tick
     } else summary.failed += 1;
   }
+
+  if (typeof retryNotifications === 'function') {
+    try {
+      const result = await retryNotifications();
+      summary.notificationsRetried = result?.sent ?? 0;
+    } catch (err) {
+      logger?.warn?.(`Notification retry step failed (tick unaffected): ${redact(err.message)}`);
+    }
+  }
+
   return summary;
 }
