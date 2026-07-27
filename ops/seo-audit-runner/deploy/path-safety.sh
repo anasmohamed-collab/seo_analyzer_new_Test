@@ -26,6 +26,24 @@
 # operates only on a value that has just re-passed the full validation.
 set -Eeuo pipefail
 
+# Guarantee the utilities this contract relies on (realpath/readlink, head,
+# sed, stat) resolve even when the script is invoked with a minimal or reset
+# PATH — canonicalization MUST NOT silently fail because a command is
+# missing. The caller's PATH is kept FIRST so operator overrides and the
+# deployment tests' mocked commands still take precedence; standard system
+# directories are only appended as a fallback. Harmless when this file is
+# sourced by a parent that already hardened PATH.
+# Drop Windows system directories (their find.exe/sort.exe/tar.exe shadow
+# the GNU tools) before appending the standard system directories.
+seo_path=; seo_ifs=$IFS; IFS=:
+for seo_d in ${PATH:-}; do
+  case $seo_d in ''|/[A-Za-z]/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]|/[A-Za-z]/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]/*|[A-Za-z]:/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]|[A-Za-z]:/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]/*) continue ;; esac
+  seo_path=${seo_path:+$seo_path:}$seo_d
+done
+IFS=$seo_ifs
+export PATH="${seo_path:+$seo_path:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+unset seo_path seo_ifs seo_d
+
 PSAFE_SENTINEL_NAME='.seo-audit-runner.owned'
 PSAFE_SENTINEL_HEADER='seo-audit-runner ownership sentinel v1'
 

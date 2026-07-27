@@ -26,6 +26,22 @@
 #   SEO_AUDIT_RUNNER_USER      run-as user    (default seo-runner; empty disables the drop)
 set -Eeuo pipefail
 
+# Guarantee the utilities this wrapper relies on (id, runuser) resolve even
+# under a minimal or reset PATH. The Node runtime is still resolved by
+# ABSOLUTE path (never via PATH); this only affects the privilege-drop
+# helpers. The caller's PATH is kept FIRST so mocked commands in the
+# deployment tests still take precedence.
+# Drop Windows system directories (their find.exe/sort.exe/tar.exe shadow
+# the GNU tools) before appending the standard system directories.
+seo_path=; seo_ifs=$IFS; IFS=:
+for seo_d in ${PATH:-}; do
+  case $seo_d in ''|/[A-Za-z]/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]|/[A-Za-z]/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]/*|[A-Za-z]:/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]|[A-Za-z]:/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]/*) continue ;; esac
+  seo_path=${seo_path:+$seo_path:}$seo_d
+done
+IFS=$seo_ifs
+export PATH="${seo_path:+$seo_path:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+unset seo_path seo_ifs seo_d
+
 ROOT=${SEO_AUDIT_RUNNER_ROOT:-/opt/seo-audit-runner}
 NODE_BIN=${SEO_AUDIT_RUNNER_NODE:-$ROOT/node/bin/node}
 ENV_FILE=${SEO_AUDIT_RUNNER_ENV_FILE:-/etc/seo-audit-runner/runner.env}

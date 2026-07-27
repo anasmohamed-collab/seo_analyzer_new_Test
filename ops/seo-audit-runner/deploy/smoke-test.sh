@@ -12,6 +12,22 @@
 set -Euo pipefail
 # NOTE: not -e — every check's failure is caught and reported.
 
+# Guarantee core system utilities (sed, realpath, id, mktemp, cat, …)
+# resolve even when invoked with a minimal or reset PATH. The caller's PATH
+# is kept FIRST so operator overrides and the rootless deployment tests'
+# mocked commands still take precedence; standard system directories are
+# only appended as a fallback.
+# Drop Windows system directories (their find.exe/sort.exe/tar.exe shadow
+# the GNU tools) before appending the standard system directories.
+seo_path=; seo_ifs=$IFS; IFS=:
+for seo_d in ${PATH:-}; do
+  case $seo_d in ''|/[A-Za-z]/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]|/[A-Za-z]/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]/*|[A-Za-z]:/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]|[A-Za-z]:/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]/*) continue ;; esac
+  seo_path=${seo_path:+$seo_path:}$seo_d
+done
+IFS=$seo_ifs
+export PATH="${seo_path:+$seo_path:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+unset seo_path seo_ifs seo_d
+
 DESTDIR=
 WITH_DRY_RUN=0
 
@@ -35,7 +51,13 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# Resolve this script's own directory with shell builtins only, so the
+# bootstrap never depends on `dirname` being on PATH.
+SCRIPT_SOURCE=${BASH_SOURCE[0]:-$0}
+case $SCRIPT_SOURCE in
+  */*) SCRIPT_DIR=$(CDPATH= cd -- "${SCRIPT_SOURCE%/*}" && pwd) ;;
+  *)   SCRIPT_DIR=$(CDPATH= cd -- . && pwd) ;;
+esac
 OPT_DIR=$DESTDIR/opt/seo-audit-runner
 NODE_BIN=$OPT_DIR/node/bin/node
 WRAPPER=$DESTDIR/usr/local/bin/seo-audit-runner
