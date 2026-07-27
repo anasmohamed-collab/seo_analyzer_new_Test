@@ -1,12 +1,17 @@
 # Deployment Contracts — SEO Audit Runner
 
-Status: **approved contract** (Phase 4A, paths corrected). This file defines
-the target layout and the behavioral contracts that the Phase 4B–4E scripts
-must implement. No script referenced here exists yet; nothing in this
-document is executable.
+Status: **approved contract, and now implemented.** This file defines the
+target layout and the behavioral contracts; every script referenced here
+exists under `deploy/` and is covered by tests. Read this to understand *what
+the scripts guarantee*; for the commands to run, use
+`deploy/SERVER-HANDOVER.md` (installation) and
+`../docs/OPERATIONS_RUNBOOK.md` (backup, restore, upgrade, rollback,
+emergency disable).
 
 Architecture decision and isolation rules: `../docs/DEPLOYMENT_ARCHITECTURE.md`.
 Safety gates: `../docs/PRODUCTION_GATES.md`.
+CLI/exit-code specification: `../docs/CLI_CONTRACT.md`.
+Readiness status: `../docs/READINESS_MATRIX.md`.
 
 ## 1. Production installation layout
 
@@ -37,9 +42,10 @@ Notes:
   logs to stdout/stderr and must never REQUIRE file logging when run through
   systemd. `/var/log/seo-audit-runner/` exists only for cron mode, redirected
   output, or operator-managed file logging; whoever redirects output there
-  owns rotation (a `logrotate.example` may ship in a later phase).
+  owns rotation — install `deploy/logrotate.example` as
+  `/etc/logrotate.d/seo-audit-runner`.
 - `/run/seo-audit-runner/` is tmpfs-backed and recreated at boot (via systemd
-  `RuntimeDirectory=seo-audit-runner` in Phase 4C). See §2a for the lock-file
+  `RuntimeDirectory=seo-audit-runner` in the tick service). See §2a for the lock-file
   transition caveat.
 - A non-root "user mode" install (everything under `~/seo-audit-runner/`,
   cron instead of system units) is a documented degraded option for hosts
@@ -68,7 +74,7 @@ Notes:
   `RUNNER_LOCK_DIR=/run/seo-audit-runner`) — which is a **Phase 4F
   implementation item** with its own tests.
 - **Until that code change is implemented and tested, deployment scripts and
-  units MUST NOT pretend the runner supports it**: Phase 4B–4E artifacts
+  units MUST NOT pretend the runner supports it**: the shipped artifacts
   treat the lock as living in `/var/lib/seo-audit-runner/` (the state dir),
   and `/run/seo-audit-runner/` is provisioned but unused. After Phase 4F,
   `runner.env` gains `RUNNER_LOCK_DIR=/run/seo-audit-runner` explicitly.
@@ -123,7 +129,7 @@ Notes:
   `deploy/cron.example`. No script ever writes `/etc/cron.d` or calls
   `crontab`. Never schedule the same runner command twice on one host.
 
-## 5. Installation contract (Phase 4B script `install.sh`)
+## 5. Installation contract (`install.sh` — implemented)
 
 - Idempotent: re-running against the same release is a no-op; against a new
   release it behaves as upgrade §7.
@@ -140,7 +146,7 @@ Notes:
   reporting the result. Install fails loudly if validation fails.
 - Touches nothing outside the paths in §1.
 
-## 6. Backup and restore contracts (Phase 4D)
+## 6. Backup and restore contracts (implemented)
 
 Backup (`backup.sh`):
 - Source: the state directory `/var/lib/seo-audit-runner/` only — SQLite
@@ -187,7 +193,7 @@ Restore (`restore.sh`):
 - Rollback of a bad restore = swap the `state.pre-restore-<stamp>` directory
   back.
 
-## 7. Upgrade and rollback contracts (Phase 4E)
+## 7. Upgrade and rollback contracts (implemented)
 
 Upgrade (`upgrade.sh`):
 1. `backup.sh` (mandatory pre-upgrade backup; abort on failure),
@@ -208,7 +214,7 @@ Rollback (`rollback.sh`):
   step 1). The script must detect a schema version newer than the rolled-back
   code supports and instruct the operator instead of guessing.
 
-## 8. Uninstall and purge contracts (Phase 4E)
+## 8. Uninstall and purge contracts (implemented)
 
 Uninstall (`uninstall.sh`) — non-destructive:
 - Stops and disables units, removes unit files, removes `/opt/seo-audit-runner`

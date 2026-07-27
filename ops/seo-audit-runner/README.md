@@ -2,9 +2,11 @@
 
 Standalone Linux automation command for the SEO analyzer application.
 
-It discovers all projects, deduplicates domains, triggers a fresh SEO audit
-per project **through the application's own supported HTTP API**, waits for
-completion, extracts the issues the application classifies as critical
+**This is an operational automation layer, not an SEO tool.** It contains no
+audit rules, no checklist, no scoring, and no crawler. It discovers all
+projects, deduplicates domains, asks the application to run a fresh audit
+**through the application's own supported HTTP API**, waits for completion,
+extracts the issues *the application* classified as critical
 (`recommendation.priority === 'P0'`), tracks their lifecycle
 (new / reopened / unchanged / resolved) in a runner-owned SQLite database,
 and sends Slack notifications with persistent retry.
@@ -14,11 +16,34 @@ and sends Slack notifications with persistent retry.
 - Lives entirely in `ops/seo-audit-runner/`. No file of the main application
   is imported or modified.
 - Pure HTTP API client toward the SEO app — **no access to the application's
-  PostgreSQL database, ever**. The runner's own state lives in a separate
-  SQLite file it fully owns.
+  PostgreSQL database, ever**. Runner state is SQLite; application data stays
+  in PostgreSQL, and the runner never connects to it, never queries or
+  modifies application tables, and never reads the app's `DATABASE_URL`.
+- **No backend module is imported.** The runner does not change crawler,
+  checklist, or scoring logic, and does not modify frontend or backend
+  behavior. Audit rules and result structure belong to the application alone —
+  the runner only reads what the API returns.
 - Audits are started through the exact same endpoint the frontend uses.
+- Listens on **no network port**; its only network activity is outbound to the
+  configured application API and to Slack.
 - Zero production npm dependencies (Node built-ins, native `fetch`, and the
   built-in `node:sqlite` module).
+
+**Documentation map**
+
+| Document | Covers |
+|---|---|
+| `docs/CLI_CONTRACT.md` | JSON envelope, stdout/stderr split, exit codes, read-only guarantees, list bounds |
+| `docs/OPERATIONS_RUNBOOK.md` | backup, restore, upgrade, rollback, emergency disable, monitoring |
+| `docs/READINESS_MATRIX.md` | what is PASS / NOT VERIFIED / BLOCKED / NEEDS LINUX STAGING |
+| `docs/JOBS_AND_SCHEDULES.md` | the runner-owned job queue and recurring schedules |
+| `docs/BACKEND_CONTROL_API.md` | how a backend drives the runner (CLI over SSH) |
+| `docs/DEPLOYMENT_ARCHITECTURE.md` | architecture decision and the isolation contract |
+| `docs/PRODUCTION_GATES.md` | the gates that must pass before production |
+| `deploy/SERVER-HANDOVER.md` | full server install/operate/remove guide |
+| `deploy/INSTALL-CHECKLIST.md` | printable tick-box installation checklist |
+| `deploy/TROUBLESHOOTING.md` | symptom → cause → fix |
+| `deploy/README-deploy.md` | the deployment contracts the scripts implement |
 
 Endpoints used (the complete set):
 
@@ -131,6 +156,7 @@ plain-text fallback.
 ## Usage
 
 ```bash
+seo-audit-runner init                     # explicit state create/migrate (idempotent)
 seo-audit-runner validate-config          # config + state dir + state DB (offline)
 seo-audit-runner list-projects            # read-only listing with dedupe preview
 seo-audit-runner run --all                # audit every deduplicated project
@@ -146,23 +172,73 @@ seo-audit-runner retry-notifications --project PROJECT_ID
 seo-audit-runner retry-notifications --dry-run       # list eligible, send nothing
 
 seo-audit-runner status                   # runner-owned state report
-seo-audit-runner status --output json
+seo-audit-runner status --output json      # (default 10 project snapshots; --limit N)
 
 seo-audit-runner health                   # fast check: 0 healthy / 1 unhealthy / 2 degraded
 seo-audit-runner doctor                   # + DB integrity, disk space, systemd probing
 
 seo-audit-runner job create --project PROJECT_ID   # queue a manual audit job
-seo-audit-runner job list [--status FAILED] [--limit 20]
+seo-audit-runner job list [--status FAILED] [--limit 20]    # default limit 50
 seo-audit-runner job show|retry|cancel JOB_ID
 seo-audit-runner schedule create --frequency daily --at 03:00 --all
 seo-audit-runner schedule enable|disable|update|delete SCHEDULE_ID
-seo-audit-runner schedule list
+seo-audit-runner schedule list [--limit 20]                 # default limit 50
 seo-audit-runner worker --once            # one scheduler tick: recover, enqueue, run,
                                           # retry notifications (run by seo-runner-tick.timer)
 ```
 
 Jobs and schedules (the backend-controllable layer) are documented in
 `docs/JOBS_AND_SCHEDULES.md` and `docs/BACKEND_CONTROL_API.md`.
+
+### Output contract (`--output text|json`)
+
+Full specification: **`docs/CLI_CONTRACT.md`**. In short:
+
+- Every command takes `--output text|json`; `text` is the default.
+- In JSON mode **stdout is exactly one versioned envelope document** and
+  everything human-readable — logs, warnings, progress, error text — goes to
+  **stderr**. So `doctor --output json > doctor.json` is always safe.
+
+```json
+{ "schemaVersion": 1, "command": "job list", "ok": true,
+  "generatedAt": "2026-07-27T03:00:00.000Z", "data": { "limit": 50, "count": 0, "jobs": [] } }
+```
+
+```json
+{ "schemaVersion": 1, "command": "job create", "ok": false,
+  "generatedAt": "2026-07-27T03:00:00.000Z",
+  "error": { "code": "CONFLICT", "message": "…already QUEUED (job 7f3a…)" } }
+```
+
+- `ok` is exactly `exitCode === 0` — so `health` **degraded** (exit 2) reports
+  `ok: false` with `error.code: DEGRADED` while still carrying every check in
+  `data`. Branch on `error.code`, not on `ok` alone.
+- An unrecognized `--output` value is a usage error that writes nothing to
+  stdout, rather than silently emitting unparseable text.
+
+### Read-only commands
+
+`init`, `validate-config`, `list-projects`, `status`, `health`, `doctor`,
+`job list`, `job show`, `schedule list`, `retry-notifications --dry-run`, and
+`run --dry-run` never trigger an audit, send a notification, create a job or
+schedule, or write any row. Tests enforce this by snapshotting row counts and
+by running the CLI against a request-recording mock server (no diagnostic
+issues any HTTP request; nothing ever issues the audit-trigger `POST`).
+
+**State initialization.** Opening the state database creates and migrates it
+when absent, so the *first* state-reading command initializes it implicitly.
+That is safe — the DB is runner-owned and starts empty — but it is why
+`init` exists (explicit, idempotent) and why every documented command runs as
+`sudo -u seo-runner`: running one as root would leave root-owned files in
+`/var/lib/seo-audit-runner/`. See `docs/CLI_CONTRACT.md` §5.
+
+### List bounds
+
+No list is unbounded: `job list` 50, `schedule list` 50, `status` snapshots
+10, `retry-notifications` 50 — each overridable with `--limit <n>`. In JSON
+mode the applied bound is echoed back so a truncated page is distinguishable
+from a complete one. The bound is display-only: the worker tick and the health
+checks always see *every* enabled schedule.
 
 ### What a run does
 
@@ -278,6 +354,17 @@ reclaimed.
 
 Precedence: **4 > 1 > 3 > 2 > 0**. Slack notification failures do **not**
 affect these codes — they appear in the report and the retry queue.
+
+Management and diagnostic commands use a narrower table (per-command detail in
+`docs/CLI_CONTRACT.md` §3). Two behaviors worth knowing:
+
+- `worker --once` exits **0 even when a job it ran FAILED** — a tick fails only
+  on infrastructure errors, which is what stops `seo-runner-tick.service` from
+  flapping on an unrelated audit failure. Failed jobs surface through
+  `health`, `status`, and `job list --status FAILED`.
+- `health`/`doctor` exit **2** for warnings-only and **1** for a real failure,
+  so a fresh install is legitimately exit 2 (`last-success` warning) until the
+  first successful run. Monitoring should accept 0 and 2, and alert on 1 and 4.
 
 ## Scheduling on Linux — one authority
 
