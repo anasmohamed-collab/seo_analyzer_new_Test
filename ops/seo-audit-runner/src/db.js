@@ -174,6 +174,36 @@ export const MIGRATIONS = [
       `);
     },
   },
+  {
+    version: 4,
+    name: 'job-execution-identity',
+    /**
+     * Durable execution identity for claimed jobs.
+     *
+     * `worker_pid` alone cannot answer "is the worker that claimed this job
+     * still alive?" — PIDs are recycled, so after a reboot a dead worker's
+     * PID may belong to an unrelated live process and the job would stay
+     * RUNNING forever. These columns are runner-owned SQLite fields only:
+     * no external lease service, no PostgreSQL, no application change.
+     *
+     * Every column is nullable with no default, so the migration is a pure
+     * additive ALTER on existing databases and rows claimed under v3 keep
+     * working (they simply fall back to the PID-liveness check).
+     */
+    up(db) {
+      db.exec(`
+        ALTER TABLE jobs ADD COLUMN execution_id TEXT;
+        ALTER TABLE jobs ADD COLUMN host_id      TEXT;
+        ALTER TABLE jobs ADD COLUMN boot_id      TEXT;
+        ALTER TABLE jobs ADD COLUMN claimed_at   TEXT;
+        ALTER TABLE jobs ADD COLUMN heartbeat_at TEXT;
+
+        -- Supports the active-conflict lookup on every job create/retry.
+        CREATE INDEX IF NOT EXISTS idx_jobs_active_target
+          ON jobs (status, project_id);
+      `);
+    },
+  },
 ];
 
 export function migrate(db, { dbPath = null, logger = null } = {}) {

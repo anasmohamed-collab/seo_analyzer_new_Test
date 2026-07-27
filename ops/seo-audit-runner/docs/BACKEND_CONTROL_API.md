@@ -27,7 +27,7 @@ status, execution history, and the last error, and retry a failed job.
 
 ## Selected architecture: runner-owned control plane, CLI transport
 
-Jobs and schedules live in the runner's own SQLite (schema v3) with full
+Jobs and schedules live in the runner's own SQLite (schema v4) with full
 lifecycle, locking, and history (`JOBS_AND_SCHEDULES.md`). Every control
 operation is a **CLI verb with structured argv and `--output json`** —
 no shell strings, no eval, no secrets on command lines, deterministic
@@ -44,11 +44,24 @@ concatenation. This satisfies every control requirement today:
 | create manual job | `job create --project <id>` / `job create --all` |
 | create/update schedule | `schedule create …` / `schedule update <id> …` |
 | enable/disable schedule | `schedule enable|disable <id>` |
+| delete schedule | `schedule delete <id> [--force]` |
 | list schedules | `schedule list --output json` |
 | current job status | `job show <id> --output json` |
 | execution history | `job list --output json [--status …]` |
 | last error | `health --output json` (`last-error` check) or `job list --status FAILED --limit 1` |
 | retry failed job safely | `job retry <id>` (FAILED→QUEUED only; execution stays lock-guarded) |
+
+Two verbs can be **refused by design** — both exit 1 with an explanatory
+message on stderr, and change nothing (see `JOBS_AND_SCHEDULES.md`):
+
+- `job create` / `job retry` refuse when an overlapping job is already
+  QUEUED or RUNNING (same project, or either side targeting all projects).
+  The message names the blocking job and its status, so a backend can
+  surface "an audit for this project is already queued" instead of
+  silently double-queueing. Retry after that job finishes.
+- `schedule delete` refuses while the schedule has QUEUED jobs (pass
+  `--force` to cancel them as part of the delete) and always refuses while
+  it has a RUNNING job.
 
 Authorization model: the SSH key IS the credential — a dedicated,
 command-restricted key for the unprivileged `seo-runner` user

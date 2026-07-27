@@ -5,6 +5,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { openStateDb } from '../src/db.js';
+import { JobStore } from '../src/jobs.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BIN = path.resolve(__dirname, '..', 'bin', 'seo-audit-runner.js');
@@ -99,4 +101,56 @@ test('health and doctor return contract exit codes and print no env values', () 
 test('unknown job/schedule actions are rejected', () => {
   assert.equal(cli(['job', 'frobnicate']).status, 1);
   assert.equal(cli(['schedule', 'frobnicate']).status, 1);
+});
+
+test('job create refuses to queue work that overlaps an active job', () => {
+  const first = JSON.parse(cli(['job', 'create', '--project', 'p-conflict', '--output', 'json']).stdout);
+
+  const duplicate = cli(['job', 'create', '--project', 'p-conflict']);
+  assert.equal(duplicate.status, 1);
+  assert.match(duplicate.stderr, /already QUEUED/);
+  assert.match(duplicate.stderr, new RegExp(first.id), 'the message must name the blocking job');
+
+  const allProjects = cli(['job', 'create', '--all']);
+  assert.equal(allProjects.status, 1, 'an all-project job overlaps the queued project job');
+  assert.match(allProjects.stderr, /already QUEUED/);
+
+  // Clearing the queue makes both creatable again.
+  assert.equal(cli(['job', 'cancel', first.id]).status, 0);
+  const after = JSON.parse(cli(['job', 'create', '--all', '--output', 'json']).stdout);
+  assert.equal(after.project_id, null);
+  assert.equal(cli(['job', 'cancel', after.id]).status, 0);
+});
+
+test('schedule delete refuses to strand queued jobs unless --force is given', () => {
+  const schedule = JSON.parse(
+    cli(['schedule', 'create', '--frequency', 'daily', '--at', '03:00', '--all', '--output', 'json']).stdout,
+  );
+
+  // Enqueue the occurrence the way a worker tick would, writing directly to
+  // the same state DB the CLI uses — no audit is spawned by this test.
+  const db = openStateDb(path.join(stateDir, 'runner-state.sqlite'));
+  const job = new JobStore(db).createForOccurrence({ schedule, occurrenceKey: '2026-07-21' });
+  db.close();
+  assert.ok(job, 'the scheduled occurrence must enqueue');
+
+  const refused = cli(['schedule', 'delete', schedule.id]);
+  assert.equal(refused.status, 1);
+  assert.match(refused.stderr, /QUEUED job/);
+  assert.match(refused.stderr, /--force/);
+  assert.equal(
+    JSON.parse(cli(['job', 'show', job.id, '--output', 'json']).stdout).status,
+    'QUEUED',
+    'a refused delete changes nothing',
+  );
+
+  const forced = cli(['schedule', 'delete', schedule.id, '--force']);
+  assert.equal(forced.status, 0, forced.output);
+  assert.match(forced.stdout, new RegExp(`cancelled queued job ${job.id}`));
+  assert.equal(
+    JSON.parse(cli(['job', 'show', job.id, '--output', 'json']).stdout).status,
+    'CANCELLED',
+    'the queued job is cancelled, not deleted',
+  );
+  assert.equal(cli(['schedule', 'list']).stdout.includes(schedule.id), false);
 });

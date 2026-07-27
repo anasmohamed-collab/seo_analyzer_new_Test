@@ -25,6 +25,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { JobStore, JOB_STATUS } from './jobs.js';
 
 export const FREQUENCIES = ['daily', 'weekly', 'monthly'];
 export const DEFAULT_TIMEZONE = 'Africa/Cairo';
@@ -304,18 +305,72 @@ export class ScheduleStore {
     return this.get(id);
   }
 
-  delete(id) {
+  /**
+   * Delete a schedule, refusing to strand work it already enqueued.
+   *
+   * Contract:
+   *  - a RUNNING job from this schedule ALWAYS blocks the delete. A job in
+   *    flight is a real audit against the live application; it is never
+   *    silently deleted and never marked successful. Wait for it, or let
+   *    crash recovery resolve it, then delete.
+   *  - QUEUED jobs block the delete too, unless `force` is given — with
+   *    `force` they are CANCELLED first (an explicit terminal state with a
+   *    finished_at, not a silent row removal).
+   *  - finished jobs (SUCCEEDED/FAILED/CANCELLED) never block anything. They
+   *    keep their `schedule_id` after the delete, so the history of what this
+   *    schedule ran stays readable.
+   *
+   * Returns { cancelledJobIds }.
+   */
+  delete(id, { force = false, jobStore = new JobStore(this.db) } = {}) {
+    if (!this.get(id)) throw new ScheduleError(`schedule not found: ${id}`);
+
+    const active = this.db
+      .prepare(
+        `SELECT id, status FROM jobs
+          WHERE schedule_id = ? AND status IN ('QUEUED', 'RUNNING')
+          ORDER BY created_at, rowid`,
+      )
+      .all(id);
+    const running = active.filter((j) => j.status === JOB_STATUS.RUNNING);
+    const queued = active.filter((j) => j.status === JOB_STATUS.QUEUED);
+
+    if (running.length > 0) {
+      throw new ScheduleError(
+        `schedule ${id} still has ${running.length} RUNNING job(s) (${running.map((j) => j.id).join(', ')}) — ` +
+          'a running audit is never cancelled or deleted from under itself; ' +
+          'wait for it to finish, then delete the schedule',
+      );
+    }
+    if (queued.length > 0 && !force) {
+      throw new ScheduleError(
+        `schedule ${id} still has ${queued.length} QUEUED job(s) (${queued.map((j) => j.id).join(', ')}) — ` +
+          'cancel them first, or re-run with --force to cancel them as part of the delete',
+      );
+    }
+
+    const cancelledJobIds = [];
+    for (const job of queued) {
+      jobStore.cancel(job.id);
+      cancelledJobIds.push(job.id);
+    }
     const result = this.db.prepare('DELETE FROM schedules WHERE id = ?').run(id);
     if (result.changes === 0) throw new ScheduleError(`schedule not found: ${id}`);
+    return { cancelledJobIds };
   }
 
   get(id) {
     return this.db.prepare('SELECT * FROM schedules WHERE id = ?').get(id) ?? null;
   }
 
+  /**
+   * Ordered by (created_at, rowid): when several schedules come due in the
+   * same tick, the older one is always considered first, so which occurrence
+   * wins a conflict is deterministic rather than insertion-timing luck.
+   */
   list({ enabledOnly = false } = {}) {
     return enabledOnly
-      ? this.db.prepare('SELECT * FROM schedules WHERE enabled = 1 ORDER BY created_at').all()
-      : this.db.prepare('SELECT * FROM schedules ORDER BY created_at').all();
+      ? this.db.prepare('SELECT * FROM schedules WHERE enabled = 1 ORDER BY created_at, rowid').all()
+      : this.db.prepare('SELECT * FROM schedules ORDER BY created_at, rowid').all();
   }
 }

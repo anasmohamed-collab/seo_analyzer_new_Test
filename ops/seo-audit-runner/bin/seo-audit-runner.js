@@ -68,6 +68,8 @@ schedule options:
                   [--project <id> | --all] [--timezone <IANA>]
                   [--day-of-week 0..6] [--day-of-month 1..31]
   schedule update <id> [same flags]      (created disabled; enable explicitly)
+  schedule delete <id> [--force]         (--force also cancels its queued jobs;
+                                          a RUNNING job always blocks the delete)
 
 Run options:
   --dry-run                 Plan only: no audit started, no state written,
@@ -119,6 +121,7 @@ async function main() {
         'day-of-month': { type: 'string' },
         status: { type: 'string' },
         once: { type: 'boolean', default: false },
+        force: { type: 'boolean', default: false },
         help: { type: 'boolean', default: false },
       },
     });
