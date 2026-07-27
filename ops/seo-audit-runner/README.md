@@ -140,7 +140,7 @@ seo-audit-runner run --all --max-concurrency 1
 seo-audit-runner run --all --no-notifications
 seo-audit-runner run --all --fail-on-critical
 
-seo-audit-runner retry-notifications                 # retry queued/failed Slack messages
+seo-audit-runner retry-notifications                 # manual retry (the tick does this too)
 seo-audit-runner retry-notifications --limit 50
 seo-audit-runner retry-notifications --project PROJECT_ID
 seo-audit-runner retry-notifications --dry-run       # list eligible, send nothing
@@ -157,7 +157,8 @@ seo-audit-runner job show|retry|cancel JOB_ID
 seo-audit-runner schedule create --frequency daily --at 03:00 --all
 seo-audit-runner schedule enable|disable|update|delete SCHEDULE_ID
 seo-audit-runner schedule list
-seo-audit-runner worker --once            # one scheduler tick (run by seo-runner-tick.timer)
+seo-audit-runner worker --once            # one scheduler tick: recover, enqueue, run,
+                                          # retry notifications (run by seo-runner-tick.timer)
 ```
 
 Jobs and schedules (the backend-controllable layer) are documented in
@@ -252,14 +253,16 @@ idempotency and always checks local delivery state before retrying.
   (`invalid_auth`, `channel_not_found`, `not_in_channel`, `token_revoked`,
   `msg_too_long`, invalid payload, …) are never retried and are marked
   `PERMANENT_FAILURE`. Transient failures are stored with a growing
-  `next_retry_at` and picked up by `retry-notifications`.
+  `next_retry_at` and picked up by the notification-retry step of the next
+  `worker --once` tick (or by a manual `retry-notifications`).
 
 ### Concurrency & locking
 
 `RUNNER_CONCURRENCY` (default **1**) bounds parallel audits across different
 sites; the same normalized domain never runs twice in one execution. A
 process lock file in `RUNNER_STATE_DIR` prevents concurrent runner processes
-(exit code 4) — `run` and `retry-notifications` both take it; the lock is
+(exit code 4) — `run`, `retry-notifications`, and the tick's notification
+retry step all take it (the tick skips that step rather than waiting); the lock is
 released on success, error, `SIGINT`, and `SIGTERM`, and stale locks are
 reclaimed.
 
@@ -276,14 +279,25 @@ reclaimed.
 Precedence: **4 > 1 > 3 > 2 > 0**. Slack notification failures do **not**
 affect these codes — they appear in the report and the retry queue.
 
-## Scheduling on Linux
+## Scheduling on Linux — one authority
 
-Production scheduling ships as hardened systemd units in `deploy/systemd/`
-(installed DISABLED by `deploy/install.sh`; see
-`deploy/SERVER-HANDOVER.md` §7 for the two supported models — the classic
-daily timer or runner-managed schedules via the tick timer). A cron
-fallback for hosts without systemd is documented in `deploy/cron.example`.
-Never enable cron and systemd for the same command on the same host.
+Production scheduling is a single hardened systemd model, shipped in
+`deploy/systemd/` and installed **disabled** by `deploy/install.sh`:
+
+    seo-runner-tick.timer → seo-runner-tick.service → worker --once
+
+Those two unit files are the only ones shipped. Every 5 minutes the tick
+recovers interrupted jobs, enqueues due schedule occurrences, runs queued
+jobs, and retries queued Slack notifications — so there is no second
+timer. **Audit times are not configured in the unit files**; they live in
+the runner's own schedules (`seo-audit-runner schedule ...`), each with
+its own IANA timezone.
+
+Enabling the timer requires the pre-enable validation in
+`deploy/SERVER-HANDOVER.md` §7 and the gates in `docs/PRODUCTION_GATES.md`.
+A cron fallback for hosts *without* systemd is documented (fully commented
+out) in `deploy/cron.example`; cron and systemd are mutually exclusive —
+never schedule the same runner command twice on one host.
 
 ## Tests
 

@@ -87,7 +87,10 @@ else
   WRAPPER=$DESTDIR_CANON/usr/local/bin/seo-audit-runner
   SYSTEMD_DIR=$DESTDIR_CANON/etc/systemd/system
 fi
-UNITS='seo-audit-runner.timer seo-audit-runner.service seo-runner-retry.timer seo-runner-retry.service seo-runner-tick.timer seo-runner-tick.service'
+# The tick timer/service is the only unit installed today; the other four
+# are superseded units from earlier multi-timer installs and stay on this
+# list so an uninstall cleans a host that still carries them.
+UNITS='seo-runner-tick.timer seo-runner-tick.service seo-audit-runner.timer seo-audit-runner.service seo-runner-retry.timer seo-runner-retry.service'
 
 # ── Validate the one recursive deletion target BEFORE any change ───
 OPT_CANON=

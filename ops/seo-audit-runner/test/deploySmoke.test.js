@@ -30,9 +30,27 @@ test('smoke test passes against a freshly staged installation', { skip }, () => 
   assert.equal(r.status, 0, r.output);
   assert.match(r.stdout, /RESULT: PASS/);
   assert.match(r.stdout, /PASS {2}validate-config/);
-  assert.match(r.stdout, /PASS {2}all six systemd unit files installed/);
+  assert.match(r.stdout, /PASS {2}the single tick timer and service are installed/);
+  assert.match(r.stdout, /PASS {2}no superseded \(multi-timer\) unit files present/);
   assert.match(r.stdout, /PASS {2}backup command produced a validated archive/);
   assert.ok(!/^FAIL/m.test(r.stdout), `unexpected FAIL lines:\n${r.stdout}`);
+});
+
+test('a fresh install stages exactly the two tick units', { skip }, () => {
+  const fx = installedFixture();
+  const units = fs.readdirSync(path.join(fx.destdir, 'etc', 'systemd', 'system')).sort();
+  assert.deepEqual(units, ['seo-runner-tick.service', 'seo-runner-tick.timer']);
+});
+
+test('smoke test fails when a superseded unit file is left behind', { skip }, () => {
+  const fx = installedFixture();
+  const systemdDir = path.join(fx.destdir, 'etc', 'systemd', 'system');
+  fs.writeFileSync(path.join(systemdDir, 'seo-audit-runner.timer'), '# leftover from an older install\n');
+
+  const r = runScript(SMOKE_SH, ['--destdir', toPosix(fx.destdir)]);
+  assert.equal(r.status, 1, r.output);
+  assert.match(r.stdout, /RESULT: FAIL/);
+  assert.match(r.stdout, /FAIL {2}superseded unit files .*seo-audit-runner\.timer/);
 });
 
 test('smoke test fails loudly when the installation is broken', { skip }, () => {

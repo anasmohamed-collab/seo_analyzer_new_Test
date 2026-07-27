@@ -1,10 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { openStateDb } from '../src/db.js';
 import { JobStore, JOB_STATUS } from '../src/jobs.js';
 import { ScheduleStore } from '../src/schedules.js';
-import { currentHostId } from '../src/lock.js';
+import { acquireLock, currentHostId } from '../src/lock.js';
 import { workerTick, enqueueDueSchedules, jobArgs } from '../src/worker.js';
+import { createTickNotificationRetry } from '../src/cli/manage.js';
 
 const DEAD_PID = 2147483647;
 
@@ -276,7 +280,7 @@ test('an outcome is not recorded for a job that was re-claimed mid-execution', a
   db.close();
 });
 
-// ── notification retry seam (Prompt 3 will own the timer) ──────────
+// ── notification retry: owned by the tick (single-timer model) ─────
 
 test('the notification retry hook runs after jobs and is off by default', async () => {
   const { db, jobStore, scheduleStore } = fixture();
@@ -318,4 +322,65 @@ test('a failing notification retry never fails the tick or the jobs in it', asyn
   assert.equal(summary.notificationsRetried, 0);
   assert.ok(warnings.some((w) => /Notification retry step failed/.test(w)));
   db.close();
+});
+
+test('the retry step still runs on a tick with nothing due — one timer owns both', async () => {
+  const { db, jobStore, scheduleStore } = fixture();
+  let called = 0;
+
+  const summary = await workerTick({
+    scheduleStore,
+    jobStore,
+    retryNotifications: async () => { called += 1; return { sent: 1 }; },
+  });
+
+  assert.equal(summary.executed, 0, 'no job was due');
+  assert.equal(called, 1, 'notifications must be retried even when no audit ran');
+  assert.equal(summary.notificationsRetried, 1);
+  db.close();
+});
+
+// ── the CLI hook the tick timer actually runs ──────────────────────
+
+function retryFixture() {
+  const db = openStateDb(':memory:');
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'seo-runner-tick-retry-'));
+  return { db, stateDir, config: { stateDir, slackMethod: 'bot' } };
+}
+
+test('no retry hook is built when Slack is not configured', () => {
+  const { db, stateDir, config } = retryFixture();
+  assert.equal(createTickNotificationRetry({ config: { ...config, slackMethod: null }, logger: null, db }), null);
+  db.close();
+  fs.rmSync(stateDir, { recursive: true, force: true });
+});
+
+test('the retry hook takes the runner lock and releases it', async () => {
+  const { db, stateDir, config } = retryFixture();
+  const hook = createTickNotificationRetry({ config, logger: null, db });
+
+  const summary = await hook();
+  assert.equal(summary.eligible, 0, 'nothing queued in a fresh state database');
+  assert.equal(summary.sent, 0);
+  // Released: the lock is free again for the next tick or a manual command.
+  const lock = acquireLock({ stateDir });
+  lock.release();
+
+  db.close();
+  fs.rmSync(stateDir, { recursive: true, force: true });
+});
+
+test('the retry hook skips (never double-sends) while another instance holds the lock', async () => {
+  const { db, stateDir, config } = retryFixture();
+  const held = acquireLock({ stateDir }); // e.g. a manual `retry-notifications`
+  const infos = [];
+  const hook = createTickNotificationRetry({ config, logger: { info: (m) => infos.push(m) }, db });
+
+  const summary = await hook();
+  assert.deepEqual(summary, { sent: 0 });
+  assert.ok(infos.some((m) => /Notification retry skipped/.test(m)));
+
+  held.release();
+  db.close();
+  fs.rmSync(stateDir, { recursive: true, force: true });
 });

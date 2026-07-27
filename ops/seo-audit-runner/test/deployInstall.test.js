@@ -244,15 +244,9 @@ test('systemd units are installed DISABLED: systemctl never invoked, nothing ena
   assert.equal(r.status, 0, r.output);
 
   const systemdDir = path.join(fx.destdir, 'etc', 'systemd', 'system');
+  // One scheduling authority: the tick timer and the service it starts.
   const units = fs.readdirSync(systemdDir).sort();
-  assert.deepEqual(units, [
-    'seo-audit-runner.service',
-    'seo-audit-runner.timer',
-    'seo-runner-retry.service',
-    'seo-runner-retry.timer',
-    'seo-runner-tick.service',
-    'seo-runner-tick.timer',
-  ]);
+  assert.deepEqual(units, ['seo-runner-tick.service', 'seo-runner-tick.timer']);
   // Installed unit files are byte-identical to the shipped ones.
   for (const unit of units) {
     assert.equal(
@@ -265,7 +259,8 @@ test('systemd units are installed DISABLED: systemctl never invoked, nothing ena
   assert.equal(readMockLog(mockLog), '', 'systemctl was invoked during install');
   const wants = listTree(fx.destdir).filter((p) => p.includes('.wants/'));
   assert.deepEqual(wants, [], `enablement symlinks appeared: ${wants}`);
-  assert.match(r.stdout, /all timers DISABLED/);
+  assert.match(r.stdout, /timer DISABLED/);
+  assert.match(r.stdout, /seo-runner-tick\.timer is DISABLED/);
 });
 
 test('installer writes nothing outside --destdir and deletes nothing from the source tree', { skip }, () => {

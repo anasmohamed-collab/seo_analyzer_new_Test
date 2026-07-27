@@ -33,11 +33,15 @@ Print this and tick every box in order. Details for every step:
 - [ ] Results, Slack message, and application health reviewed
 
 ## Automation (only after the above)
-- [ ] Scheduling model chosen: ☐ A (daily timer) ☐ B (tick + schedules) ☐ none yet
-- [ ] Model A: `sudo systemctl enable --now seo-audit-runner.timer seo-runner-retry.timer`
-- [ ] Model B: schedule created + enabled, then `sudo systemctl enable --now seo-runner-tick.timer seo-runner-retry.timer`
-- [ ] `systemctl list-timers 'seo-*'` shows the expected next run
-- [ ] NOT both models; NOT cron and systemd together
+One authority only: `seo-runner-tick.timer` → `seo-runner-tick.service` →
+`worker --once`. It ships disabled. Details: `SERVER-HANDOVER.md` §7.
+- [ ] Schedule created and enabled: `schedule create --frequency daily --at 03:00 --all`, then `schedule enable <id>`
+- [ ] `sudo -u seo-runner seo-audit-runner schedule list` shows it `ENABLED` with the expected `next=`
+- [ ] Pre-enable validation done (SERVER-HANDOVER.md §7 step 2): smoke test PASS, `doctor` clean, one manual `worker --once` reviewed
+- [ ] `systemctl list-unit-files 'seo-*'` lists ONLY `seo-runner-tick.timer` and `seo-runner-tick.service`
+- [ ] `sudo systemctl enable --now seo-runner-tick.timer`
+- [ ] `systemctl list-timers 'seo-*'` shows the expected next tick
+- [ ] NOT cron and systemd together; no leftover `seo-audit-runner.timer` / `seo-runner-retry.timer`
 
 ## Safety net
 - [ ] `sudo -u seo-runner bash deploy/backup.sh` produced `state-<stamp>.tar.gz`

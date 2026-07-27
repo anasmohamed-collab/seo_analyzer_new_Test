@@ -64,28 +64,43 @@ The next `worker --once` tick (or the tick timer) marks it FAILED
 
 ## Scheduling
 
+The only scheduling authority is `seo-runner-tick.timer` →
+`seo-runner-tick.service` → `worker --once`. Audit times live in the
+runner's schedules, not in the unit file.
+
 **Timer enabled but nothing happens**
 ```bash
 sudo systemctl daemon-reload
-systemctl list-timers 'seo-*' 'seo-audit-runner*'
-journalctl -u seo-audit-runner.service -e
+systemctl list-timers 'seo-*'
+journalctl -u seo-runner-tick.service -e
 ```
-Also confirm you did not enable BOTH scheduling models — pick one.
+A tick that finds nothing due is normal and logs `enqueued=0 executed=0`.
 
 **Schedule exists but no job is created**
 `schedule list` — is it `ENABLED`? Is `seo-runner-tick.timer` active?
 A `next=` time in the future is normal; occurrences more than 24 h in
 the past are deliberately skipped (catch-up window).
 
+**Duplicate audits / double Slack alerts**
+Two scheduling authorities are running. There must be exactly one:
+```bash
+systemctl list-unit-files 'seo-*'      # expect ONLY the two seo-runner-tick units
+systemctl is-enabled seo-audit-runner.timer seo-runner-retry.timer   # must not be 'enabled'
+cat /etc/cron.d/seo-audit-runner 2>/dev/null                         # must not exist / be all comments
+```
+Superseded units from an older install: `sudo systemctl disable --now
+<unit>`, delete the file from `/etc/systemd/system/`, `daemon-reload`.
+`smoke-test.sh` and `doctor` both flag this.
+
 **Wrong hour after a DST change**
-Schedules follow their stored IANA timezone (`schedule list` shows it);
-the systemd daily timer follows `Africa/Cairo` in its `OnCalendar=`. If
-you need a different zone: `schedule update <id> --timezone <Area/City>`.
+Schedules follow their stored IANA timezone (`schedule list` shows it) —
+the timer itself has no audit hour to get wrong. If you need a different
+zone: `schedule update <id> --timezone <Area/City>`.
 
 ## State database
 
 **`state database check failed` / integrity errors**
-1. Stop automation: `sudo systemctl disable --now seo-runner-tick.timer seo-audit-runner.timer`
+1. Stop automation: `sudo systemctl disable --now seo-runner-tick.timer`
 2. `sudo -u seo-runner seo-audit-runner doctor` (runs PRAGMA quick_check)
 3. Restore the newest good backup:
    `sudo -u seo-runner bash deploy/restore.sh --yes /var/lib/seo-audit-runner/backups/state-<stamp>.tar.gz`
@@ -111,9 +126,7 @@ directory — never delete state to "fix" this.
 ## Logs
 
 ```bash
-journalctl -u seo-audit-runner.service -e     # daily audit
-journalctl -u seo-runner-tick.service -e      # scheduler tick
-journalctl -u seo-runner-retry.service -e     # Slack retry
+journalctl -u seo-runner-tick.service -e      # audits, jobs, and Slack retries
 ```
 Secrets are redacted by the runner before logging; if you ever see a
 credential in any output, treat it as an incident and rotate it.

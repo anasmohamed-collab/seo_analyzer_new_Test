@@ -9,10 +9,16 @@ v4) — never in the application's PostgreSQL (isolation contract,
 
 **systemd starts the worker; the runner decides what is due.**
 `seo-runner-tick.timer` (every 5 min, ships disabled) runs
-`seo-audit-runner worker --once` as `seo-runner`. One tick:
+`seo-audit-runner worker --once` as `seo-runner`. It is the **single
+scheduling authority** on the host — there is no daily audit timer and no
+notification-retry timer, because one tick owns the whole cycle:
 
 1. **recover** — RUNNING jobs whose worker pid is dead → `FAILED`
-   (`interrupted: …`); nothing is ever silently marked successful;
+   (`interrupted: …`); nothing is ever silently marked successful. The
+   same step reclaims stale executions: a lease that stopped being
+   renewed, or one from a previous boot, is recovered rather than left
+   stuck, and an outcome arriving from a stale execution is refused (the
+   current owner decides, and the tick logs `outcome not recorded`);
 2. **enqueue** — each enabled schedule whose latest occurrence is due
    gets at most one job (unique `(schedule_id, occurrence_key)` index);
 3. **execute** — QUEUED jobs are claimed atomically (single-statement
@@ -21,7 +27,13 @@ v4) — never in the application's PostgreSQL (isolation contract,
    (`run --all` / `run --project <id>`) with structured argv — no shell,
    no eval. The child takes the runner's process lock, so a job can never
    overlap a manual run: on lock contention the child exits 4 and the job
-   returns to QUEUED (attempt refunded) for the next tick.
+   returns to QUEUED (attempt refunded) for the next tick;
+4. **retry notifications** — queued/failed Slack deliveries are retried
+   last, under the same single-instance lock (skipped, not forced, if a
+   manual `run`/`retry-notifications` holds it). This step is wired only
+   when Slack is configured, and a failure in it never fails the tick or
+   the audits in it. `retry-notifications` stays available as a manual
+   command; nothing schedules it separately.
 
 ## Job states
 

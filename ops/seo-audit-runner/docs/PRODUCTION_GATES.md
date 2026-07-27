@@ -14,6 +14,11 @@ without recorded evidence (command output pasted into the phase review).
 - No production audit is triggered and no production project is created during
   development, testing, or staging.
 - Production scheduling stays disabled until Gate 6 and Gate 7 both pass.
+- There is exactly ONE scheduling authority — `seo-runner-tick.timer` →
+  `seo-runner-tick.service` → `worker --once`. No second timer and no cron
+  entry may be enabled for this runner on the same host. Enabling that timer
+  additionally requires the pre-enable validation in
+  `deploy/SERVER-HANDOVER.md` §7.
 
 ## Gate 1 — Baseline (PASSED in the Phase 4 discovery, 2026-07-21)
 
@@ -67,10 +72,14 @@ without recorded evidence (command output pasted into the phase review).
 - Runner configured against a MOCK of the five API endpoints (or a locally
   run app instance with a scratch database) — never the production URL.
 - Full sequence exercised: install → validate-config → list-projects →
-  status → run --all --dry-run → mock live run → retry-notifications
-  → backup → restore → upgrade → rollback → uninstall.
-- Verify both timers exist but are `disabled`/`inactive`
-  (`systemctl is-enabled` returns `disabled`).
+  status → run --all --dry-run → mock live run → schedule create/enable →
+  worker --once → retry-notifications → backup → restore → upgrade →
+  rollback → uninstall.
+- Verify the installed unit set is exactly `seo-runner-tick.service` and
+  `seo-runner-tick.timer` (`systemctl list-unit-files 'seo-*'`), that the
+  timer is `disabled`/`inactive` (`systemctl is-enabled` returns
+  `disabled`), and that no `/etc/cron.d/seo-audit-runner` exists.
+- `systemd-analyze verify` passes on both tick units.
 - Slack tested against a sandbox channel/webhook, never the real alert channel.
 
 ## Gate 6 — Controlled production installation (BLOCKED)
@@ -92,17 +101,21 @@ When unblocked, the sequence is strict and manual:
 8. `seo-audit-runner run --project <the one approved project>` — the single
    controlled production audit, watched live.
 9. Review results, Slack output, state DB, and app health/load.
-10. Only after that review may the administrator consider enabling the daily
-    timer (a separate explicit `systemctl enable --now` decision, plus the
-    hourly retry timer). A production `run --all` is not permitted — by
-    timer or by hand — before the step-8 controlled project audit has been
-    reviewed and approved.
+10. Only after that review may the administrator consider enabling the one
+    tick timer — a separate explicit `systemctl enable --now
+    seo-runner-tick.timer` decision, preceded by the pre-enable validation
+    in `deploy/SERVER-HANDOVER.md` §7 (smoke test PASS, `doctor` clean,
+    schedules reviewed, one manual `worker --once` watched, exactly the two
+    tick units installed, no cron entry). No second timer is enabled — the
+    tick also owns notification retry. A production `run --all` is not
+    permitted — by timer, by schedule, or by hand — before the step-8
+    controlled project audit has been reviewed and approved.
 
 ## Gate 7 — Post-install monitoring (first week after enabling)
 
 - Application health endpoints unchanged and healthy after each scheduled run.
-- Runner journal (`journalctl -u seo-audit-runner`) reviewed; exit codes 0/2
-  understood, any 1/4 investigated.
+- Runner journal (`journalctl -u seo-runner-tick.service`) reviewed; exit
+  codes 0/2 understood, any 1/4 investigated.
 - Notification queue drained: `seo-audit-runner status --output json` shows no
   growing PENDING/FAILED backlog.
 - SQLite health: `PRAGMA quick_check` via the backup script's pre-check.
