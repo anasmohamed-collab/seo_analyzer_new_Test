@@ -8,6 +8,19 @@ sudo -u seo-runner seo-audit-runner doctor
 ```
 
 Exit codes: `0` healthy · `2` warnings (degraded but working) · `1` broken.
+A freshly installed runner is legitimately `2` (`last-success` warning) until
+its first successful run. Full exit-code table: `../docs/CLI_CONTRACT.md` §3.
+Recovery procedures: `../docs/OPERATIONS_RUNBOOK.md` §5.
+
+**Permission errors on the state directory after running a command as root**
+A read-only command creates the state database if it is absent, so invoking
+the runner as plain root — omitting `-u seo-runner` from the `sudo` call — can
+leave root-owned files that the real runs cannot write. Fix the ownership and
+always pass `-u seo-runner`:
+```bash
+sudo chown -R seo-runner:seo-runner /var/lib/seo-audit-runner
+sudo -u seo-runner seo-audit-runner doctor
+```
 
 ---
 

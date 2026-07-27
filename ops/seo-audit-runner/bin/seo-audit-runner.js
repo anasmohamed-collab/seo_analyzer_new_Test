@@ -3,12 +3,13 @@
  * seo-audit-runner — standalone Linux automation command.
  *
  * Commands:
+ *   init
  *   validate-config
  *   list-projects
  *   run --all | --project <id> [--dry-run] [--max-concurrency <n>]
  *       [--no-notifications] [--fail-on-critical]
  *   retry-notifications [--limit <n>] [--project <id>] [--dry-run]
- *   status [--output json]
+ *   status | health | doctor | worker --once | job … | schedule …
  *
  * Exit codes (precedence: 4 > 1 > 3 > 2 > 0):
  *   0  completed successfully
@@ -19,6 +20,10 @@
  *
  * Slack notification failures do NOT change audit exit behavior — they are
  * reported and queued for `retry-notifications`.
+ *
+ * Output contract: every command accepts `--output text|json` (default text).
+ * In JSON mode stdout is exactly ONE versioned envelope document and all
+ * diagnostics go to stderr. Specification: docs/CLI_CONTRACT.md.
  */
 
 import { parseArgs } from 'node:util';
@@ -41,11 +46,15 @@ import {
   scheduleCommand,
   workerCommand,
   healthCommand,
+  initCommand,
+  DEFAULT_LIST_LIMIT,
 } from '../src/cli/manage.js';
+import { createOutput, resolveOutputMode, OutputModeError, ERROR_CODES } from '../src/cli/output.js';
 
 const USAGE = `Usage: seo-audit-runner <command> [options]
 
 Commands:
+  init                      Create/migrate the runner state DB explicitly (idempotent)
   validate-config           Validate configuration, state directory, state DB
   list-projects             List projects with a dedupe preview (read-only)
   run --all                 Audit every project (after deduplication)
@@ -63,6 +72,7 @@ Commands:
 job options:
   job create --project <id> | --all
   job list [--status QUEUED|RUNNING|SUCCEEDED|FAILED|CANCELLED] [--limit <n>]
+            (default --limit ${DEFAULT_LIST_LIMIT}; newest first)
   job show|retry|cancel <id>
 
 schedule options:
@@ -72,6 +82,7 @@ schedule options:
   schedule update <id> [same flags]      (created disabled; enable explicitly)
   schedule delete <id> [--force]         (--force also cancels its queued jobs;
                                           a RUNNING job always blocks the delete)
+  schedule list [--limit <n>]            (default --limit ${DEFAULT_LIST_LIMIT})
 
 Run options:
   --dry-run                 Plan only: no audit started, no state written,
@@ -81,25 +92,23 @@ Run options:
   --fail-on-critical        Exit with code 3 when critical (P0) issues exist
 
 retry-notifications options:
-  --limit <n>               Max notifications to retry (default 50)
+  --limit <n>               Max notifications to retry (default ${DEFAULT_LIST_LIMIT})
   --project <id>            Only retry notifications for one project
   --dry-run                 List eligible records without sending or updating
 
 status options:
-  --output json             Machine-readable output
+  --limit <n>               Max project snapshots to list (default 10)
 
 Global options:
+  --output text|json        Output mode (default text). In json mode stdout is
+                            exactly one versioned envelope; diagnostics go to
+                            stderr. See docs/CLI_CONTRACT.md
   --env-file <path>         Env file to load (default: <runner dir>/.env)
   --help                    Show this help
 
 Exit codes: 0 ok | 1 config/runner failure | 2 audit failures/timeouts
             3 criticals with --fail-on-critical | 4 already locked
 `;
-
-function fail(message) {
-  process.stderr.write(`${message}\n`);
-  return EXIT_CODES.RUNNER_FAILURE;
-}
 
 async function main() {
   let parsed;
@@ -128,15 +137,41 @@ async function main() {
       },
     });
   } catch (err) {
-    return fail(`${err.message}\n\n${USAGE}`);
+    // argv is unparseable, so the output mode is unknown — report as text.
+    process.stderr.write(`${err.message}\n\n${USAGE}`);
+    return EXIT_CODES.RUNNER_FAILURE;
   }
 
   const { values, positionals } = parsed;
   const command = positionals[0];
 
+  // Resolve the output mode before anything writes, so even bootstrap
+  // failures below honor the JSON-only-stdout rule.
+  let mode;
+  try {
+    mode = resolveOutputMode(values);
+  } catch (err) {
+    if (!(err instanceof OutputModeError)) throw err;
+    process.stderr.write(`${err.message}\n`);
+    return EXIT_CODES.RUNNER_FAILURE;
+  }
+  // `job`/`schedule` are verb+action pairs; the envelope reports both
+  // ("job list") so a consumer can key on one field.
+  const commandName =
+    (command === 'job' || command === 'schedule') && positionals[1]
+      ? `${command} ${positionals[1]}`
+      : (command ?? '(none)');
+  const out = createOutput({ command: commandName, mode });
+
   if (values.help || !command) {
-    process.stdout.write(USAGE);
-    return values.help ? EXIT_CODES.OK : EXIT_CODES.RUNNER_FAILURE;
+    // `--help` is a success; a bare invocation is a usage error. Both carry
+    // the usage text — as stdout text, or inside the envelope in JSON mode.
+    if (values.help) {
+      out.ok({ usage: USAGE }, USAGE);
+      return EXIT_CODES.OK;
+    }
+    out.fail(ERROR_CODES.USAGE, `a command is required\n\n${USAGE}`, { usage: USAGE });
+    return EXIT_CODES.RUNNER_FAILURE;
   }
 
   loadEnvFile(values['env-file'] ?? path.join(PACKAGE_ROOT, '.env'));
@@ -145,45 +180,71 @@ async function main() {
   try {
     config = loadConfig(process.env);
   } catch (err) {
-    if (err instanceof ConfigError) return fail(err.message);
+    if (err instanceof ConfigError) {
+      out.fail(ERROR_CODES.CONFIG, err.message, { problems: err.problems });
+      return EXIT_CODES.RUNNER_FAILURE;
+    }
     throw err;
   }
 
   // Slack token and webhook URL are secrets — redacted from every log line.
+  // The logger writes to stderr, which is what keeps stdout JSON-only.
   const logger = createLogger({
     level: config.logLevel,
     secrets: [config.slackWebhookUrl, config.slackBotToken].filter(Boolean),
   });
 
   switch (command) {
+    case 'init':
+      return initCommand(config, logger, values, out);
     case 'validate-config':
-      return validateConfigCommand(config, logger);
+      return validateConfigCommand(config, logger, out);
     case 'list-projects':
-      return listProjectsCommand(config, logger);
+      return listProjectsCommand(config, logger, out);
     case 'run':
-      return runCommand(config, logger, values);
+      return runCommand(config, logger, values, out);
     case 'retry-notifications':
-      return retryNotificationsCommand(config, logger, values);
+      return retryNotificationsCommand(config, logger, values, out);
     case 'status':
-      return statusCommand(config, logger, values);
+      return statusCommand(config, logger, values, out);
     case 'health':
-      return healthCommand(config, logger, values, 'health');
+      return healthCommand(config, logger, values, 'health', out);
     case 'doctor':
-      return healthCommand(config, logger, values, 'doctor');
+      return healthCommand(config, logger, values, 'doctor', out);
     case 'worker':
-      return workerCommand(config, logger, values);
+      return workerCommand(config, logger, values, out);
     case 'job':
-      return jobCommand(config, logger, values, positionals);
+      return jobCommand(config, logger, values, positionals, out);
     case 'schedule':
-      return scheduleCommand(config, logger, values, positionals);
+      return scheduleCommand(config, logger, values, positionals, out);
     default:
-      return fail(`Unknown command: ${command}\n\n${USAGE}`);
+      out.fail(ERROR_CODES.USAGE, `Unknown command: ${command}\n\n${USAGE}`);
+      return EXIT_CODES.RUNNER_FAILURE;
   }
 }
 
 // ── validate-config ─────────────────────────────────────────────
 
-function validateConfigCommand(config, logger) {
+function validateConfigCommand(config, logger, out) {
+  // Machine-readable view: NEVER any secret value — only whether one is set.
+  const data = {
+    apiBaseUrl: config.apiBaseUrlRedacted,
+    runnerConcurrency: config.runnerConcurrency,
+    pollIntervalMs: config.pollIntervalMs,
+    pollTimeoutMs: config.pollTimeoutMs,
+    httpRequestTimeoutMs: config.httpRequestTimeoutMs,
+    stateDir: config.stateDir,
+    stateDbPath: config.stateDbPath,
+    logLevel: config.logLevel,
+    notificationsEnabled: config.notificationsEnabled,
+    alertMode: config.alertMode,
+    sendRunSummary: config.sendRunSummary,
+    slackMethod: config.slackMethod,
+    slackConfigured: Boolean(config.slackMethod),
+    stateDirWritable: false,
+    stateSchemaVersion: null,
+  };
+
   const lines = [
     'Configuration OK',
     `  SEO_API_BASE_URL        = ${config.apiBaseUrlRedacted}`,
@@ -214,92 +275,132 @@ function validateConfigCommand(config, logger) {
   try {
     fs.mkdirSync(config.stateDir, { recursive: true });
     fs.accessSync(config.stateDir, fs.constants.W_OK);
+    data.stateDirWritable = true;
     lines.push('  state directory writable: yes');
   } catch (err) {
-    process.stdout.write(lines.join('\n') + '\n');
-    return fail(`State directory is not writable (${config.stateDir}): ${err.message}`);
+    out.fail(ERROR_CODES.CONFIG, `State directory is not writable (${config.stateDir}): ${err.message}`, { data });
+    if (!out.isJson) process.stdout.write(lines.join('\n') + '\n');
+    return EXIT_CODES.RUNNER_FAILURE;
   }
 
+  // Opening also CREATES and MIGRATES the state DB when absent — the same
+  // implicit initialization every state-reading command performs. Run it as
+  // the owning `seo-runner` user (docs/CLI_CONTRACT.md §5).
   try {
     const db = openStateDb(config.stateDbPath, { logger });
     const version = db.prepare('SELECT MAX(version) AS v FROM schema_migrations').get()?.v ?? 0;
     db.close();
+    data.stateSchemaVersion = version;
     lines.push(`  state database: OK (schema v${version})`);
   } catch (err) {
-    process.stdout.write(lines.join('\n') + '\n');
-    return fail(`State database check failed (${config.stateDbPath}): ${err.message}`);
+    out.fail(ERROR_CODES.STATE, `State database check failed (${config.stateDbPath}): ${err.message}`, { data });
+    if (!out.isJson) process.stdout.write(lines.join('\n') + '\n');
+    return EXIT_CODES.RUNNER_FAILURE;
   }
 
   lines.push('');
   lines.push('Note: API connectivity is not tested here — use `seo-audit-runner list-projects`.');
-  process.stdout.write(lines.join('\n') + '\n');
+  out.ok(data, () => lines.join('\n'));
   return EXIT_CODES.OK;
 }
 
 // ── list-projects ───────────────────────────────────────────────
 
-async function listProjectsCommand(config, logger) {
+async function listProjectsCommand(config, logger, out) {
   const apiClient = new ApiClient({
     baseUrl: config.apiBaseUrl,
     requestTimeoutMs: config.httpRequestTimeoutMs,
     logger,
   });
 
+  // Read-only: one GET /api/projects. No audit is triggered, no state is
+  // opened or written, no notification is sent.
   let projects;
   try {
     projects = await apiClient.listProjects();
   } catch (err) {
-    return fail(`Failed to list projects from ${config.apiBaseUrlRedacted}: ${logger.redact(err.message)}`);
+    out.fail(
+      ERROR_CODES.API,
+      `Failed to list projects from ${config.apiBaseUrlRedacted}: ${logger.redact(err.message)}`,
+    );
+    return EXIT_CODES.RUNNER_FAILURE;
   }
 
   const { winners, duplicates } = dedupeProjects(projects);
   const winnerIds = new Set(winners.map((w) => String(w.project.id)));
   const duplicateById = new Map(duplicates.map((d) => [String(d.project.id), d.winnerId]));
 
-  process.stdout.write(`${projects.length} project(s) — ${winners.length} unique domain(s)\n\n`);
-  for (const p of projects) {
+  const rows = projects.map((p) => {
     const id = String(p.id);
-    const role = winnerIds.has(id)
-      ? 'winner'
-      : `deduplicated: covered by ${duplicateById.get(id)}`;
-    const usable = hasUsableFormValues(p) ? 'yes' : 'NO';
-    process.stdout.write(
-      `- ${id}\n` +
-        `    name: ${p.project_name ?? p.name ?? '(unnamed)'} | domain: ${p.domain ?? '?'}\n` +
-        `    website_url: ${p.website_url ? redactUrl(p.website_url) : '(none)'} | audit config usable: ${usable}\n` +
-        `    last_audit_at: ${p.last_audit_at ?? 'never'} | audits: ${p.audit_count ?? 0} (completed: ${p.completed_count ?? 0})\n` +
-        `    dedupe: ${role}\n`,
-    );
-  }
+    return {
+      id,
+      name: p.project_name ?? p.name ?? null,
+      domain: p.domain ?? null,
+      websiteUrl: p.website_url ? redactUrl(p.website_url) : null,
+      auditConfigUsable: hasUsableFormValues(p),
+      lastAuditAt: p.last_audit_at ?? null,
+      auditCount: p.audit_count ?? 0,
+      completedCount: p.completed_count ?? 0,
+      dedupe: winnerIds.has(id) ? 'winner' : 'deduplicated',
+      coveredBy: winnerIds.has(id) ? null : (duplicateById.get(id) ?? null),
+    };
+  });
+
+  out.ok(
+    { discovered: projects.length, uniqueDomains: winners.length, projects: rows },
+    () =>
+      [
+        `${projects.length} project(s) — ${winners.length} unique domain(s)`,
+        '',
+        ...rows.map((r) =>
+          `- ${r.id}\n` +
+          `    name: ${r.name ?? '(unnamed)'} | domain: ${r.domain ?? '?'}\n` +
+          `    website_url: ${r.websiteUrl ?? '(none)'} | audit config usable: ${r.auditConfigUsable ? 'yes' : 'NO'}\n` +
+          `    last_audit_at: ${r.lastAuditAt ?? 'never'} | audits: ${r.auditCount} (completed: ${r.completedCount})\n` +
+          `    dedupe: ${r.dedupe === 'winner' ? 'winner' : `deduplicated: covered by ${r.coveredBy}`}`,
+        ),
+      ].join('\n'),
+  );
   return EXIT_CODES.OK;
 }
 
 // ── run ─────────────────────────────────────────────────────────
 
-async function runCommand(config, logger, values) {
+async function runCommand(config, logger, values, out) {
   const all = Boolean(values.all);
   const projectId = values.project ?? null;
   const dryRun = Boolean(values['dry-run']);
   const noNotifications = Boolean(values['no-notifications']);
 
-  if (!all && !projectId) return fail(`run requires --all or --project <id>\n\n${USAGE}`);
-  if (all && projectId) return fail('run accepts either --all or --project <id>, not both');
+  if (!all && !projectId) {
+    out.fail(ERROR_CODES.USAGE, `run requires --all or --project <id>\n\n${USAGE}`);
+    return EXIT_CODES.RUNNER_FAILURE;
+  }
+  if (all && projectId) {
+    out.fail(ERROR_CODES.USAGE, 'run accepts either --all or --project <id>, not both');
+    return EXIT_CODES.RUNNER_FAILURE;
+  }
 
   let maxConcurrency;
   if (values['max-concurrency'] !== undefined) {
     maxConcurrency = Number.parseInt(values['max-concurrency'], 10);
     if (!Number.isInteger(maxConcurrency) || maxConcurrency < 1) {
-      return fail(`--max-concurrency must be an integer >= 1, got: ${values['max-concurrency']}`);
+      out.fail(
+        ERROR_CODES.USAGE,
+        `--max-concurrency must be an integer >= 1, got: ${values['max-concurrency']}`,
+      );
+      return EXIT_CODES.RUNNER_FAILURE;
     }
   }
 
   // ── Single-instance process lock ──────────────────────────────
+  // Lock contention is exit code 4 and must stay exit code 4.
   let lock;
   try {
     lock = acquireLock({ stateDir: config.stateDir });
   } catch (err) {
     if (err instanceof LockError) {
-      process.stderr.write(`${err.message}\n`);
+      out.fail(ERROR_CODES.LOCKED, err.message);
       return EXIT_CODES.ALREADY_LOCKED;
     }
     throw err;
@@ -352,7 +453,8 @@ async function runCommand(config, logger, values) {
     } catch (err) {
       lock.release();
       process.removeListener('exit', releaseLockOnExit);
-      return fail(`Could not open runner state database (${config.stateDbPath}): ${err.message}`);
+      out.fail(ERROR_CODES.STATE, `Could not open runner state database (${config.stateDbPath}): ${err.message}`);
+      return EXIT_CODES.RUNNER_FAILURE;
     }
   }
 
@@ -444,13 +546,31 @@ async function runCommand(config, logger, values) {
       }
     }
 
-    process.stdout.write(formatTextReport(report));
-
+    // Exit code is computed from the report exactly as before — the output
+    // mode never influences it.
     const code = computeExitCode(report, { failOnCritical: Boolean(values['fail-on-critical']) });
+    if (code === EXIT_CODES.OK) {
+      out.ok(report, () => formatTextReport(report));
+    } else {
+      const [errCode, message] = report.aborted
+        ? [ERROR_CODES.INTERNAL, 'run was aborted before completing']
+        : code === EXIT_CODES.CRITICAL_ISSUES
+          ? [
+              ERROR_CODES.CRITICAL_ISSUES,
+              `critical (P0) issues found in ${report.criticalIssues?.length ?? 0} project(s) and --fail-on-critical is set`,
+            ]
+          : [
+              ERROR_CODES.AUDIT_FAILURES,
+              'one or more audits failed, timed out, or ended with an unknown trigger outcome',
+            ];
+      out.fail(errCode, message, { data: report });
+      if (!out.isJson) process.stdout.write(formatTextReport(report));
+    }
     logger.info(`Run finished with exit code ${code}`);
     return code;
   } catch (err) {
     logger.error(`Runner failure: ${err.stack ?? err.message}`);
+    out.fail(ERROR_CODES.INTERNAL, `Runner failure: ${logger.redact(err.message)}`);
     return EXIT_CODES.RUNNER_FAILURE;
   } finally {
     try { stateDb?.close(); } catch { /* already closed */ }
@@ -461,21 +581,24 @@ async function runCommand(config, logger, values) {
 
 // ── retry-notifications ─────────────────────────────────────────
 
-async function retryNotificationsCommand(config, logger, values) {
+async function retryNotificationsCommand(config, logger, values, out) {
   const dryRun = Boolean(values['dry-run']);
-  let limit = 50;
+  let limit = DEFAULT_LIST_LIMIT;
   if (values.limit !== undefined) {
     limit = Number.parseInt(values.limit, 10);
     if (!Number.isInteger(limit) || limit < 1) {
-      return fail(`--limit must be an integer >= 1, got: ${values.limit}`);
+      out.fail(ERROR_CODES.USAGE, `--limit must be an integer >= 1, got: ${values.limit}`);
+      return EXIT_CODES.RUNNER_FAILURE;
     }
   }
 
   if (!dryRun && !config.slackMethod) {
-    return fail(
+    out.fail(
+      ERROR_CODES.CONFIG,
       'retry-notifications requires a configured Slack method ' +
         '(SLACK_BOT_TOKEN + SLACK_CHANNEL_ID, or SLACK_WEBHOOK_URL)',
     );
+    return EXIT_CODES.RUNNER_FAILURE;
   }
 
   // Same single-instance lock as `run` — prevents concurrent double-sends.
@@ -485,7 +608,7 @@ async function retryNotificationsCommand(config, logger, values) {
       lock = acquireLock({ stateDir: config.stateDir });
     } catch (err) {
       if (err instanceof LockError) {
-        process.stderr.write(`${err.message}\n`);
+        out.fail(ERROR_CODES.LOCKED, err.message);
         return EXIT_CODES.ALREADY_LOCKED;
       }
       throw err;
@@ -505,23 +628,23 @@ async function retryNotificationsCommand(config, logger, values) {
       options: { limit, projectId: values.project ?? null, dryRun },
     });
 
-    if (dryRun) {
-      process.stdout.write(`DRY RUN — ${summary.eligible} eligible notification(s), nothing sent:\n`);
-      for (const item of summary.items) {
-        process.stdout.write(
-          `- ${item.id.slice(0, 12)}… type=${item.type} project=${item.projectId ?? '-'} ` +
-            `status=${item.status} attempts=${item.attempts}\n`,
-        );
-      }
-    } else {
-      process.stdout.write(
-        `Retry complete: eligible=${summary.eligible} sent=${summary.sent} ` +
-          `failed=${summary.failed} permanent=${summary.permanentFailures} skipped=${summary.skipped}\n`,
-      );
-    }
+    out.ok({ dryRun, limit, ...summary }, () =>
+      dryRun
+        ? [
+            `DRY RUN — ${summary.eligible} eligible notification(s), nothing sent:`,
+            ...summary.items.map(
+              (item) =>
+                `- ${item.id.slice(0, 12)}… type=${item.type} project=${item.projectId ?? '-'} ` +
+                `status=${item.status} attempts=${item.attempts}`,
+            ),
+          ].join('\n')
+        : `Retry complete: eligible=${summary.eligible} sent=${summary.sent} ` +
+          `failed=${summary.failed} permanent=${summary.permanentFailures} skipped=${summary.skipped}`,
+    );
     return EXIT_CODES.OK;
   } catch (err) {
     logger.error(`retry-notifications failed: ${logger.redact(err.stack ?? err.message)}`);
+    out.fail(ERROR_CODES.INTERNAL, `retry-notifications failed: ${logger.redact(err.message)}`);
     return EXIT_CODES.RUNNER_FAILURE;
   } finally {
     try { stateDb?.close(); } catch { /* already closed */ }
@@ -531,17 +654,23 @@ async function retryNotificationsCommand(config, logger, values) {
 
 // ── status ──────────────────────────────────────────────────────
 
-async function statusCommand(config, logger, values) {
+async function statusCommand(config, logger, values, out) {
+  // Project-snapshot output is bounded (default 10) so `status` stays a fixed-
+  // size report no matter how many projects the application has.
+  let snapshotLimit = 10;
+  if (values.limit !== undefined) {
+    snapshotLimit = Number.parseInt(values.limit, 10);
+    if (!Number.isInteger(snapshotLimit) || snapshotLimit < 1) {
+      out.fail(ERROR_CODES.USAGE, `--limit must be an integer >= 1, got: ${values.limit}`);
+      return EXIT_CODES.RUNNER_FAILURE;
+    }
+  }
+
   let stateDb = null;
   try {
     stateDb = openStateDb(config.stateDbPath, { logger });
     const stateStore = new StateStore(stateDb);
-    const status = stateStore.statusSummary();
-
-    if (values.output === 'json') {
-      process.stdout.write(JSON.stringify(status, null, 2) + '\n');
-      return EXIT_CODES.OK;
-    }
+    const status = stateStore.statusSummary({ snapshotLimit });
 
     const run = status.latestRun;
     const lines = ['Runner state (runner-owned data only; no audits triggered)', ''];
@@ -565,17 +694,18 @@ async function statusCommand(config, logger, values) {
     lines.push(`Active critical (P0) issues: ${status.activeCriticalIssues}`);
     lines.push(`Issues resolved in the last 7 days: ${status.recentlyResolvedIssues}`);
     lines.push('');
-    lines.push(`Latest project snapshots (${status.latestSnapshots.length}):`);
+    lines.push(`Latest project snapshots (${status.latestSnapshots.length}, limit ${snapshotLimit}):`);
     for (const snap of status.latestSnapshots) {
       lines.push(
         `- project ${snap.project_id} (${snap.normalized_domain ?? '?'}): ` +
           `P0=${snap.p0_count} auditRun=${snap.audit_run_id} at ${snap.created_at}`,
       );
     }
-    process.stdout.write(lines.join('\n') + '\n');
+    out.ok({ snapshotLimit, ...status }, () => lines.join('\n'));
     return EXIT_CODES.OK;
   } catch (err) {
     logger.error(`status failed: ${err.stack ?? err.message}`);
+    out.fail(ERROR_CODES.STATE, `status failed: ${logger.redact(err.message)}`);
     return EXIT_CODES.RUNNER_FAILURE;
   } finally {
     try { stateDb?.close(); } catch { /* already closed */ }

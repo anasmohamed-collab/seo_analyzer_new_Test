@@ -9,7 +9,20 @@ placeholders. **Never put real credentials in files tracked by git.**
 The runner is a self-contained automation client. It talks to the SEO
 analyzer application **only over HTTP** (five API endpoints), keeps all of
 its own state in a local SQLite database, opens **no network port**, and
-never touches the application's database or runtime.
+never touches the application's database or runtime. It contains no SEO audit
+rules — the application does all the auditing; the runner only schedules it
+and reports the results.
+
+Companion documents: `../docs/OPERATIONS_RUNBOOK.md` (backup, restore,
+upgrade, rollback, emergency disable, monitoring),
+`../docs/CLI_CONTRACT.md` (`--output json`, exit codes, read-only
+guarantees), `TROUBLESHOOTING.md` (symptom lookup),
+`../docs/READINESS_MATRIX.md` (what is verified and what is not).
+
+**Run every runner command as the `seo-runner` user** — `sudo -u seo-runner
+seo-audit-runner …`, exactly as written below. Running one as plain `root`
+can leave root-owned files in `/var/lib/seo-audit-runner/` that the real runs
+then cannot write.
 
 ---
 
@@ -73,7 +86,12 @@ What this does (idempotent — safe to re-run):
   `/var/lib/seo-audit-runner` (state, mode 0700), `…/backups`,
   `/var/log/seo-audit-runner`, `/run/seo-audit-runner`;
 - installs the command wrapper `/usr/local/bin/seo-audit-runner`;
-- installs six systemd units **disabled** — nothing is scheduled yet;
+- installs the **two** systemd units — `seo-runner-tick.timer` and
+  `seo-runner-tick.service` — and leaves them **disabled**; nothing is
+  scheduled yet, and installation never invokes `systemctl` at all. (If an
+  older multi-timer install left `seo-audit-runner.timer` or
+  `seo-runner-retry.timer` behind, the installer warns about them — remove
+  them, see §7 step 2.);
 - creates `/etc/seo-audit-runner/runner.env` from the template **only if
   absent** (existing configuration, state, backups, and logs are always
   preserved);
@@ -112,7 +130,12 @@ leaks. After editing:
 sudo chmod 0640 /etc/seo-audit-runner/runner.env
 sudo chown root:seo-runner /etc/seo-audit-runner/runner.env
 sudo -u seo-runner seo-audit-runner validate-config
+sudo -u seo-runner seo-audit-runner init        # create/migrate state explicitly
 ```
+
+`init` is idempotent and creates the runner's SQLite state as the correct
+user. (Any state-reading command would create it implicitly; doing it
+explicitly here is what guarantees the files end up owned by `seo-runner`.)
 
 ## 5. Smoke test
 
@@ -223,7 +246,13 @@ sudo -u seo-runner seo-audit-runner worker --once               # run due jobs n
 
 Add `--output json` to any of these for machine-readable output — this
 CLI is the documented control channel for the backend
-(`docs/BACKEND_CONTROL_API.md`).
+(`../docs/BACKEND_CONTROL_API.md`). In JSON mode stdout is exactly one
+versioned envelope and all diagnostics go to stderr, so redirecting stdout to
+a file is always safe. Envelope shape, error codes, exit codes, and list
+bounds: `../docs/CLI_CONTRACT.md`.
+
+Default list bounds: `job list` 50, `schedule list` 50, `status` snapshots 10
+— each overridable with `--limit <n>`.
 
 ## 9. Logs
 
@@ -265,6 +294,10 @@ Backups contain only runner state (SQLite + run journals) — never
 `runner.env`, never secrets, never application data. Schedule backups
 outside the 03:00 audit window if you automate them.
 
+Full procedure, including the SQLite-safe copy method, the integrity gates,
+the active-lock refusal, archive verification, and how restore preserves what
+it replaces: **`../docs/OPERATIONS_RUNBOOK.md` §1–§2**.
+
 ## 12. Upgrade and rollback
 
 ```bash
@@ -283,17 +316,25 @@ DB migrations). If a rolled-back release cannot open a newer state
 schema, `rollback.sh` says so and points at the matching state backup —
 nothing is ever downgraded blindly.
 
+Full procedure with the per-step safety properties and the two-part
+code+state rollback: **`../docs/OPERATIONS_RUNBOOK.md` §3–§4**.
+
 ## 13. Uninstall
 
 ```bash
 sudo bash deploy/uninstall.sh    # removes code, wrapper, units; PRESERVES state, backups, runner.env, logs, user
 ```
 
-Full destruction requires explicit flags and takes a final backup first:
+Full destruction requires **both** explicit flags and writes *and verifies* a
+final backup before deleting anything:
 
 ```bash
 sudo bash deploy/purge.sh --yes-delete-state --final-backup-to /root/seo-runner-final-backup
 ```
+
+Purge never runs as part of uninstall, upgrade, or any automated flow.
+Emergency disable, job/notification recovery, and the uninstall-versus-purge
+decision: **`../docs/OPERATIONS_RUNBOOK.md` §5**.
 
 ## 14. Common errors
 

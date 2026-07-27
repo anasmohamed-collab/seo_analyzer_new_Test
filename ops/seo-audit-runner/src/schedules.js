@@ -367,10 +367,16 @@ export class ScheduleStore {
    * Ordered by (created_at, rowid): when several schedules come due in the
    * same tick, the older one is always considered first, so which occurrence
    * wins a conflict is deterministic rather than insertion-timing luck.
+   *
+   * `limit` is for DISPLAY only and defaults to null = unbounded. The worker
+   * tick and the health checks must see every enabled schedule — a default
+   * cap here would silently stop enqueueing the schedules past it — so the
+   * bound lives in the CLI (`schedule list --limit`), never in this default.
    */
-  list({ enabledOnly = false } = {}) {
-    return enabledOnly
-      ? this.db.prepare('SELECT * FROM schedules WHERE enabled = 1 ORDER BY created_at, rowid').all()
-      : this.db.prepare('SELECT * FROM schedules ORDER BY created_at, rowid').all();
+  list({ enabledOnly = false, limit = null } = {}) {
+    const where = enabledOnly ? 'WHERE enabled = 1' : '';
+    const sql = `SELECT * FROM schedules ${where} ORDER BY created_at, rowid`;
+    if (limit == null) return this.db.prepare(sql).all();
+    return this.db.prepare(`${sql} LIMIT ?`).all(limit);
   }
 }

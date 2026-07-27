@@ -1,7 +1,10 @@
 # Deployment Architecture — SEO Audit Runner (Phase 4)
 
-Status: **approved contract** (Phase 4A, paths corrected). Implementation
-follows in later phases. Scope: everything in this document applies only to
+Status: **approved contract, and implemented** — the scripts, units, CLI, and
+tests described here all exist under `ops/seo-audit-runner/`. Nothing has been
+executed on a Linux host yet; see `docs/READINESS_MATRIX.md` for exactly what
+is verified versus what still needs Linux staging. Scope: everything in this
+document applies only to
 `ops/seo-audit-runner/`. The main SEO application (its runtime, Docker image,
 nixpacks config, Node version, environment variables, startup command, and
 PostgreSQL database) is **out of scope and must never be modified by runner

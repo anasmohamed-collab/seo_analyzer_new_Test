@@ -21,6 +21,8 @@ Print this and tick every box in order. Details for every step:
 - [ ] Slack: set `SLACK_BOT_TOKEN` + `SLACK_CHANNEL_ID`, then `NOTIFICATIONS_ENABLED=true`
 - [ ] `sudo chmod 0640 /etc/seo-audit-runner/runner.env && sudo chown root:seo-runner /etc/seo-audit-runner/runner.env`
 - [ ] `sudo -u seo-runner seo-audit-runner validate-config` → `Configuration OK`
+- [ ] `sudo -u seo-runner seo-audit-runner init` → state DB created as `seo-runner`
+      (always `-u seo-runner`, never plain root — root would leave root-owned state files)
 
 ## Verify
 - [ ] `sudo bash deploy/smoke-test.sh --with-dry-run` → `RESULT: PASS`
@@ -45,6 +47,8 @@ One authority only: `seo-runner-tick.timer` → `seo-runner-tick.service` →
 
 ## Safety net
 - [ ] `sudo -u seo-runner bash deploy/backup.sh` produced `state-<stamp>.tar.gz`
-- [ ] Restore procedure read (`deploy/restore.sh --help`)
-- [ ] Rollback procedure read (`deploy/rollback.sh --help`)
-- [ ] Handover guide delivered to the operating team
+- [ ] Restore procedure read (`deploy/restore.sh --help`, runbook §2)
+- [ ] Rollback procedure read (`deploy/rollback.sh --help`, runbook §4)
+- [ ] Emergency disable understood: `sudo systemctl disable --now seo-runner-tick.timer` (runbook §5)
+- [ ] Monitoring checks agreed (runbook §6); alert on exit 1 and 4, accept 0 and 2
+- [ ] Handover guide + `docs/OPERATIONS_RUNBOOK.md` delivered to the operating team

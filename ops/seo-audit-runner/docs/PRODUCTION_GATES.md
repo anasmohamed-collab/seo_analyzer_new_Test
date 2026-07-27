@@ -41,7 +41,13 @@ without recorded evidence (command output pasted into the phase review).
 ## Gate 3 — Local validation (per implementation phase)
 
 - Full runner suite green: `cd ops/seo-audit-runner && npm test`
-  (baseline 186; new phases may only add tests, never break existing ones).
+  (Gate 1 baseline was 186; the suite has grown with each phase and stands at
+  409 tests / 408 pass / 1 skip after the CLI-contract phase — the single skip
+  is a Windows-only file-symlink case. New phases may only add tests, never
+  break existing ones.)
+- CLI contract green: the JSON envelope, JSON-only stdout, exit-code table,
+  read-only guarantees, and list bounds in `docs/CLI_CONTRACT.md` are all
+  asserted by `test/cliContract.test.js`.
 - Shell syntax: `bash -n` / `sh -n` on every `deploy/*.sh`.
 - CRLF/LF scan: no `\r` bytes in any of the following under
   `ops/seo-audit-runner/` (byte-level check, matching `.gitattributes`):
