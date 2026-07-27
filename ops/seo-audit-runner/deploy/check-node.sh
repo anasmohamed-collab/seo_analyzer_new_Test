@@ -12,6 +12,21 @@
 # Contract: deploy/README-deploy.md §2, docs/DEPLOYMENT_ARCHITECTURE.md §3.
 set -Eeuo pipefail
 
+# Guarantee core system utilities (cat, …) resolve even when invoked with a
+# minimal or reset PATH. The caller's PATH is kept FIRST so operator
+# overrides and the rootless deployment tests' mocked commands still take
+# precedence; standard system directories are only appended as a fallback.
+# Drop Windows system directories (their find.exe/sort.exe/tar.exe shadow
+# the GNU tools) before appending the standard system directories.
+seo_path=; seo_ifs=$IFS; IFS=:
+for seo_d in ${PATH:-}; do
+  case $seo_d in ''|/[A-Za-z]/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]|/[A-Za-z]/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]/*|[A-Za-z]:/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]|[A-Za-z]:/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]/*) continue ;; esac
+  seo_path=${seo_path:+$seo_path:}$seo_d
+done
+IFS=$seo_ifs
+export PATH="${seo_path:+$seo_path:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+unset seo_path seo_ifs seo_d
+
 MIN_MAJOR=22
 MIN_MINOR=5
 
