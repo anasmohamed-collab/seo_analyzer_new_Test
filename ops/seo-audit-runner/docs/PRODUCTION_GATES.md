@@ -42,7 +42,7 @@ without recorded evidence (command output pasted into the phase review).
 
 - Full runner suite green: `cd ops/seo-audit-runner && npm test`
   (Gate 1 baseline was 186; the suite has grown with each phase and stands at
-  409 tests / 408 pass / 1 skip after the CLI-contract phase — the single skip
+  414 tests / 413 pass / 1 skip after the CLI-contract phase — the single skip
   is a Windows-only file-symlink case. New phases may only add tests, never
   break existing ones.)
 - CLI contract green: the JSON envelope, JSON-only stdout, exit-code table,

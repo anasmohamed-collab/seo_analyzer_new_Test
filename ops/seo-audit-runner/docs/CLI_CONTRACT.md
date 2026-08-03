@@ -157,6 +157,7 @@ or schedule, or write a row to any table:
 
 `init` · `validate-config` · `list-projects` · `status` · `health` ·
 `doctor` · `job list` · `job show` · `schedule list` ·
+`notifications list` · `notifications show` ·
 `retry-notifications --dry-run` · `run … --dry-run`
 
 Enforced by tests that snapshot every mutable table's row count before and
@@ -214,6 +215,7 @@ No list command can return an unbounded result set:
 |---|---|---|
 | `job list` | **50** newest jobs | `--limit <n>` |
 | `schedule list` | **50** schedules | `--limit <n>` |
+| `notifications list` | **50** newest notifications | `--limit <n>` |
 | `status` project snapshots | **10** newest | `--limit <n>` |
 | `retry-notifications [--dry-run]` | **50** eligible notifications | `--limit <n>` |
 
@@ -247,6 +249,11 @@ seo-audit-runner run --project <id> [same flags]
 
 # notifications
 seo-audit-runner retry-notifications [--limit 50] [--project <id>] [--dry-run]
+
+# what was actually sent to Slack (read-only; contacts Slack never)
+seo-audit-runner notifications list [--status PENDING|DELIVERED|FAILED|PERMANENT_FAILURE]
+                                    [--project <id>] [--limit 50]
+seo-audit-runner notifications show <id>     # prints the exact message text
 
 # job queue (runner-owned)
 seo-audit-runner job create --project <id> | --all
@@ -282,7 +289,42 @@ Behavioral guarantees worth restating:
   or `RUNNING`, naming the blocking job, and change nothing.
 - `worker` requires `--once`.
 
-## 8. Portability
+## 8. "No Slack message arrived" — where it stopped
+
+A message reaches Slack only if **all four** gates pass. Any one of them
+failing means no message — and the first two mean **nothing is stored either**,
+so `notifications list` will legitimately be empty.
+
+| # | Gate | Check it with |
+|---|---|---|
+| 1 | An audit actually **COMPLETED** (failed/timed-out audits never notify) | `job list`, `status` |
+| 2 | `NOTIFICATIONS_ENABLED=true` **and** a Slack method is configured — and `run` was not given `--no-notifications` | `validate-config` |
+| 3 | The **alert mode** matched: the default `new_or_regressed` only fires when there are new, reopened, or resolved P0 issues — a repeat run with identical findings is deliberately silent | `validate-config` (Alert mode) |
+| 4 | Delivery succeeded | `notifications list` |
+
+Gates 1–3 produce **no record at all**: the message is only built and persisted
+inside the `slackActive && shouldNotify(...)` branch, so there is nothing to
+display afterwards. Gate 4 is the only failure that leaves evidence — a
+`PENDING`/`FAILED`/`PERMANENT_FAILURE` row whose full text you can read with
+`notifications show <id>`.
+
+```bash
+seo-audit-runner validate-config          # gates 2 and 3
+seo-audit-runner notifications list       # gate 4 — and whether anything exists
+seo-audit-runner notifications show <id>  # the exact message text
+```
+
+Common gate-4 causes, all reported in `last_error`: `channel_not_found` (using
+the channel *name* instead of its ID), `not_in_channel` (the bot was never
+`/invite`d to a private channel), `invalid_auth` / `token_revoked`, and
+`msg_too_long`. These are `PERMANENT_FAILURE` — never retried; fix the
+configuration, then re-run the audit to generate a fresh message.
+
+**`NOTIFICATIONS_ENABLED` defaults to `false`.** A runner that was never
+explicitly configured for Slack will complete audits silently and store no
+notification — which is the single most common reason nothing arrives.
+
+## 9. Portability
 
 The CLI is developed on Windows and runs in production on Linux. The
 deployment scripts are POSIX `bash` and are exercised from both Git Bash and

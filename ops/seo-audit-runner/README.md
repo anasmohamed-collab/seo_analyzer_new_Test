@@ -171,6 +171,10 @@ seo-audit-runner retry-notifications --limit 50
 seo-audit-runner retry-notifications --project PROJECT_ID
 seo-audit-runner retry-notifications --dry-run       # list eligible, send nothing
 
+seo-audit-runner notifications list                  # what was sent to Slack (read-only)
+seo-audit-runner notifications list --status FAILED
+seo-audit-runner notifications show NOTIFICATION_ID  # the exact message text
+
 seo-audit-runner status                   # runner-owned state report
 seo-audit-runner status --output json      # (default 10 project snapshots; --limit N)
 
@@ -268,6 +272,16 @@ checks always see *every* enabled schedule.
 
 Notification failures never change audit results or audit exit codes — they
 are reported separately and queued for `retry-notifications`.
+
+**If no Slack message arrives**, four gates must all pass, and the first three
+leave no record at all (so an empty `notifications list` is itself the answer):
+(1) the audit must have **COMPLETED**; (2) `NOTIFICATIONS_ENABLED=true` with a
+Slack method configured and no `--no-notifications`; (3) the alert mode must
+match — the default `new_or_regressed` is deliberately silent when a re-run
+finds nothing new, reopened, or resolved; (4) delivery must succeed. Only (4)
+leaves a row you can inspect with `notifications show <id>`. Note
+`NOTIFICATIONS_ENABLED` defaults to **false**. Full walkthrough:
+`docs/CLI_CONTRACT.md` §8 and `deploy/TROUBLESHOOTING.md`.
 
 ### Issue lifecycle
 

@@ -26,6 +26,8 @@ import { fileURLToPath } from 'node:url';
 import { openStateDb } from '../src/db.js';
 import { JobStore } from '../src/jobs.js';
 import { ScheduleStore } from '../src/schedules.js';
+import { StateStore } from '../src/stateStore.js';
+import { buildProjectMessages } from '../src/slackFormat.js';
 import { CLI_SCHEMA_VERSION, ERROR_CODES } from '../src/cli/output.js';
 import { DEFAULT_LIST_LIMIT } from '../src/cli/manage.js';
 
@@ -590,6 +592,124 @@ test('the scheduler itself is never bounded by the CLI display limit', () => {
   assert.equal(store.list({ enabledOnly: true }).length, total);
   assert.equal(store.list({ limit: 4 }).length, 4, 'an explicit limit still applies');
   db.close();
+});
+
+// ── notifications viewer (read-only Slack message history) ─────────
+
+/** Seed one notification with a real rendered Slack payload. */
+function seedNotification(stateDir, { status = 'FAILED', error = 'channel_not_found' } = {}) {
+  const db = openStateDb(path.join(stateDir, 'runner-state.sqlite'));
+  const store = new StateStore(db);
+  const messages = buildProjectMessages({
+    projectName: 'Acme Corp',
+    domain: 'acme.example',
+    projectId: '42',
+    auditRunId: 'audit-run-1001',
+    auditCompletedAt: '2026-07-27T03:04:05.000Z',
+    dashboardUrl: null,
+    lifecycle: {
+      new: [{ area: 'Indexing', message: 'Missing meta description', normalizedUrl: 'https://acme.example/pricing' }],
+      reopened: [],
+      unchanged: [],
+      resolved: [],
+      counts: { new: 1, reopened: 0, unchanged: 0, resolved: 0, current: 1 },
+    },
+    mode: 'new_or_regressed',
+    maxIssuesPerMessage: 20,
+    maxMessageCharacters: 30000,
+  });
+  const id = 'ntf-test-0001-abcdef';
+  store.ensureNotification({
+    id,
+    projectId: '42',
+    auditRunId: 'audit-run-1001',
+    type: 'project_update',
+    method: 'bot',
+    payloadHash: 'test',
+    payloadJson: JSON.stringify(messages),
+    createdAt: '2026-07-27T03:04:06.000Z',
+  });
+  store.recordNotificationAttempt(id, { status, error });
+  db.close();
+  return { id, messages };
+}
+
+test('notifications show prints the exact message text that went to Slack', () => {
+  const stateDir = tmpDir();
+  const { id, messages } = seedNotification(stateDir);
+
+  const shown = cli(['notifications', 'show', id, '--output', 'json'], { stateDir });
+  assert.equal(shown.status, 0, shown.output);
+  const data = envelope(shown, { ok: true }).data;
+  assert.equal(data.status, 'FAILED');
+  assert.equal(data.lastError, 'channel_not_found');
+  assert.equal(data.messages.length, messages.length);
+  assert.equal(data.messages[0].text, messages[0].text, 'the stored payload must be returned verbatim');
+
+  const text = cli(['notifications', 'show', id], { stateDir });
+  assert.equal(text.status, 0, text.output);
+  assert.match(text.stdout, /Missing meta description/, 'the human view must show the message body');
+  assert.match(text.stdout, /last error: channel_not_found/);
+});
+
+test('notifications show accepts the truncated id printed by list', () => {
+  const stateDir = tmpDir();
+  const { id } = seedNotification(stateDir);
+  const short = id.slice(0, 12);
+  const r = cli(['notifications', 'show', short, '--output', 'json'], { stateDir });
+  assert.equal(r.status, 0, r.output);
+  assert.equal(envelope(r, { ok: true }).data.id, id);
+});
+
+test('notifications list shows delivered and permanently failed history, bounded', () => {
+  const stateDir = tmpDir();
+  seedNotification(stateDir, { status: 'PERMANENT_FAILURE', error: 'invalid_auth' });
+
+  const all = envelope(cli(['notifications', 'list', '--output', 'json'], { stateDir })).data;
+  assert.equal(all.limit, DEFAULT_LIST_LIMIT, 'the list must be bounded by default');
+  assert.equal(all.count, 1);
+  assert.equal(all.notifications[0].status, 'PERMANENT_FAILURE');
+
+  // Retryable-only queries deliberately hide these; the viewer must not.
+  const filtered = envelope(
+    cli(['notifications', 'list', '--status', 'PERMANENT_FAILURE', '--output', 'json'], { stateDir }),
+  ).data;
+  assert.equal(filtered.count, 1);
+  const none = envelope(cli(['notifications', 'list', '--status', 'DELIVERED', '--output', 'json'], { stateDir })).data;
+  assert.equal(none.count, 0);
+
+  const bad = cli(['notifications', 'list', '--status', 'NOPE'], { stateDir });
+  assert.equal(bad.status, 1);
+  assert.match(bad.stderr, /--status must be one of/);
+});
+
+test('notifications is read-only: it never mutates state or contacts Slack', () => {
+  const stateDir = tmpDir();
+  const stateDbPath = path.join(stateDir, 'runner-state.sqlite');
+  const { id } = seedNotification(stateDir);
+  const before = stateCounts(stateDbPath);
+
+  for (const args of [['notifications', 'list'], ['notifications', 'show', id]]) {
+    const r = cli(args, { stateDir });
+    assert.equal(r.status, 0, r.output);
+    assert.deepEqual(stateCounts(stateDbPath), before, `${args.join(' ')} mutated state`);
+  }
+  // Attempt count must be untouched — viewing is not a delivery attempt.
+  const after = envelope(cli(['notifications', 'show', id, '--output', 'json'], { stateDir })).data;
+  assert.equal(after.attemptCount, 1, 'viewing must not count as a send attempt');
+  assert.equal(after.status, 'FAILED', 'viewing must not change delivery status');
+});
+
+test('notifications missing id is NOT_FOUND, and an empty list explains why', () => {
+  const stateDir = tmpDir();
+  const missing = cli(['notifications', 'show', 'no-such-id', '--output', 'json'], { stateDir });
+  assert.equal(missing.status, 1);
+  assert.equal(envelope(missing, { ok: false }).error.code, ERROR_CODES.NOT_FOUND);
+
+  const empty = cli(['notifications', 'list'], { stateDir });
+  assert.equal(empty.status, 0, empty.output);
+  assert.match(empty.stdout, /Nothing recorded yet/);
+  assert.match(empty.stdout, /notifications\s+are enabled/, 'the empty state must name the cause');
 });
 
 // ── secrets never reach any output ─────────────────────────────────

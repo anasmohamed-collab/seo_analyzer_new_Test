@@ -47,6 +47,7 @@ import {
   workerCommand,
   healthCommand,
   initCommand,
+  notificationsCommand,
   DEFAULT_LIST_LIMIT,
 } from '../src/cli/manage.js';
 import { createOutput, resolveOutputMode, OutputModeError, ERROR_CODES } from '../src/cli/output.js';
@@ -68,6 +69,7 @@ Commands:
                             run queued jobs, retry notifications
   job <action>              create | list | show | retry | cancel   (runner-owned queue)
   schedule <action>         create | update | enable | disable | delete | list
+  notifications <action>    list | show <id>   (what was sent to Slack; read-only)
 
 job options:
   job create --project <id> | --all
@@ -83,6 +85,12 @@ schedule options:
   schedule delete <id> [--force]         (--force also cancels its queued jobs;
                                           a RUNNING job always blocks the delete)
   schedule list [--limit <n>]            (default --limit ${DEFAULT_LIST_LIMIT})
+
+notifications options:
+  notifications list [--status PENDING|DELIVERED|FAILED|PERMANENT_FAILURE]
+                     [--project <id>] [--limit <n>]   (default ${DEFAULT_LIST_LIMIT})
+  notifications show <id>                Print the exact message text sent to
+                                         Slack (accepts the truncated id)
 
 Run options:
   --dry-run                 Plan only: no audit started, no state written,
@@ -155,10 +163,10 @@ async function main() {
     process.stderr.write(`${err.message}\n`);
     return EXIT_CODES.RUNNER_FAILURE;
   }
-  // `job`/`schedule` are verb+action pairs; the envelope reports both
-  // ("job list") so a consumer can key on one field.
+  // `job`/`schedule`/`notifications` are verb+action pairs; the envelope
+  // reports both ("job list") so a consumer can key on one field.
   const commandName =
-    (command === 'job' || command === 'schedule') && positionals[1]
+    ['job', 'schedule', 'notifications'].includes(command) && positionals[1]
       ? `${command} ${positionals[1]}`
       : (command ?? '(none)');
   const out = createOutput({ command: commandName, mode });
@@ -213,6 +221,8 @@ async function main() {
       return healthCommand(config, logger, values, 'doctor', out);
     case 'worker':
       return workerCommand(config, logger, values, out);
+    case 'notifications':
+      return notificationsCommand(config, logger, values, positionals, out);
     case 'job':
       return jobCommand(config, logger, values, positionals, out);
     case 'schedule':
