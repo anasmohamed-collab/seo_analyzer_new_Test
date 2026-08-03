@@ -110,6 +110,45 @@ Schedules follow their stored IANA timezone (`schedule list` shows it) —
 the timer itself has no audit hour to get wrong. If you need a different
 zone: `schedule update <id> --timezone <Area/City>`.
 
+## Slack notifications
+
+**No Slack message arrived after an audit**
+Four gates must all pass; the first three leave **no record at all**, so an
+empty `notifications list` is itself the diagnosis. Work down in order:
+```bash
+sudo -u seo-runner seo-audit-runner status              # 1. did an audit COMPLETE?
+sudo -u seo-runner seo-audit-runner validate-config     # 2. notifications on + Slack method?
+                                                        # 3. alert mode (see below)
+sudo -u seo-runner seo-audit-runner notifications list  # 4. was it built and did it send?
+```
+1. Only a **COMPLETED** audit notifies — failed/timed-out ones never do.
+2. `NOTIFICATIONS_ENABLED` defaults to **false**. If `validate-config` prints
+   `NOTIFICATIONS_ENABLED = false` or `Slack method: none`, nothing was ever
+   built. Also check the run was not invoked with `--no-notifications`.
+3. The default alert mode `new_or_regressed` is **deliberately silent** when a
+   re-run finds exactly the same issues — nothing new, reopened, or resolved.
+   Use `SEO_RUNNER_ALERT_MODE=all_current` if you want every run to report.
+4. If a row exists, read the exact text and the failure reason:
+   ```bash
+   sudo -u seo-runner seo-audit-runner notifications show <id>
+   ```
+
+**`channel_not_found` / `not_in_channel` / `invalid_auth`**
+These are `PERMANENT_FAILURE` — never retried automatically.
+- `channel_not_found`: you used the channel *name*; use the channel **ID**
+  (e.g. `C0123456789`) in `SLACK_CHANNEL_ID`.
+- `not_in_channel`: `/invite @your-bot` into the (private) channel.
+- `invalid_auth` / `token_revoked`: rotate `SLACK_BOT_TOKEN`.
+Fix the configuration, then re-run the audit to generate a fresh message —
+retrying the old record cannot succeed for a permanent error.
+
+**Message queued but not sent (`PENDING` / `FAILED`)**
+Transient failures are retried by the next tick. To force a pass now:
+```bash
+sudo -u seo-runner seo-audit-runner retry-notifications --dry-run   # inspect
+sudo -u seo-runner seo-audit-runner retry-notifications
+```
+
 ## State database
 
 **`state database check failed` / integrity errors**

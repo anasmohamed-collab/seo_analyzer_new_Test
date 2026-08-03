@@ -261,6 +261,37 @@ export class StateStore {
       .all(...params);
   }
 
+  /**
+   * Notifications in any state, newest first — the read model behind
+   * `seo-audit-runner notifications list|show`.
+   *
+   * Unlike listRetryableNotifications this deliberately includes DELIVERED
+   * and PERMANENT_FAILURE rows: the operator question it answers is "what
+   * did the runner actually send (or try to send) to Slack?", which is
+   * exactly the history the retry query filters out.
+   */
+  listNotifications({ limit = 50, status = null, projectId = null } = {}) {
+    const filters = [];
+    const params = [];
+    if (status != null) {
+      filters.push('status = ?');
+      params.push(status);
+    }
+    if (projectId != null) {
+      filters.push('project_id = ?');
+      params.push(String(projectId));
+    }
+    params.push(limit);
+    return this.db
+      .prepare(`
+        SELECT * FROM notifications
+        ${filters.length ? `WHERE ${filters.join(' AND ')}` : ''}
+        ORDER BY created_at DESC
+        LIMIT ?
+      `)
+      .all(...params);
+  }
+
   // ── Status reporting (read-only) ──────────────────────────────
 
   statusSummary({ resolvedSinceDays = 7, snapshotLimit = 10 } = {}) {

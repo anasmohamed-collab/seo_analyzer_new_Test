@@ -32,7 +32,7 @@ amount of local testing can change that.
 
 | Item | Status | Evidence |
 |---|---|---|
-| Full runner test suite | **PASS** | `npm test` — 409 tests, 408 pass, 1 skip, 0 fail (Node 24.14.0; the skip is a Windows-only file-symlink case) |
+| Full runner test suite | **PASS** | `npm test` — 414 tests, 413 pass, 1 skip, 0 fail (Node 24.14.0; the skip is a Windows-only file-symlink case) |
 | Zero production dependencies | **PASS** | `package.json` `dependencies: {}`; Node built-ins + `node:sqlite` only |
 | Versioned JSON envelope | **PASS** | `test/cliContract.test.js` — `schemaVersion`/`command`/`ok`/`generatedAt` on every JSON command |
 | JSON-mode stdout is JSON only | **PASS** | same suite — asserted at `RUNNER_LOG_LEVEL=debug`; logger writes to stderr |

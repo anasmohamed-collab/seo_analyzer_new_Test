@@ -406,6 +406,148 @@ export function healthCommand(config, logger, values, level, out) {
   return report.exitCode;
 }
 
+// ── notifications ──────────────────────────────────────────────────
+
+/** Notification statuses, for `--status` validation. */
+const NOTIFICATION_STATUS = ['PENDING', 'DELIVERED', 'FAILED', 'PERMANENT_FAILURE'];
+
+const notificationLine = (n) =>
+  `${n.id.slice(0, 12)}…  ${n.status.padEnd(17)} ${n.type.padEnd(14)} ` +
+  `project=${n.project_id ?? '(run summary)'} attempts=${n.attempt_count} created=${n.created_at}` +
+  `${n.delivered_at ? ` delivered=${n.delivered_at}` : ''}` +
+  `${n.last_error ? `\n    last error: ${n.last_error}` : ''}`;
+
+/**
+ * Decode the stored payload into the messages that were (or would have been)
+ * posted. Each message is `{ text, blocks }`; `text` is Slack's plain-text
+ * fallback and is what a human actually wants to read.
+ *
+ * A payload that will not parse is reported rather than thrown — the point of
+ * this command is to show the operator what is there.
+ */
+function decodeMessages(notification) {
+  try {
+    const parsed = JSON.parse(notification.payload_json);
+    return { messages: Array.isArray(parsed) ? parsed : [parsed], parseError: null };
+  } catch (err) {
+    return { messages: [], parseError: err.message };
+  }
+}
+
+/**
+ * `notifications list|show` — read-only Slack message history.
+ *
+ * This is the answer to "what did the runner send to Slack?". It reads the
+ * runner's own `notifications` table and never contacts Slack, so running it
+ * cannot deliver, re-deliver, or mutate anything.
+ */
+export function notificationsCommand(config, logger, values, positionals, out) {
+  const action = positionals[1] ?? 'list';
+  const id = positionals[2];
+
+  switch (action) {
+    case 'list':
+      return withDb(config, logger, out, (db) => {
+        const status = values.status ? String(values.status).toUpperCase() : null;
+        if (status && !NOTIFICATION_STATUS.includes(status)) {
+          out.fail(ERROR_CODES.USAGE, `--status must be one of ${NOTIFICATION_STATUS.join(', ')}`);
+          return EXIT_CODES.RUNNER_FAILURE;
+        }
+        let limit;
+        try {
+          limit = parseLimit(values);
+        } catch (err) {
+          out.fail(ERROR_CODES.USAGE, err.message);
+          return EXIT_CODES.RUNNER_FAILURE;
+        }
+        const rows = new StateStore(db).listNotifications({
+          limit,
+          status,
+          projectId: values.project ?? null,
+        });
+        out.ok(
+          { limit, count: rows.length, notifications: rows.map(summarizeNotification) },
+          () =>
+            [
+              `${rows.length} notification(s) (limit ${limit})`,
+              ...rows.map((n) => `- ${notificationLine(n)}`),
+              rows.length === 0
+                ? '\nNothing recorded yet. A message is only built and stored when notifications\n' +
+                  'are enabled AND the alert mode matches — see `seo-audit-runner validate-config`.'
+                : '\nShow the full message text with: seo-audit-runner notifications show <id>',
+            ].join('\n'),
+        );
+        return EXIT_CODES.OK;
+      });
+    case 'show': {
+      if (!id) {
+        out.fail(ERROR_CODES.USAGE, 'notifications show requires a notification id');
+        return EXIT_CODES.RUNNER_FAILURE;
+      }
+      return withDb(config, logger, out, (db) => {
+        const store = new StateStore(db);
+        // Accept the truncated id shown by `list` as well as the full one.
+        const notification =
+          store.getNotification(id) ??
+          store.listNotifications({ limit: 500 }).find((n) => n.id.startsWith(id)) ??
+          null;
+        if (!notification) {
+          out.fail(ERROR_CODES.NOT_FOUND, `notification not found: ${id}`);
+          return EXIT_CODES.RUNNER_FAILURE;
+        }
+        const { messages, parseError } = decodeMessages(notification);
+        out.ok(
+          { ...summarizeNotification(notification), parseError, messages },
+          () =>
+            [
+              `Notification ${notification.id}`,
+              `  status:     ${notification.status}`,
+              `  type:       ${notification.type}`,
+              `  project:    ${notification.project_id ?? '(run summary)'}`,
+              `  audit run:  ${notification.audit_run_id ?? '-'}`,
+              `  method:     ${notification.method ?? '(none recorded)'}`,
+              `  attempts:   ${notification.attempt_count}`,
+              `  created:    ${notification.created_at}`,
+              `  delivered:  ${notification.delivered_at ?? '(not delivered)'}`,
+              `  next retry: ${notification.next_retry_at ?? '-'}`,
+              ...(notification.last_error ? [`  last error: ${notification.last_error}`] : []),
+              '',
+              parseError
+                ? `Stored payload could not be parsed: ${parseError}`
+                : `Message content as sent to Slack (${messages.length} part(s)):`,
+              ...messages.flatMap((m, i) => [
+                '',
+                `──────── part ${i + 1} of ${messages.length} ────────`,
+                m?.text ?? '(no plain-text fallback in this part)',
+              ]),
+            ].join('\n'),
+        );
+        return EXIT_CODES.OK;
+      });
+    }
+    default:
+      out.fail(ERROR_CODES.USAGE, 'notifications requires an action: list | show');
+      return EXIT_CODES.RUNNER_FAILURE;
+  }
+}
+
+/** Row projection for JSON output — the payload is exposed only by `show`. */
+function summarizeNotification(n) {
+  return {
+    id: n.id,
+    status: n.status,
+    type: n.type,
+    projectId: n.project_id,
+    auditRunId: n.audit_run_id,
+    method: n.method,
+    attemptCount: n.attempt_count,
+    createdAt: n.created_at,
+    deliveredAt: n.delivered_at,
+    nextRetryAt: n.next_retry_at,
+    lastError: n.last_error,
+  };
+}
+
 // ── init ───────────────────────────────────────────────────────────
 
 /**
