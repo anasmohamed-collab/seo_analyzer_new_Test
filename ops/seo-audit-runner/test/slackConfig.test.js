@@ -52,10 +52,37 @@ test('alert mode is validated strictly', () => {
   }
 });
 
+test('SLACK_CRITICAL_MENTION defaults to channel and accepts every documented value', () => {
+  assert.equal(loadConfig({}).slackCriticalMention, 'channel');
+  for (const mode of ['channel', 'here', 'everyone', 'none']) {
+    assert.equal(loadConfig({ SLACK_CRITICAL_MENTION: mode }).slackCriticalMention, mode);
+    assert.equal(loadConfig({ SLACK_CRITICAL_MENTION: mode.toUpperCase() }).slackCriticalMention, mode);
+  }
+});
+
+test('an invalid SLACK_CRITICAL_MENTION fails validation instead of falling back', () => {
+  for (const value of ['all', '@channel', 'everybody', '', ' ']) {
+    assert.throws(
+      () => loadConfig({ SLACK_CRITICAL_MENTION: value }),
+      (err) => {
+        assert.ok(err instanceof ConfigError);
+        assert.match(
+          err.message,
+          /SLACK_CRITICAL_MENTION must be one of channel, here, everyone, none/,
+          'the error must name the accepted values',
+        );
+        return true;
+      },
+      `value ${JSON.stringify(value)} must be rejected`,
+    );
+  }
+});
+
 test('Phase 3 defaults and state DB path', () => {
   const config = loadConfig({});
   assert.equal(config.alertMode, 'new_or_regressed');
   assert.equal(config.sendRunSummary, true);
+  assert.equal(config.slackCriticalMention, 'channel');
   assert.equal(config.slackRequestTimeoutMs, 15000);
   assert.equal(config.slackMaxRetries, 4);
   assert.equal(config.slackMaxIssuesPerMessage, 20);

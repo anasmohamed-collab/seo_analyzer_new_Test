@@ -250,6 +250,7 @@ function validateConfigCommand(config, logger, out) {
     alertMode: config.alertMode,
     sendRunSummary: config.sendRunSummary,
     slackMethod: config.slackMethod,
+    slackCriticalMention: config.slackCriticalMention,
     slackConfigured: Boolean(config.slackMethod),
     stateDirWritable: false,
     stateSchemaVersion: null,
@@ -268,6 +269,8 @@ function validateConfigCommand(config, logger, out) {
     `  NOTIFICATIONS_ENABLED   = ${config.notificationsEnabled}`,
     `  Alert mode              = ${config.alertMode}`,
     `  Send run summary        = ${config.sendRunSummary}`,
+    `  SLACK_CRITICAL_MENTION  = ${config.slackCriticalMention} ` +
+      '(new/reopened P0 alerts only; never on run summaries)',
   ];
 
   // Never print configured Slack values — only whether they are set.

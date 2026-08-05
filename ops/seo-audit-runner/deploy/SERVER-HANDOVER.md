@@ -118,6 +118,11 @@ SEO_API_BASE_URL=<http://127.0.0.1:3000 or your internal app address>
 NOTIFICATIONS_ENABLED=true
 SLACK_BOT_TOKEN=<xoxb-your-bot-token>
 SLACK_CHANNEL_ID=<C0XXXXXXXXX>
+
+# channel | here | everyone | none  (default: channel)
+# Adds <!channel> to alerts that contain a NEW or REOPENED P0 issue only.
+# Run summaries never contain a broad mention. Use `none` to switch it off.
+SLACK_CRITICAL_MENTION=channel
 ```
 
 **Secret handling:** `runner.env` is the ONLY place secrets live

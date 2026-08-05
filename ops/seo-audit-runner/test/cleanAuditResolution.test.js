@@ -125,9 +125,13 @@ for (const [label, cleanPayload] of [
     // new_or_regressed: resolved > 0 must notify, with a Resolved section.
     assert.equal(outcome.notificationStatus, 'delivered');
     const resolvedMessage = sender.sent.at(-1).text;
-    assert.match(resolvedMessage, /Resolved: 1/);
+    assert.match(resolvedMessage, /\*Resolved:\* 1/);
     assert.match(resolvedMessage, /\*Resolved issues\*/);
-    assert.match(resolvedMessage, /Missing title tag/);
+    assert.match(resolvedMessage, /✓ \*Missing title tag\*/);
+    // A resolved-only alert states the open state plainly and never pages the
+    // channel — nothing new or reopened happened.
+    assert.match(resolvedMessage, /\*P0:\* none currently open/);
+    assert.ok(!/<!(channel|here|everyone)>/.test(resolvedMessage));
     db.close();
   });
 }

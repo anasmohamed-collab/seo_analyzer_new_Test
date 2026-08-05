@@ -142,6 +142,17 @@ These are `PERMANENT_FAILURE` — never retried automatically.
 Fix the configuration, then re-run the audit to generate a fresh message —
 retrying the old record cannot succeed for a permanent error.
 
+**The channel is not notified even though the alert arrived**
+Critical alerts add a channel-wide mention (`SLACK_CRITICAL_MENTION`, default
+`channel`) **only** when the alert contains a new or reopened P0 issue —
+unchanged-only alerts, resolved-only alerts, and run summaries never mention
+the channel by design. If a new-P0 alert shows `@channel` as plain text
+instead of notifying anyone, the Slack **workspace** restricts who may post
+broad mentions; grant the posting identity that permission in Slack, or set
+`SLACK_CRITICAL_MENTION=none` and rely on the message itself. An invalid value
+(anything but `channel`, `here`, `everyone`, `none`) fails `validate-config`
+rather than falling back silently.
+
 **Message queued but not sent (`PENDING` / `FAILED`)**
 Transient failures are retried by the next tick. To force a pass now:
 ```bash

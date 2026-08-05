@@ -10,6 +10,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { SLACK_CRITICAL_MENTION_MODES } from './slackFormat.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const PACKAGE_ROOT = path.resolve(__dirname, '..');
@@ -40,9 +41,11 @@ const DEFAULTS = {
   SLACK_MAX_RETRIES: '4',
   SLACK_MAX_ISSUES_PER_MESSAGE: '20',
   SLACK_MAX_MESSAGE_CHARACTERS: '30000',
+  SLACK_CRITICAL_MENTION: 'channel',
 };
 
 export const ALERT_MODES = ['new_or_regressed', 'all_current', 'summary_only', 'disabled'];
+export { SLACK_CRITICAL_MENTION_MODES };
 
 // Hostnames considered private/trusted for plain-http transport.
 const PRIVATE_HOST_PATTERNS = [
@@ -205,6 +208,17 @@ export function loadConfig(env = process.env) {
     );
   }
 
+  // Channel-wide mention for NEW / REOPENED P0 alerts only. An unknown or
+  // empty value is a hard error — silently falling back to another mention
+  // type would either spam a channel or quietly stop paging it.
+  const slackCriticalMention = raw('SLACK_CRITICAL_MENTION').toLowerCase();
+  if (!SLACK_CRITICAL_MENTION_MODES.includes(slackCriticalMention)) {
+    problems.push(
+      `SLACK_CRITICAL_MENTION must be one of ${SLACK_CRITICAL_MENTION_MODES.join(', ')}, ` +
+        `got: ${raw('SLACK_CRITICAL_MENTION') || '(empty)'}`,
+    );
+  }
+
   const slackRequestTimeoutMs = parsePositiveInt('SLACK_REQUEST_TIMEOUT_MS', { min: 1000 });
   const slackMaxRetries = parsePositiveInt('SLACK_MAX_RETRIES', { min: 0 });
   const slackMaxIssuesPerMessage = parsePositiveInt('SLACK_MAX_ISSUES_PER_MESSAGE', { min: 1 });
@@ -242,6 +256,7 @@ export function loadConfig(env = process.env) {
     slackMaxRetries,
     slackMaxIssuesPerMessage,
     slackMaxMessageCharacters,
+    slackCriticalMention,
     dashboardUrl,
     allowInsecurePublicApi,
   };

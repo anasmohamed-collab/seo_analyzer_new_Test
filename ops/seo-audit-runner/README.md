@@ -96,6 +96,7 @@ SLACK_BOT_TOKEN=
 SLACK_CHANNEL_ID=
 SLACK_WEBHOOK_URL=
 
+SLACK_CRITICAL_MENTION=channel
 SLACK_REQUEST_TIMEOUT_MS=15000
 SLACK_MAX_RETRIES=4
 SLACK_MAX_ISSUES_PER_MESSAGE=20
@@ -147,11 +148,53 @@ without channel ID or vice versa) is always a configuration error.
 | `summary_only` | Project-level counts only, no individual issues. |
 | `disabled` | Never send Slack messages — issue lifecycle state is still updated after successful audits. |
 
-Messages are split safely for Slack: at most `SLACK_MAX_ISSUES_PER_MESSAGE`
-issues and `SLACK_MAX_MESSAGE_CHARACTERS` characters per message, project
-context repeated in every part, a single issue never split across messages,
-truncation with an explicit remaining count, mrkdwn escaping, blocks plus a
+### Critical mentions (`SLACK_CRITICAL_MENTION`)
+
+| Value | Slack token | Who is notified |
+|---|---|---|
+| `channel` *(default)* | `<!channel>` | **all members of the Slack channel**, online or not |
+| `here` | `<!here>` | only the **currently active** members of the channel |
+| `everyone` | `<!everyone>` | everyone in the workspace — **only appropriate for `#general`** |
+| `none` | *(none)* | disables critical mentions entirely |
+
+Rules:
+
+- The mention is added **only** when the alert contains at least one **new or
+  reopened P0** issue, and then exactly once, in the first line (so it is
+  present in both the plain-text fallback and the first mrkdwn block).
+- **Unchanged-only** and **resolved-only** alerts carry no mention.
+- **Run summaries never contain a broad mention**, and neither do ordinary
+  informational or failure messages.
+- The literal string `@all` is never emitted.
+- An invalid value is a **configuration error** (`validate-config` fails) —
+  the runner never silently falls back to a different mention type. Use
+  `none` to switch mentions off.
+- **Slack workspace permissions may restrict broad mentions.** If the posting
+  identity is not allowed to use `@channel`/`@here`, Slack still delivers the
+  message but renders the mention as plain text without notifying anyone.
+
+### Message format
+
+A critical alert is one short message: header (with the mention when it
+applies), project name (falling back to the normalized domain), P0 counts,
+**at most 5** issues — each one line of title + page type, the URL, and the
+canonical fix hint capped at 180 characters — a `+ N more critical issues`
+remainder when there are more, a compact technical line
+(`Robots … | Sitemap … | News sitemap …`) read from the completed audit's
+`siteChecks`, and the first 8 characters of the audit run ID. Full IDs stay in
+the persisted notification row (`notifications show`). `SLACK_MAX_ISSUES_PER_MESSAGE`
+still applies below the hard cap of 5; `SLACK_MAX_MESSAGE_CHARACTERS` remains
+the safety bound. mrkdwn is escaped and blocks always accompany a populated
 plain-text fallback.
+
+Run summaries are equally compact: audited/failed/timed-out/skipped, the
+critical totals, per-check robots/sitemap/news-sitemap aggregates over the
+successfully completed audits, and duration plus the short execution ID.
+Zero-valued operational counters (duplicates skipped, unknown trigger
+outcomes, failed Slack notifications) appear only when non-zero. **A run in
+which no audit completed says so explicitly** and omits both the critical
+verdict and the technical aggregates — no completed audit means no
+current-critical-state conclusion was produced.
 
 ## Usage
 

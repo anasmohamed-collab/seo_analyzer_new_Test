@@ -16,7 +16,13 @@
 
 import { fingerprintIssue, sha256Hex } from './fingerprint.js';
 import { normalizeDomainKey } from './normalizeDomain.js';
-import { buildProjectMessages, buildRunSummaryMessage } from './slackFormat.js';
+import {
+  addTechnicalResult,
+  buildProjectMessages,
+  buildRunSummaryMessage,
+  createTechnicalAggregate,
+  criticalMentionToken,
+} from './slackFormat.js';
 import { SlackPermanentError } from './slackClient.js';
 
 export const ALERT_MODES = ['new_or_regressed', 'all_current', 'summary_only', 'disabled'];
@@ -106,6 +112,10 @@ export function createNotificationPipeline({
   const slackActive = Boolean(slackSender) && !notificationsDisabled && alertMode !== 'disabled';
   const counters = { delivered: 0, failed: 0, permanentFailures: 0, notRequired: 0, alreadyDelivered: 0 };
   const lifecycleTotals = { new: 0, reopened: 0, unchanged: 0, resolved: 0, currentP0: 0, projectsWithCritical: 0 };
+  // Robots / XML sitemap / News sitemap counts, aggregated from SUCCESSFULLY
+  // COMPLETED audits only — a failed, timed-out, skipped, or structurally
+  // incomplete audit is never folded in (and so never counted as "Missing").
+  const technicalTotals = createTechnicalAggregate();
 
   /**
    * Persist the notification identity, then send all messages, then mark the
@@ -166,6 +176,7 @@ export function createNotificationPipeline({
     alertMode,
     counters,
     lifecycleTotals,
+    technicalTotals,
 
     /**
      * Called by the orchestrator after each COMPLETED audit.
@@ -211,17 +222,29 @@ export function createNotificationPipeline({
       lifecycleTotals.currentP0 += counts.current;
       if (counts.current > 0) lifecycleTotals.projectsWithCritical++;
 
+      // Technical checks come from THIS completed audit result only — the
+      // notification layer never re-fetches robots.txt or a sitemap.
+      addTechnicalResult(technicalTotals, results.siteChecks ?? null);
+
       let notificationStatus = 'not-required';
       if (slackActive && shouldNotify(alertMode, counts)) {
+        // A channel-wide mention is for genuinely NEW or REOPENED P0 issues.
+        // Unchanged-only and resolved-only alerts never page the channel.
+        const mention =
+          counts.new + counts.reopened > 0
+            ? criticalMentionToken(config.slackCriticalMention ?? 'channel')
+            : null;
         const messages = buildProjectMessages({
           projectName: project.project_name ?? project.name ?? null,
-          domain: project.domain ?? null,
+          domain: project.domain ?? project.website_url ?? null,
           projectId: project.id,
           auditRunId,
           auditCompletedAt: results.finished_at ?? null,
           dashboardUrl: config.dashboardUrl ?? null,
           lifecycle,
           mode: alertMode,
+          siteChecks: results.siteChecks ?? null,
+          mention,
           maxIssuesPerMessage: config.slackMaxIssuesPerMessage,
           maxMessageCharacters: config.slackMaxMessageCharacters,
         });
@@ -250,7 +273,9 @@ export function createNotificationPipeline({
         startedAt,
         finishedAt,
         durationMs: Date.parse(finishedAt) - Date.parse(startedAt),
-        totals,
+        // Run summaries never carry a broad mention. The technical aggregate
+        // is the pipeline's own count of successfully completed audits.
+        totals: { ...totals, technical: totals?.technical ?? technicalTotals },
       });
       return persistAndSend({
         type: 'run_summary',
