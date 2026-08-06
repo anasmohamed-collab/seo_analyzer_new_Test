@@ -23,3 +23,8 @@ backend/dist
 *.sw?
 .env.local
 !.env.example
+
+# CLI run artifacts written by --json (audit-config:discover, smacient:gsc-sync)
+/*-apply-summary.json
+/*-dry-run-summary.json
+/*-sync-summary.json

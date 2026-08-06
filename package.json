@@ -17,7 +17,8 @@
     "typecheck": "tsc --noEmit -p tsconfig.app.json",
     "typecheck:backend": "tsc --noEmit -p backend/tsconfig.json",
     "db:migrate": "node scripts/migrate.js",
-    "smacient:gsc-sync": "npm run build:backend && node backend/dist/scripts/smacientGscSync.js"
+    "smacient:gsc-sync": "npm run build:backend && node backend/dist/scripts/smacientGscSync.js",
+    "audit-config:discover": "npm run build:backend && node backend/dist/scripts/auditConfigDiscover.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.98.0",
