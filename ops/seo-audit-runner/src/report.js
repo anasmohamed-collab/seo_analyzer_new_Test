@@ -13,6 +13,7 @@ export const OUTCOME = Object.freeze({
   COMPLETED: 'COMPLETED',
   FAILED: 'FAILED',
   TIMED_OUT: 'TIMED_OUT',
+  INELIGIBLE: 'INELIGIBLE',
   SKIPPED_MISSING_AUDIT_CONFIG: 'SKIPPED_MISSING_AUDIT_CONFIG',
   SKIPPED_ALREADY_RUNNING: 'SKIPPED_ALREADY_RUNNING',
   DEDUPLICATED: 'DEDUPLICATED',
@@ -51,6 +52,7 @@ export function summarize(report) {
     dryRunReady: counts[OUTCOME.DRY_RUN_READY] ?? 0,
     deduplicated: counts[OUTCOME.DEDUPLICATED] ?? 0,
     skipped:
+      (counts[OUTCOME.INELIGIBLE] ?? 0) +
       (counts[OUTCOME.SKIPPED_MISSING_AUDIT_CONFIG] ?? 0) +
       (counts[OUTCOME.SKIPPED_ALREADY_RUNNING] ?? 0),
     failures: [...FAILURE_OUTCOMES].reduce((sum, o) => sum + (counts[o] ?? 0), 0),

@@ -39,7 +39,7 @@ function stubClient(over = {}) {
     startAudit: async (body) => {
       calls.startAudit.push(body);
       if (over.startAudit) return over.startAudit(body);
-      return { siteId: 's1', auditRunId: 'r1' };
+      return { siteId: body.expectedProjectId, auditRunId: 'r1' };
     },
     getRunResults: async (id) => {
       calls.getRunResults.push(id);
@@ -74,7 +74,7 @@ test('completed audit: polls until COMPLETED and extracts P0 issues', async () =
   assert.equal(report.entries.length, 1);
   assert.equal(report.entries[0].outcome, OUTCOME.COMPLETED);
   assert.equal(report.entries[0].auditRunId, 'r1');
-  assert.equal(report.entries[0].siteId, 's1');
+  assert.equal(report.entries[0].siteId, 'p1');
   assert.equal(report.entries[0].criticalCount, 2);
   assert.equal(report.criticalIssues.length, 2);
   assert.ok(apiClient.calls.getRunResults.length >= 3);
@@ -105,13 +105,13 @@ test('running_count > 0 skips the audit and never POSTs', async () => {
   assert.equal(apiClient.calls.startAudit.length, 0);
 });
 
-test('missing audit config skips with SKIPPED_MISSING_AUDIT_CONFIG', async () => {
+test('missing stored audit config is ineligible', async () => {
   const apiClient = stubClient({
     projects: [project({ last_form_values: null })],
     getRunResults: () => ({ status: 'COMPLETED', results: [] }),
   });
   const report = await runAudits({ config: fastConfig, apiClient, options: {} });
-  assert.equal(report.entries[0].outcome, OUTCOME.SKIPPED_MISSING_AUDIT_CONFIG);
+  assert.equal(report.entries[0].outcome, OUTCOME.INELIGIBLE);
   assert.equal(apiClient.calls.startAudit.length, 0);
 });
 
@@ -121,7 +121,10 @@ test('duplicates are reported and only the winner is audited', async () => {
     id: 'b',
     domain: 'www.example.com',
     website_url: 'https://www.example.com',
-    last_form_values: null,
+    last_form_values: {
+      homeUrl: 'https://www.example.com',
+      articleUrl: 'https://example.com/a',
+    },
   });
   const apiClient = stubClient({
     projects: [winner, loser],
@@ -190,7 +193,15 @@ test('an ambiguous trigger is verified with read-only calls only, never a second
 
 test('repeated ambiguous triggers still POST once per project and never retry', async () => {
   const apiClient = stubClient({
-    projects: [project({ id: 'p1' }), project({ id: 'p2', domain: 'other.com', website_url: 'https://other.com' })],
+    projects: [
+      project({ id: 'p1' }),
+      project({
+        id: 'p2',
+        domain: 'other.com',
+        website_url: 'https://other.com',
+        last_form_values: { homeUrl: 'https://other.com', articleUrl: 'https://other.com/a' },
+      }),
+    ],
     startAudit: () => {
       throw new AmbiguousTriggerError('socket hang up');
     },
@@ -231,6 +242,7 @@ test('dry run performs zero POST requests (verified through a real ApiClient)', 
   assert.deepEqual(report.entries[0].proposedRequest, {
     homeUrl: 'https://example.com',
     articleUrl: 'https://example.com/a',
+    expectedProjectId: 'p1',
   });
   assert.ok(requests.length > 0);
   assert.ok(
@@ -241,12 +253,40 @@ test('dry run performs zero POST requests (verified through a real ApiClient)', 
 
 test('run --project filters to that single project', async () => {
   const apiClient = stubClient({
-    projects: [project({ id: 'p1' }), project({ id: 'p2', domain: 'other.com', website_url: 'https://other.com' })],
+    projects: [
+      project({ id: 'p1' }),
+      project({
+        id: 'p2',
+        domain: 'other.com',
+        website_url: 'https://other.com',
+        last_form_values: { homeUrl: 'https://other.com', articleUrl: 'https://other.com/a' },
+      }),
+    ],
     getRunResults: () => ({ status: 'COMPLETED', results: [] }),
   });
   const report = await runAudits({ config: fastConfig, apiClient, options: { projectId: 'p2' } });
   assert.equal(report.entries.length, 1);
   assert.equal(report.entries[0].projectId, 'p2');
+});
+
+test('trigger request is project-bound and a returned site mismatch stops polling and lifecycle updates', async () => {
+  let lifecycleCalls = 0;
+  const apiClient = stubClient({
+    startAudit: () => ({ siteId: 'wrong-project', auditRunId: 'r1' }),
+    getRunResults: () => ({ status: 'COMPLETED', results: [] }),
+  });
+  const report = await runAudits({
+    config: fastConfig,
+    apiClient,
+    options: { onProjectCompleted: () => { lifecycleCalls++; } },
+  });
+
+  assert.equal(apiClient.calls.startAudit.length, 1);
+  assert.equal(apiClient.calls.startAudit[0].expectedProjectId, 'p1');
+  assert.equal(report.entries[0].outcome, OUTCOME.RUNNER_ERROR);
+  assert.match(report.entries[0].detail, /SAFETY FAILURE/);
+  assert.equal(apiClient.calls.getRunResults.length, 0);
+  assert.equal(lifecycleCalls, 0);
 });
 
 test('unknown --project id throws a runner-level error', async () => {

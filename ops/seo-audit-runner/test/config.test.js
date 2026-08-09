@@ -11,6 +11,10 @@ test('defaults apply when env is empty', () => {
   assert.equal(config.pollTimeoutMs, 900000);
   assert.equal(config.httpRequestTimeoutMs, 30000);
   assert.equal(config.logLevel, 'info');
+  assert.deepEqual([...config.includeProjectIds], []);
+  assert.deepEqual([...config.excludeProjectIds], []);
+  assert.equal(config.excludeNonproduction, true);
+  assert.equal(config.requireStoredConfig, true);
   assert.equal(config.notificationsEnabled, false);
   assert.equal(config.slackWebhookUrl, null);
 });
@@ -56,6 +60,22 @@ test('invalid numbers and log level are rejected', () => {
   assert.throws(() => loadConfig({ RUNNER_CONCURRENCY: '0' }), ConfigError);
   assert.throws(() => loadConfig({ POLL_INTERVAL_MS: '-5' }), ConfigError);
   assert.throws(() => loadConfig({ RUNNER_LOG_LEVEL: 'loud' }), ConfigError);
+});
+
+test('project include/exclude configuration is parsed and malformed IDs are rejected', () => {
+  const config = loadConfig({
+    RUNNER_INCLUDE_PROJECT_IDS: 'p1, p2,p1',
+    RUNNER_EXCLUDE_PROJECT_IDS: 'p2:pinned',
+    RUNNER_EXCLUDE_NONPRODUCTION: 'false',
+    RUNNER_REQUIRE_STORED_CONFIG: 'false',
+  });
+  assert.deepEqual([...config.includeProjectIds], ['p1', 'p2']);
+  assert.deepEqual([...config.excludeProjectIds], ['p2:pinned']);
+  assert.equal(config.excludeNonproduction, false);
+  assert.equal(config.requireStoredConfig, false);
+  assert.throws(() => loadConfig({ RUNNER_INCLUDE_PROJECT_IDS: 'p1, bad id' }), ConfigError);
+  assert.throws(() => loadConfig({ RUNNER_EXCLUDE_NONPRODUCTION: 'sometimes' }), ConfigError);
+  assert.throws(() => loadConfig({ RUNNER_REQUIRE_STORED_CONFIG: 'typo' }), ConfigError);
 });
 
 test('notifications enabled requires a webhook URL', () => {
