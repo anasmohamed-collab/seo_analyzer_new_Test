@@ -20,6 +20,8 @@
  */
 
 import { isBotProtectionPage } from '../fetch/fetchEngine.js';
+import { fetchWithSafeRedirects } from '../../../../shared/outbound-url-safety.js';
+import type { OutboundHostResolver } from '../../../../shared/outbound-url-safety.js';
 
 // ── Public types ──────────────────────────────────────────────────
 
@@ -101,25 +103,11 @@ export interface AnalyzeRobotsTxtOptions {
   maxBytes?: number;
   /** Injected fetch (testability). */
   fetchFn?: typeof fetch;
+  /** Injected A/AAAA resolver (testability). */
+  resolver?: OutboundHostResolver;
 }
 
-// ── SSRF guard (self-contained — keeps this module isolated) ──────
-
-const PRIVATE_RANGES = [
-  /^127\./, /^10\./, /^172\.(1[6-9]|2\d|3[01])\./,
-  /^192\.168\./, /^169\.254\./, /^0\./, /^localhost$/i, /^\[::1\]$/, /^::1$/,
-];
-
-function isSafeUrl(raw: string): boolean {
-  try {
-    const u = new URL(raw);
-    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
-    for (const re of PRIVATE_RANGES) if (re.test(u.hostname)) return false;
-    return true;
-  } catch {
-    return false;
-  }
-}
+// Outbound URL safety is enforced by the redirect-aware fetch helper below.
 
 // ── Parsing model ─────────────────────────────────────────────────
 
@@ -683,15 +671,17 @@ async function fetchRobotsTxt(url: string, opts: AnalyzeRobotsTxtOptions): Promi
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-      const res = await fetchFn(url, {
-        redirect: 'follow',
-        signal: ctrl.signal,
-        headers: { 'User-Agent': profile.ua, 'Accept': 'text/plain,*/*' },
-      });
+      const { response: res, finalUrl } = await fetchWithSafeRedirects(
+        url,
+        {
+          signal: ctrl.signal,
+          headers: { 'User-Agent': profile.ua, 'Accept': 'text/plain,*/*' },
+        },
+        { fetchFn, resolver: opts.resolver },
+      );
       const ct = res.headers.get('content-type') ?? '';
       const raw = await res.text();
       const body = raw.length > maxBytes ? raw.slice(0, maxBytes) : raw;
-      const finalUrl = res.url || url;
 
       if (isBotProtectionPage(body)) {
         last = { ok: false, status: res.status, finalUrl, contentType: ct, body: '', failureKind: 'waf_challenge' };
@@ -725,7 +715,7 @@ export async function analyzeRobotsTxt(options: AnalyzeRobotsTxtOptions = {}): P
   }
 
   const result = emptyResult(url, autoDetected);
-  if (!url || !isSafeUrl(url)) {
+  if (!url) {
     result.issues.push({
       severity: 'critical', priority: 'top_critical', type: 'robots_txt_not_accessible',
       message: 'robots.txt could not be located: no valid Robots.txt URL was provided and it could not be derived from the Home URL.',

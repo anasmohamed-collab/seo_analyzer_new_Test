@@ -11,6 +11,8 @@
  * sitemap-discovery.js to avoid duplicate fetching.
  */
 
+import { safeFetch as fetch } from '../../../shared/outbound-url-safety.js';
+
 const NEWS_FRESHNESS_HOURS = 48;
 const MAX_NEWS_URLS = 1000;
 const MAX_SITEMAPS_TO_PARSE = 20;

@@ -27,21 +27,7 @@ export const auditRunsRouter = Router();
 const PAGE_TIMEOUT = 30_000;
 const VALID_TYPES = ['home', 'section', 'article', 'search', 'tag', 'author', 'video_article'] as const;
 
-// ── SSRF guard ──────────────────────────────────────────────────
-
-const PRIVATE_RANGES = [
-  /^127\./, /^10\./, /^172\.(1[6-9]|2\d|3[01])\./,
-  /^192\.168\./, /^169\.254\./, /^0\./, /^localhost$/i, /^\[::1\]$/,
-];
-
-function isSafeUrl(raw: string): boolean {
-  try {
-    const u = new URL(raw);
-    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
-    for (const re of PRIVATE_RANGES) { if (re.test(u.hostname)) return false; }
-    return true;
-  } catch { return false; }
-}
+// Outbound URL safety is enforced inside the shared fetch engine.
 
 // ── Page state classification ───────────────────────────────────
 //
@@ -116,11 +102,6 @@ async function auditSingleUrl(
   seenTitles: Set<string>,
   seedType?: string,
 ): Promise<Record<string, unknown>> {
-  if (!isSafeUrl(url)) {
-    return { url, error: 'Blocked by SSRF guard', status: 'FAIL', page_state: 'FETCH_ERROR',
-      recommendations: ['URL blocked by security policy'] };
-  }
-
   // ── Multi-profile fetch (Chrome → Firefox → Googlebot → Scrapling) ──────────
   const fetchResult = await runFetchEngine(url, { timeoutMs: PAGE_TIMEOUT });
 
