@@ -24,6 +24,7 @@ import {
   criticalMentionToken,
 } from './slackFormat.js';
 import { SlackPermanentError } from './slackClient.js';
+import { evaluateAuditEvidence } from './evidenceGate.js';
 
 export const ALERT_MODES = ['new_or_regressed', 'all_current', 'summary_only', 'disabled'];
 
@@ -42,57 +43,11 @@ export function shouldNotify(mode, counts) {
   return counts.current > 0 || changes > 0;
 }
 
-function isInterpretableRecommendations(value) {
-  if (value == null) return true; // stored as NULL when a row has no recommendations
-  if (Array.isArray(value)) return true;
-  if (typeof value === 'string') {
-    try {
-      return Array.isArray(JSON.parse(value));
-    } catch {
-      return false; // truncated / partially parsed JSON — ambiguous
-    }
-  }
-  return false;
-}
-
 /**
- * Explicit completed-payload validation for GET /api/audit-runs/:id/results.
- *
- * A payload is complete when:
- *  - it is a structurally valid response object (not an error payload)
- *  - status is exactly 'COMPLETED'
- *  - the `results` collection is present as an array — an EMPTY array is
- *    valid: a clean completed audit with zero P0 issues must be able to
- *    resolve previously active issues ("at least one result exists" is NOT
- *    used as proof of completeness)
- *  - every page row and `siteRecommendations` can be safely interpreted
- *  - the payload's run ID matches the expected audit run, where available
- *
- * FAILED / RUNNING / missing-status / malformed / error / ambiguous payloads
- * are all incomplete — they never resolve issues and never replace a valid
- * previous snapshot.
+ * Boolean compatibility wrapper around the evidence evaluator.
  */
-export function isCompleteAuditPayload(payload, { expectedAuditRunId = null } = {}) {
-  if (payload == null || typeof payload !== 'object' || Array.isArray(payload)) return false;
-  if (payload.error != null) return false; // API error payload
-  if (payload.status !== 'COMPLETED') return false; // FAILED / RUNNING / PENDING / missing
-  if (!Array.isArray(payload.results)) return false; // collection must exist (may be empty)
-
-  for (const row of payload.results) {
-    if (row == null || typeof row !== 'object' || Array.isArray(row)) return false;
-    if (!isInterpretableRecommendations(row.recommendations)) return false;
-  }
-  if (!isInterpretableRecommendations(payload.siteRecommendations)) return false;
-
-  // The API includes the run id in the response; verify it where available.
-  if (
-    expectedAuditRunId != null &&
-    payload.id != null &&
-    String(payload.id) !== String(expectedAuditRunId)
-  ) {
-    return false;
-  }
-  return true;
+export function isCompleteAuditPayload(payload, options = {}) {
+  return evaluateAuditEvidence(payload, options).complete;
 }
 
 function retryDelayMs(attemptCount) {
@@ -183,15 +138,32 @@ export function createNotificationPipeline({
      * Updates issue lifecycle state atomically, then dispatches the project
      * notification when the alert mode requires it.
      */
-    async handleProjectCompleted({ project, auditRunId, results, criticalIssues }) {
-      // Guard: only a structurally complete COMPLETED payload may update
-      // lifecycle state. A clean audit with ZERO current P0 issues (and even
-      // zero page rows) is complete and MUST resolve previously active issues.
-      if (!isCompleteAuditPayload(results, { expectedAuditRunId: auditRunId })) {
+    async handleProjectCompleted({
+      project,
+      siteId,
+      auditRunId,
+      results,
+      criticalIssues,
+      submittedUrls,
+    }) {
+      const evidence = evaluateAuditEvidence(results, {
+        expectedAuditRunId: auditRunId,
+        expectedProjectId: project.id,
+        submittedUrls,
+      });
+      if (!evidence.complete || String(siteId) !== String(project.id)) {
+        if (String(siteId) !== String(project.id)) {
+          evidence.reasons.push('trigger site identity does not match the selected project');
+        }
         logger?.warn?.(
-          `Project ${project.id}: result payload is incomplete or invalid — snapshot and issue state NOT updated`,
+          `Project ${project.id}: incomplete evidence — snapshot and issue state NOT updated: ` +
+            evidence.reasons.join('; '),
         );
-        return { notificationStatus: 'skipped-partial-results' };
+        return {
+          evidenceComplete: false,
+          evidenceReasons: [...new Set(evidence.reasons)],
+          notificationStatus: 'skipped-incomplete-evidence',
+        };
       }
 
       const issues = criticalIssues.map((issue) => ({
@@ -262,7 +234,7 @@ export function createNotificationPipeline({
         }
       }
 
-      return { lifecycleCounts: counts, notificationStatus };
+      return { evidenceComplete: true, lifecycleCounts: counts, notificationStatus };
     },
 
     /** Optional end-of-execution summary (SEO_RUNNER_SEND_RUN_SUMMARY). */

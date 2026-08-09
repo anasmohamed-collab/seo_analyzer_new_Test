@@ -581,7 +581,7 @@ auditRunsRouter.get('/audit-runs/:id/results', async (req: Request, res: Respons
     const siteRecs = scoreSiteChecks(run.site_checks as Parameters<typeof scoreSiteChecks>[0]);
 
     res.json({
-      id: run.id, status: run.status,
+      id: run.id, siteId: run.site_id, status: run.status, finished_at: run.finished_at,
       siteChecks: run.site_checks,
       siteRecommendations: siteRecs,
       resultsByType: grouped,

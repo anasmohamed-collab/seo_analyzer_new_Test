@@ -49,6 +49,22 @@ const pool = {
   connect: vi.fn(async () => client),
   async query(sql: string, params: unknown[] = []) {
     backgroundSql.push(sql);
+    if (/SELECT \* FROM audit_runs WHERE id/i.test(sql)) {
+      return {
+        rows: [{
+          id: String(params[0]),
+          site_id: 'project-1',
+          status: 'COMPLETED',
+          finished_at: '2026-08-09T12:00:00.000Z',
+          site_checks: {
+            robots: { status: 'FOUND' },
+            sitemap: { status: 'FOUND' },
+            newsSitemap: { status: 'NOT_FOUND' },
+          },
+        }],
+      };
+    }
+    if (/SELECT \* FROM audit_results/i.test(sql)) return { rows: [] };
     if (/INSERT INTO audit_results/i.test(sql)) insertedResultUrls.push(String(params[1]));
     return { rows: [] };
   },
@@ -211,5 +227,18 @@ describe('POST /api/technical-analyzer/run project binding', () => {
     dbAvailable = false;
     const res = await startAudit(boundRequest);
     expect(res.status).toBe(503);
+  });
+});
+
+describe('GET /api/audit-runs/:id/results evidence identity', () => {
+  it('returns the owning site identity with the audit identity', async () => {
+    const res = await fetch(`${base}/api/audit-runs/run-proof/results`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      id: 'run-proof',
+      siteId: 'project-1',
+      status: 'COMPLETED',
+      finished_at: '2026-08-09T12:00:00.000Z',
+    });
   });
 });

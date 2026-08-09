@@ -289,6 +289,30 @@ test('trigger request is project-bound and a returned site mismatch stops pollin
   assert.equal(lifecycleCalls, 0);
 });
 
+test('incomplete lifecycle evidence is reported as an operational failure', async () => {
+  const apiClient = stubClient({
+    getRunResults: () => ({ status: 'COMPLETED', results: [] }),
+  });
+  const report = await runAudits({
+    config: fastConfig,
+    apiClient,
+    options: {
+      onProjectCompleted: () => ({
+        evidenceComplete: false,
+        evidenceReasons: ['submitted article has no result'],
+        notificationStatus: 'skipped-incomplete-evidence',
+      }),
+    },
+  });
+
+  assert.equal(report.entries[0].outcome, OUTCOME.INCOMPLETE_EVIDENCE);
+  assert.match(report.entries[0].detail, /lifecycle state preserved/);
+  assert.deepEqual(report.entries[0].evidence, {
+    complete: false,
+    reasons: ['submitted article has no result'],
+  });
+});
+
 test('unknown --project id throws a runner-level error', async () => {
   const apiClient = stubClient({ getRunResults: () => ({ status: 'COMPLETED', results: [] }) });
   await assert.rejects(

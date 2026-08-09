@@ -143,7 +143,7 @@ test('failed audit does not resolve issues (guarded by status)', async () => {
   const store = new StateStore(db);
   apply(store, [issue()], 'r1');
   const outcome = await pipelineWith(store, { status: 'FAILED', results: [{ url: 'x' }] });
-  assert.equal(outcome.notificationStatus, 'skipped-partial-results');
+  assert.equal(outcome.notificationStatus, 'skipped-incomplete-evidence');
   assert.equal(store.listActiveIssues('p1').length, 1, 'issue must stay ACTIVE');
   assert.equal(store.getLatestSnapshot('p1').audit_run_id, 'r1', 'snapshot must not be replaced');
   db.close();
@@ -154,7 +154,7 @@ test('timed-out audit does not resolve issues (no results payload)', async () =>
   const store = new StateStore(db);
   apply(store, [issue()], 'r1');
   const outcome = await pipelineWith(store, undefined);
-  assert.equal(outcome.notificationStatus, 'skipped-partial-results');
+  assert.equal(outcome.notificationStatus, 'skipped-incomplete-evidence');
   assert.equal(store.listActiveIssues('p1').length, 1);
   db.close();
 });
@@ -175,22 +175,22 @@ test('malformed or ambiguous payloads do not replace a valid snapshot', async ()
   ];
   for (const payload of badPayloads) {
     const outcome = await pipelineWith(store, payload);
-    assert.equal(outcome.notificationStatus, 'skipped-partial-results', JSON.stringify(payload));
+    assert.equal(outcome.notificationStatus, 'skipped-incomplete-evidence', JSON.stringify(payload));
   }
   assert.equal(store.getLatestSnapshot('p1').audit_run_id, 'r1');
   assert.equal(store.listActiveIssues('p1').length, 1);
   db.close();
 });
 
-test('a clean COMPLETED audit (zero P0, empty results array) DOES resolve previous issues', async () => {
+test('COMPLETED with zero page results is incomplete and preserves previous issues', async () => {
   const db = openStateDb(tmpDb());
   const store = new StateStore(db);
   apply(store, [issue()], 'r1');
   const outcome = await pipelineWith(store, { status: 'COMPLETED', results: [], siteRecommendations: [] });
-  assert.notEqual(outcome.notificationStatus, 'skipped-partial-results');
-  assert.deepEqual(outcome.lifecycleCounts, { new: 0, reopened: 0, unchanged: 0, resolved: 1, current: 0 });
-  assert.equal(store.listActiveIssues('p1').length, 0);
-  assert.equal(store.getLatestSnapshot('p1').audit_run_id, 'r-next');
+  assert.equal(outcome.notificationStatus, 'skipped-incomplete-evidence');
+  assert.equal(outcome.lifecycleCounts, undefined);
+  assert.equal(store.listActiveIssues('p1').length, 1);
+  assert.equal(store.getLatestSnapshot('p1').audit_run_id, 'r1');
   db.close();
 });
 

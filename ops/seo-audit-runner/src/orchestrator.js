@@ -235,7 +235,18 @@ export async function runAudits({ config, apiClient, logger = null, options = {}
             auditRunId: trigger.auditRunId,
             results: polled.results,
             criticalIssues: criticals,
+            submittedUrls: built.body,
           });
+          if (outcome?.evidenceComplete === false) {
+            completedEntry.outcome = OUTCOME.INCOMPLETE_EVIDENCE;
+            completedEntry.detail = `lifecycle state preserved: ${outcome.evidenceReasons.join('; ')}`;
+            completedEntry.evidence = {
+              complete: false,
+              reasons: outcome.evidenceReasons,
+            };
+          } else if (outcome?.evidenceComplete === true) {
+            completedEntry.evidence = { complete: true, reasons: [] };
+          }
           if (outcome?.lifecycleCounts) completedEntry.lifecycle = outcome.lifecycleCounts;
           if (outcome?.notificationStatus) completedEntry.notification = outcome.notificationStatus;
           if (['failed-will-retry', 'permanent-failure'].includes(outcome?.notificationStatus)) {

@@ -55,6 +55,7 @@ test('exit 2 when an audit failed, timed out, or trigger outcome is unknown', ()
     OUTCOME.TRIGGER_FAILED,
     OUTCOME.TRIGGER_OUTCOME_UNKNOWN,
     OUTCOME.RUNNER_ERROR,
+    OUTCOME.INCOMPLETE_EVIDENCE,
   ]) {
     const report = reportWith([entry(OUTCOME.COMPLETED), entry(outcome, { projectId: 'p2' })]);
     assert.equal(computeExitCode(report), EXIT_CODES.AUDIT_FAILURES, outcome);
