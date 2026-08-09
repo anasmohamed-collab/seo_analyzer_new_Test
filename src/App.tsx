@@ -4,20 +4,11 @@ import ProjectSelector from './components/ProjectSelector';
 import ProjectsPage from './components/ProjectsPage';
 import AuditHistoryPanel from './components/AuditHistoryPanel';
 import type { Project, ProjectFormValues } from './components/ProjectSelector';
+import type { AuditRunData } from './types/audit';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '';
 
 type AppView = 'analyzer' | 'projects';
-
-// Must match the AuditRunData interface in SEOAgent.tsx
-interface AuditRunData {
-  id: string;
-  status: string;
-  siteChecks: Record<string, unknown> | null;
-  siteRecommendations: unknown[];
-  resultsByType: Record<string, unknown[]>;
-  results: unknown[];
-}
 
 export default function App() {
   const [view, setView] = useState<AppView>('analyzer');
