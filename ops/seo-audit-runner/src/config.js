@@ -29,6 +29,7 @@ const LOG_LEVELS = ['error', 'warn', 'info', 'debug'];
 const DEFAULTS = {
   SEO_API_BASE_URL: 'http://localhost:3000',
   RUNNER_CONCURRENCY: '1',
+  RUNNER_MAX_JOBS_PER_TICK: '6',
   POLL_INTERVAL_MS: '5000',
   POLL_TIMEOUT_MS: '900000',
   HTTP_REQUEST_TIMEOUT_MS: '30000',
@@ -183,6 +184,7 @@ export function loadConfig(env = process.env) {
     return value;
   };
   const runnerConcurrency = parsePositiveInt('RUNNER_CONCURRENCY');
+  const runnerMaxJobsPerTick = parsePositiveInt('RUNNER_MAX_JOBS_PER_TICK');
   const pollIntervalMs = parsePositiveInt('POLL_INTERVAL_MS', { min: 100 });
   const pollTimeoutMs = parsePositiveInt('POLL_TIMEOUT_MS', { min: 1000 });
   const httpRequestTimeoutMs = parsePositiveInt('HTTP_REQUEST_TIMEOUT_MS', { min: 1000 });
@@ -288,6 +290,7 @@ export function loadConfig(env = process.env) {
     apiBaseUrl,
     apiBaseUrlRedacted: redactUrl(apiBaseUrl).replace(/\/+$/, ''),
     runnerConcurrency,
+    runnerMaxJobsPerTick,
     pollIntervalMs,
     pollTimeoutMs,
     httpRequestTimeoutMs,

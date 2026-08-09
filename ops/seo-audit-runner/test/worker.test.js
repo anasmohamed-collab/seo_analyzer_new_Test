@@ -151,6 +151,67 @@ test('lock contention (exit 4) defers the job and stops the tick', async () => {
   db.close();
 });
 
+test('a single-project running-audit collision defers, refunds, and succeeds next tick', async () => {
+  const { db, jobStore, scheduleStore } = fixture();
+  const job = jobStore.create({ projectId: 'p1', requestedBy: 'schedule' });
+  let execution = 0;
+  const exec = async () => {
+    execution += 1;
+    return execution === 1
+      ? {
+          exitCode: 0,
+          stderr: '',
+          report: {
+            entries: [{ projectId: 'p1', outcome: 'SKIPPED_ALREADY_RUNNING' }],
+          },
+        }
+      : {
+          exitCode: 0,
+          stderr: '',
+          report: { entries: [{ projectId: 'p1', outcome: 'COMPLETED' }] },
+        };
+  };
+
+  const first = await workerTick({ scheduleStore, jobStore, executeJob: exec });
+  assert.equal(first.deferred, 1);
+  assert.equal(jobStore.get(job.id).status, JOB_STATUS.QUEUED);
+  assert.equal(jobStore.get(job.id).attempts, 0, 'temporary defer refunds the lease attempt');
+  assert.match(jobStore.get(job.id).error, /already has a running audit/);
+
+  const second = await workerTick({ scheduleStore, jobStore, executeJob: exec });
+  assert.equal(second.succeeded, 1);
+  assert.equal(jobStore.get(job.id).status, JOB_STATUS.SUCCEEDED);
+  assert.equal(jobStore.get(job.id).attempts, 1);
+  db.close();
+});
+
+test('an all-project job with partial completion is never blindly replayed', async () => {
+  const { db, jobStore, scheduleStore } = fixture();
+  const job = jobStore.create({ projectId: null, requestedBy: 'schedule' });
+  const exec = stubExec(0);
+  exec.calls.length = 0;
+  const executeJob = async (claimed) => {
+    exec.calls.push(claimed);
+    return {
+      exitCode: 0,
+      stderr: '',
+      report: {
+        entries: [
+          { projectId: 'p1', outcome: 'COMPLETED' },
+          { projectId: 'p2', outcome: 'SKIPPED_ALREADY_RUNNING' },
+        ],
+      },
+    };
+  };
+
+  const summary = await workerTick({ scheduleStore, jobStore, executeJob });
+  assert.equal(summary.deferred, 0);
+  assert.equal(summary.succeeded, 1);
+  assert.equal(jobStore.get(job.id).status, JOB_STATUS.SUCCEEDED);
+  assert.equal(exec.calls.length, 1);
+  db.close();
+});
+
 test('a tick recovers interrupted RUNNING jobs before executing', async () => {
   const { db, jobStore } = fixture();
   const scheduleStore = new ScheduleStore(db);
@@ -171,6 +232,15 @@ test('maxJobs bounds one tick', async () => {
   const summary = await workerTick({ scheduleStore, jobStore, executeJob: exec, maxJobs: 2 });
   assert.equal(summary.executed, 2);
   assert.equal(jobStore.list({ status: JOB_STATUS.QUEUED }).length, 3);
+  db.close();
+});
+
+test('the conservative default bounds a tick to six jobs', async () => {
+  const { db, jobStore, scheduleStore } = fixture();
+  for (let i = 0; i < 8; i += 1) jobStore.create({ projectId: `default-${i}` });
+  const summary = await workerTick({ scheduleStore, jobStore, executeJob: stubExec(0) });
+  assert.equal(summary.executed, 6);
+  assert.equal(jobStore.list({ status: JOB_STATUS.QUEUED }).length, 2);
   db.close();
 });
 

@@ -46,6 +46,26 @@ test('migrations are idempotent and versioned', () => {
   db.close();
 });
 
+test('abandoned automation execution rows are recovered as failure-bearing history', () => {
+  const db = openStateDb(tmpDb());
+  const store = new StateStore(db);
+  store.createRun({ id: 'abandoned', startedAt: '2026-08-09T10:00:00.000Z' });
+  store.createRun({ id: 'finished', startedAt: '2026-08-09T09:00:00.000Z' });
+  store.finishRun('finished', {
+    completedAt: '2026-08-09T09:05:00.000Z',
+    finalStatus: 'COMPLETED',
+  });
+
+  const recovered = store.recoverAbandonedRuns({ completedAt: '2026-08-09T11:00:00.000Z' });
+  assert.deepEqual(recovered, ['abandoned']);
+  const abandoned = db.prepare('SELECT * FROM automation_runs WHERE id = ?').get('abandoned');
+  assert.equal(abandoned.final_status, 'FAILED');
+  assert.equal(abandoned.completed_at, '2026-08-09T11:00:00.000Z');
+  assert.match(abandoned.notification_status, /recovered/);
+  assert.deepEqual(store.recoverAbandonedRuns(), [], 'recovery is idempotent');
+  db.close();
+});
+
 test('first appearance becomes NEW', () => {
   const db = openStateDb(tmpDb());
   const store = new StateStore(db);

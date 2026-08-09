@@ -7,6 +7,7 @@ test('defaults apply when env is empty', () => {
   const config = loadConfig({});
   assert.equal(config.apiBaseUrl, 'http://localhost:3000');
   assert.equal(config.runnerConcurrency, 1);
+  assert.equal(config.runnerMaxJobsPerTick, 6);
   assert.equal(config.pollIntervalMs, 5000);
   assert.equal(config.pollTimeoutMs, 900000);
   assert.equal(config.httpRequestTimeoutMs, 30000);
@@ -58,6 +59,7 @@ test('allows https public URLs and private http URLs', () => {
 test('invalid numbers and log level are rejected', () => {
   assert.throws(() => loadConfig({ RUNNER_CONCURRENCY: 'zero' }), ConfigError);
   assert.throws(() => loadConfig({ RUNNER_CONCURRENCY: '0' }), ConfigError);
+  assert.throws(() => loadConfig({ RUNNER_MAX_JOBS_PER_TICK: '0' }), ConfigError);
   assert.throws(() => loadConfig({ POLL_INTERVAL_MS: '-5' }), ConfigError);
   assert.throws(() => loadConfig({ RUNNER_LOG_LEVEL: 'loud' }), ConfigError);
 });

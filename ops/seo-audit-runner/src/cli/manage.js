@@ -353,6 +353,7 @@ export async function workerCommand(config, logger, values, out) {
       jobStore: new JobStore(db),
       logger,
       redact: (s) => logger.redact(s),
+      maxJobs: config.runnerMaxJobsPerTick,
       retryNotifications: createTickNotificationRetry({ config, logger, db }),
     });
     out.ok(

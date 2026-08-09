@@ -257,18 +257,11 @@ export class JobStore {
     if (exitCode === 4) {
       // Another runner instance held the process lock: not a failure of
       // this job — refund the attempt and let a later tick retry it.
-      // The claim identity is cleared with it, so the next claim is fresh.
-      this.db
-        .prepare(
-          `UPDATE jobs SET status = 'QUEUED', started_at = NULL, worker_pid = NULL,
-                           execution_id = NULL, host_id = NULL, boot_id = NULL,
-                           claimed_at = NULL, heartbeat_at = NULL,
-                           attempts = attempts - 1, updated_at = ?,
-                           error = 'deferred: another runner instance was active'
-           WHERE id = ?`,
-        )
-        .run(nowIso, id);
-      return this.get(id);
+      return this.defer(id, {
+        reason: 'deferred: another runner instance was active',
+        executionId,
+        now: new Date(nowIso),
+      });
     }
 
     const status = exitCode === 0 ? JOB_STATUS.SUCCEEDED : JOB_STATUS.FAILED;
@@ -279,6 +272,33 @@ export class JobStore {
          WHERE id = ?`,
       )
       .run(status, exitCode, sanitizeErrorText(error, redact), nowIso, nowIso, id);
+    return this.get(id);
+  }
+
+  /**
+   * RUNNING -> QUEUED for a temporary condition. The attempt is refunded and
+   * every claim field is cleared, so the next scheduler tick owns a fresh
+   * execution. This never applies to all-project partial runs.
+   */
+  defer(id, { reason, executionId = null, now = new Date() }) {
+    const job = this.get(id);
+    if (!job) throw new JobError(`job not found: ${id}`);
+    if (job.status !== JOB_STATUS.RUNNING) {
+      throw new JobError(`job ${id} is ${job.status}, not RUNNING`);
+    }
+    if (executionId != null && job.execution_id != null && job.execution_id !== executionId) {
+      throw new JobError(`job ${id} was re-claimed by another execution`);
+    }
+    this.db
+      .prepare(
+        `UPDATE jobs SET status = 'QUEUED', exit_code = NULL, finished_at = NULL,
+                         started_at = NULL, worker_pid = NULL, execution_id = NULL,
+                         host_id = NULL, boot_id = NULL, claimed_at = NULL,
+                         heartbeat_at = NULL, attempts = MAX(attempts - 1, 0),
+                         updated_at = ?, error = ?
+         WHERE id = ? AND status = 'RUNNING'`,
+      )
+      .run(now.toISOString(), sanitizeErrorText(reason), id);
     return this.get(id);
   }
 

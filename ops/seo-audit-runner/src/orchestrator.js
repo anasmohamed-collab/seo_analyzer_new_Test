@@ -52,6 +52,7 @@ export async function runAudits({ config, apiClient, logger = null, options = {}
     discoveredProjects: 0,
     eligibleProjects: 0,
     selectedProjects: 0,
+    attemptedProjects: 0,
     notificationFailures: 0,
     entries: [],
     criticalIssues: [],
@@ -168,6 +169,7 @@ export async function runAudits({ config, apiClient, logger = null, options = {}
     let trigger;
     try {
       logger?.info?.(`Project ${label}: starting audit (request source: ${built.source})`);
+      report.attemptedProjects += 1;
       trigger = await apiClient.startAudit(
         { ...built.body, expectedProjectId: String(project.id) },
         { signal },

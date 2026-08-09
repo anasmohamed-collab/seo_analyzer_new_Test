@@ -35,7 +35,13 @@ import { createLogger } from '../src/logger.js';
 import { ApiClient } from '../src/apiClient.js';
 import { acquireLock, LockError } from '../src/lock.js';
 import { runAudits } from '../src/orchestrator.js';
-import { computeExitCode, formatTextReport, summarize, EXIT_CODES, OUTCOME } from '../src/report.js';
+import {
+  computeExitCode,
+  executionFinalStatus,
+  formatTextReport,
+  summarize,
+  EXIT_CODES,
+} from '../src/report.js';
 import { dedupeProjects } from '../src/dedupe.js';
 import { evaluateProjectEligibility } from '../src/eligibility.js';
 import { openStateDb } from '../src/db.js';
@@ -245,6 +251,7 @@ function validateConfigCommand(config, logger, out) {
   const data = {
     apiBaseUrl: config.apiBaseUrlRedacted,
     runnerConcurrency: config.runnerConcurrency,
+    runnerMaxJobsPerTick: config.runnerMaxJobsPerTick,
     pollIntervalMs: config.pollIntervalMs,
     pollTimeoutMs: config.pollTimeoutMs,
     httpRequestTimeoutMs: config.httpRequestTimeoutMs,
@@ -269,6 +276,7 @@ function validateConfigCommand(config, logger, out) {
     'Configuration OK',
     `  SEO_API_BASE_URL        = ${config.apiBaseUrlRedacted}`,
     `  RUNNER_CONCURRENCY      = ${config.runnerConcurrency}`,
+    `  RUNNER_MAX_JOBS_PER_TICK = ${config.runnerMaxJobsPerTick}`,
     `  POLL_INTERVAL_MS        = ${config.pollIntervalMs}`,
     `  POLL_TIMEOUT_MS         = ${config.pollTimeoutMs}`,
     `  HTTP_REQUEST_TIMEOUT_MS = ${config.httpRequestTimeoutMs}`,
@@ -471,10 +479,15 @@ async function runCommand(config, logger, values, out) {
   let pipeline = null;
   let runnerExecutionId = null;
   let stateStore = null;
+  let executionFinished = false;
   if (!dryRun) {
     try {
       stateDb = openStateDb(config.stateDbPath, { logger });
       stateStore = new StateStore(stateDb);
+      const recovered = stateStore.recoverAbandonedRuns();
+      if (recovered.length > 0) {
+        logger.warn(`Recovered ${recovered.length} abandoned runner execution row(s) as FAILED`);
+      }
       runnerExecutionId = randomUUID();
       stateStore.createRun({ id: runnerExecutionId, startedAt: new Date().toISOString() });
 
@@ -526,15 +539,17 @@ async function runCommand(config, logger, values, out) {
     if (!dryRun && pipeline && stateStore) {
       const s = summarize(report);
       const totals = {
-        discovered: report.discoveredProjects,
+        discovered: s.discovered,
+        eligible: s.eligible,
+        attempted: s.attempted,
         selected: report.selectedProjects,
         deduplicated: s.deduplicated,
         completed: s.completed,
-        failed: s.counts[OUTCOME.FAILED] ?? 0,
-        timedOut: s.counts[OUTCOME.TIMED_OUT] ?? 0,
-        skippedAlreadyRunning: s.counts[OUTCOME.SKIPPED_ALREADY_RUNNING] ?? 0,
-        skippedMissingConfig: s.counts[OUTCOME.SKIPPED_MISSING_AUDIT_CONFIG] ?? 0,
-        triggerOutcomeUnknown: s.counts[OUTCOME.TRIGGER_OUTCOME_UNKNOWN] ?? 0,
+        deferred: s.deferred,
+        skipped: s.skipped,
+        failed: s.failed,
+        timedOut: s.timedOut,
+        triggerOutcomeUnknown: s.triggerUnknown,
         projectsWithCritical: pipeline.lifecycleTotals.projectsWithCritical,
         currentP0: pipeline.lifecycleTotals.currentP0,
         newIssues: pipeline.lifecycleTotals.new,
@@ -557,15 +572,16 @@ async function runCommand(config, logger, values, out) {
       try {
         stateStore.finishRun(runnerExecutionId, {
           completedAt: report.finishedAt,
-          finalStatus: report.aborted ? 'ABORTED' : 'COMPLETED',
+          finalStatus: executionFinalStatus(report),
           totalProjects: report.discoveredProjects,
           successfulAudits: s.completed,
-          failedAudits: (s.counts[OUTCOME.FAILED] ?? 0) + (s.counts[OUTCOME.TRIGGER_FAILED] ?? 0),
-          timedOutAudits: s.counts[OUTCOME.TIMED_OUT] ?? 0,
+          failedAudits: s.failed + s.triggerUnknown,
+          timedOutAudits: s.timedOut,
           deduplicatedProjects: s.deduplicated,
           projectsWithCritical: pipeline.lifecycleTotals.projectsWithCritical,
           notificationStatus: JSON.stringify(pipeline.counters),
         });
+        executionFinished = true;
       } catch (err) {
         logger.warn(`Could not record automation run in state DB: ${err.message}`);
       }
@@ -612,6 +628,19 @@ async function runCommand(config, logger, values, out) {
     logger.info(`Run finished with exit code ${code}`);
     return code;
   } catch (err) {
+    if (!dryRun && stateStore && runnerExecutionId && !executionFinished) {
+      try {
+        stateStore.finishRun(runnerExecutionId, {
+          completedAt: new Date().toISOString(),
+          finalStatus: 'FAILED',
+          failedAudits: 1,
+          notificationStatus: JSON.stringify({ runnerError: logger.redact(err.message) }),
+        });
+        executionFinished = true;
+      } catch (stateErr) {
+        logger.warn(`Could not persist failed runner execution: ${stateErr.message}`);
+      }
+    }
     logger.error(`Runner failure: ${err.stack ?? err.message}`);
     out.fail(ERROR_CODES.INTERNAL, `Runner failure: ${logger.redact(err.message)}`);
     return EXIT_CODES.RUNNER_FAILURE;

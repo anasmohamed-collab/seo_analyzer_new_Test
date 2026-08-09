@@ -543,7 +543,8 @@ test('run-summary technical aggregates count only completed audits and total exa
     },
   });
   const summary = sender.sent.at(-1).text;
-  assert.match(summary, /Audited: 2 \| Failed: 1/);
+  assert.match(summary, /Discovered: 3 \| Eligible: 3 \| Attempted: 3/);
+  assert.match(summary, /Completed: 2 .* Failed: 1/);
   assert.match(summary, /Robots: .* 1 \| .* 0 \| .* 0 \| .* 0/);
   assert.match(summary, /News sitemaps: .* 0 \| .* 1 \| .* 0 \| .* 0/);
   db.close();
@@ -567,7 +568,8 @@ test('a run with zero completed audits sends the no-audits summary', async () =>
 
   const summary = sender.sent[0].text;
   assert.match(summary, /No audits completed in this cycle\./);
-  assert.match(summary, /Discovered: 13 \| Due\/selected: 4/);
+  assert.match(summary, /Discovered: 13 \| Eligible: 4 \| Attempted: 0/);
+  assert.match(summary, /Completed: 0 \| Deferred: 4 \| Skipped: 0/);
   assert.ok(!/critical/i.test(summary), 'a zero-audit run states no critical conclusion');
   assert.ok(!/Robots:/.test(summary), 'and no technical aggregate');
   db.close();
