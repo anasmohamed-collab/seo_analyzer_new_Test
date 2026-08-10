@@ -40,6 +40,7 @@ and sends Slack notifications with persistent retry.
 | `docs/BACKEND_CONTROL_API.md` | how a backend drives the runner (CLI over SSH) |
 | `docs/DEPLOYMENT_ARCHITECTURE.md` | architecture decision and the isolation contract |
 | `docs/PRODUCTION_GATES.md` | the gates that must pass before production |
+| `docs/TEST_PILOT_RUNBOOK.md` | exact controlled TEST pilot sequence (prepared, not executed) |
 | `deploy/SERVER-HANDOVER.md` | full server install/operate/remove guide |
 | `deploy/INSTALL-CHECKLIST.md` | printable tick-box installation checklist |
 | `deploy/TROUBLESHOOTING.md` | symptom → cause → fix |
@@ -81,6 +82,11 @@ All settings (defaults shown; see `.env.example` for full documentation):
 ```env
 SEO_API_BASE_URL=http://localhost:3000
 RUNNER_CONCURRENCY=1
+RUNNER_MAX_JOBS_PER_TICK=6
+RUNNER_INCLUDE_PROJECT_IDS=
+RUNNER_EXCLUDE_PROJECT_IDS=
+RUNNER_EXCLUDE_NONPRODUCTION=true
+RUNNER_REQUIRE_STORED_CONFIG=true
 POLL_INTERVAL_MS=5000
 POLL_TIMEOUT_MS=900000
 HTTP_REQUEST_TIMEOUT_MS=30000
@@ -108,12 +114,20 @@ be passed with `--env-file /path/to/file`.
 
 ### Security
 
-The application API has **no authentication** (by design of the current app —
-the runner does not invent a token header). Therefore:
+The application API has **no authentication middleware in this repository**
+and the runner does not invent a token header. Production is blocked until an
+IT-owned boundary supplies both **private ingress and authenticated workload
+identity**. Private routing alone is not authentication. Therefore:
 
 - `SEO_API_BASE_URL` must point to a **trusted private endpoint**: localhost,
   a Docker network hostname, or a VPN/internal address. Plain-`http` URLs to
-  public hosts are rejected (dev override: `ALLOW_INSECURE_PUBLIC_API=true`).
+  public hosts are rejected (the development override
+  `ALLOW_INSECURE_PUBLIC_API=true` is forbidden outside local development).
+- Application and Scrapling-sidecar egress controls must reject private,
+  link-local, reserved, multicast, unspecified, and metadata destinations
+  after DNS resolution. Application validation covers A/AAAA answers and
+  native redirects; host/container egress remains mandatory for DNS rebinding
+  and headless-browser redirects inside the sidecar.
 - **Secret handling:** the Slack bot token, webhook URL, and Authorization
   headers are never logged (registered as redaction secrets), never stored in
   SQLite, and never printed by `validate-config`. Keep `.env` readable only
@@ -187,11 +201,12 @@ still applies below the hard cap of 5; `SLACK_MAX_MESSAGE_CHARACTERS` remains
 the safety bound. mrkdwn is escaped and blocks always accompany a populated
 plain-text fallback.
 
-Run summaries are equally compact: audited/failed/timed-out/skipped, the
-critical totals, per-check robots/sitemap/news-sitemap aggregates over the
-successfully completed audits, and duration plus the short execution ID.
-Zero-valued operational counters (duplicates skipped, unknown trigger
-outcomes, failed Slack notifications) appear only when non-zero. **A run in
+Run summaries are equally compact: discovered/eligible/attempted and
+completed/deferred/skipped/failed/timed-out/trigger-unknown, the critical
+totals, per-check robots/sitemap/news-sitemap aggregates over the successfully
+completed audits, and duration plus the short execution ID. Zero-valued
+secondary counters (duplicates skipped and failed Slack notifications) appear
+only when non-zero. **A run in
 which no audit completed says so explicitly** and omits both the critical
 verdict and the technical aggregates — no completed audit means no
 current-critical-state conclusion was produced.
@@ -202,7 +217,7 @@ current-critical-state conclusion was produced.
 seo-audit-runner init                     # explicit state create/migrate (idempotent)
 seo-audit-runner validate-config          # config + state dir + state DB (offline)
 seo-audit-runner list-projects            # read-only listing with dedupe preview
-seo-audit-runner run --all                # audit every deduplicated project
+seo-audit-runner run --all                # audit every eligible, deduplicated project
 seo-audit-runner run --project PROJECT_ID # audit one project
 seo-audit-runner run --all --dry-run      # plan only — no POST, no state, no Slack
 seo-audit-runner run --all --max-concurrency 1
@@ -227,7 +242,7 @@ seo-audit-runner doctor                   # + DB integrity, disk space, systemd 
 seo-audit-runner job create --project PROJECT_ID   # queue a manual audit job
 seo-audit-runner job list [--status FAILED] [--limit 20]    # default limit 50
 seo-audit-runner job show|retry|cancel JOB_ID
-seo-audit-runner schedule create --frequency daily --at 03:00 --all
+seo-audit-runner schedule create --frequency daily --at 03:00 --timezone Africa/Cairo --project PROJECT_ID
 seo-audit-runner schedule enable|disable|update|delete SCHEDULE_ID
 seo-audit-runner schedule list [--limit 20]                 # default limit 50
 seo-audit-runner worker --once            # one scheduler tick: recover, enqueue, run,
@@ -290,28 +305,34 @@ checks always see *every* enabled schedule.
 ### What a run does
 
 1. `GET /api/projects` — discover all projects.
-2. Normalize domains **for comparison only**; deduplicate (winner order:
-   usable `last_form_values` → newest `last_audit_at` → newest `updated_at`
-   → `completed_count > 0` → lowest ID). Losers are reported as
+2. Apply the configured include/exclude/non-production filters. Exclusion wins;
+   scheduled and `--all` runs require a stored, valid Home + Article pair in
+   `last_form_values`. Historical fallback is disabled by default and is
+   available only for an explicit manual single-project run.
+3. Normalize domains **for comparison only**; deduplicate eligible projects
+   (winner order: usable `last_form_values` → newest `last_audit_at` → newest
+   `updated_at` → `completed_count > 0` → lowest ID). Losers are reported as
    `deduplicated: covered by <winner-project-id>`; nothing is modified.
-3. Build the audit request from `last_form_values` (fallback: latest
-   completed audit's page types). No usable pair →
-   `SKIPPED_MISSING_AUDIT_CONFIG`.
-4. Pre-flight `running_count` check → `SKIPPED_ALREADY_RUNNING` when > 0.
-5. `POST /api/technical-analyzer/run` — **never retried automatically**;
+4. Build a project-bound request containing `expectedProjectId`; validate both
+   URLs against the selected project's normalized domain. Ineligible projects
+   are reported with an explicit reason.
+5. Pre-flight `running_count` check → `SKIPPED_ALREADY_RUNNING` when > 0.
+6. `POST /api/technical-analyzer/run` — **never retried automatically**;
    ambiguous failures are verified read-only → `TRIGGER_OUTCOME_UNKNOWN`.
-6. Poll until `COMPLETED` / `FAILED`, or `TIMED_OUT` after `POLL_TIMEOUT_MS`.
-7. **Phase 3, per COMPLETED audit:** validate the payload with an explicit
+   The returned `siteId` must exactly equal the selected project ID, and both
+   `siteId` and `auditRunId` are required before polling.
+7. Poll until `COMPLETED` / `FAILED`, or `TIMED_OUT` after `POLL_TIMEOUT_MS`.
+8. **Per COMPLETED audit:** validate the payload with an explicit
    completeness check (`isCompleteAuditPayload`), fingerprint the current P0
    issues, diff against the previous successful snapshot, atomically store
    the new snapshot + lifecycle transitions (new / unchanged / reopened /
-   resolved), and send the project notification per the alert mode. A
-   structurally valid **clean** completed audit — zero P0 issues, even with
-   an empty results collection — resolves previously active issues. Failed,
-   timed-out, malformed, error, or ambiguous payloads never resolve issues
-   and never replace a valid snapshot.
-8. Optionally send one run-summary message (`SEO_RUNNER_SEND_RUN_SUMMARY`).
-9. Write the run journal and the automation-run record; print the report.
+   resolved), and send the project notification per the alert mode. Complete
+   evidence requires exact project/audit identity, an exact result row for
+   every submitted URL, trustworthy page states, no hidden fetch/parse/WAF
+   failure, and definitive site checks. `INCOMPLETE_EVIDENCE` preserves the
+   prior snapshot and never produces `RESOLVED`.
+9. Optionally send one run-summary message (`SEO_RUNNER_SEND_RUN_SUMMARY`).
+10. Write the run journal and the automation-run record; print the report.
 
 Notification failures never change audit results or audit exit codes — they
 are reported separately and queued for `retry-notifications`.
@@ -432,10 +453,18 @@ Production scheduling is a single hardened systemd model, shipped in
 
 Those two unit files are the only ones shipped. Every 5 minutes the tick
 recovers interrupted jobs, enqueues due schedule occurrences, runs queued
-jobs, and retries queued Slack notifications — so there is no second
-timer. **Audit times are not configured in the unit files**; they live in
+jobs (at most `RUNNER_MAX_JOBS_PER_TICK`, default 6), and retries queued Slack
+notifications — so there is no second timer. A single-project scheduled job
+that meets a manual audit is temporarily deferred and returned to `QUEUED`
+with its attempt refunded; a partly completed all-project job is not blindly
+replayed. **Audit times are not configured in the unit files**; they live in
 the runner's own schedules (`seo-audit-runner schedule ...`), each with
 its own IANA timezone.
+
+The timer uses `Persistent=false`; the runner itself considers only the most
+recent occurrence inside its 24-hour catch-up window. Start a TEST pilot with
+project-specific schedules, `RUNNER_CONCURRENCY=1`, and
+`RUNNER_MAX_JOBS_PER_TICK=1`. See `docs/TEST_PILOT_RUNBOOK.md`.
 
 Enabling the timer requires the pre-enable validation in
 `deploy/SERVER-HANDOVER.md` §7 and the gates in `docs/PRODUCTION_GATES.md`.
@@ -457,7 +486,9 @@ real audits are started and no real Slack messages are sent.
 
 - The application must run in **DB mode** (`DATABASE_URL` set); in-memory
   mode cannot be polled and is reported as `TRIGGER_FAILED`.
-- `running_count` is a best-effort guard; the app has no server-side lock.
+- `running_count` is a pre-flight optimization. The DB-mode application is the
+  authority: it takes a per-project transaction/advisory lock and rejects an
+  existing RUNNING audit with HTTP 409.
 - `TIMED_OUT` means the runner stopped waiting — the audit may still finish
   server-side; the application status is never modified, and the timed-out
   run never updates issue lifecycle state.

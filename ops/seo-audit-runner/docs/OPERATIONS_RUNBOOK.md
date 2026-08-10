@@ -7,6 +7,7 @@ each with the commands, what to verify, and what "done" looks like.
 - First-time installation: `deploy/SERVER-HANDOVER.md`.
 - Symptom lookup: `deploy/TROUBLESHOOTING.md`.
 - CLI/exit-code specification: `docs/CLI_CONTRACT.md`.
+- Controlled TEST pilot: `docs/TEST_PILOT_RUNBOOK.md` (prepared, not executed).
 
 **Two invariants hold in every procedure below.** The runner's state is its
 own SQLite database; the application's PostgreSQL is never touched by any
@@ -93,7 +94,7 @@ Verify, then re-enable automation deliberately:
 sudo -u seo-runner seo-audit-runner status
 sudo -u seo-runner seo-audit-runner doctor
 sudo -u seo-runner seo-audit-runner schedule list      # expected schedules present
-sudo systemctl enable --now seo-runner-tick.timer      # only when satisfied
+sudo systemctl enable --now seo-runner-tick.timer      # only after all production gates pass
 ```
 
 **Rolling back a bad restore:** swap the `pre-restore-<stamp>/` directory back.
@@ -184,6 +185,13 @@ sudo -u seo-runner seo-audit-runner schedule disable <id>
 ```
 
 The tick keeps running and simply finds nothing due.
+
+Treat loss of private/authenticated API ingress, an egress-policy failure, a
+project/site identity mismatch, or incomplete evidence being accepted as clean
+as an emergency-disable event. Stop the timer and service, preserve logs and
+state, and do not retry the affected audit until the boundary or evidence
+failure is understood. For WAF pilot failures, keep bot-protection detection
+strict; a blocked crawl is incomplete evidence, not a clean result.
 
 ### Assess
 
