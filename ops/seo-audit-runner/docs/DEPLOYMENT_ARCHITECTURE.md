@@ -1,7 +1,10 @@
 # Deployment Architecture — SEO Audit Runner (Phase 4)
 
-Status: **approved contract** (Phase 4A, paths corrected). Implementation
-follows in later phases. Scope: everything in this document applies only to
+Status: **approved contract, and implemented** — the scripts, units, CLI, and
+tests described here all exist under `ops/seo-audit-runner/`. Nothing has been
+executed on a Linux host yet; see `docs/READINESS_MATRIX.md` for exactly what
+is verified versus what still needs Linux staging. Scope: everything in this
+document applies only to
 `ops/seo-audit-runner/`. The main SEO application (its runtime, Docker image,
 nixpacks config, Node version, environment variables, startup command, and
 PostgreSQL database) is **out of scope and must never be modified by runner
@@ -17,7 +20,7 @@ exactly the shape systemd serves best:
 | Concern            | How Option A covers it                                    |
 |--------------------|-----------------------------------------------------------|
 | Isolation          | dedicated system user, own runtime, own state dir         |
-| Scheduling         | `Type=oneshot` service + timer, `Persistent=true` catch-up |
+| Scheduling         | `Type=oneshot` service + `Persistent=false` timer; runner-owned catch-up |
 | Logging            | journald (rotation, retention, `journalctl -u`)            |
 | Hardening          | `ProtectSystem=strict`, `ReadWritePaths=`, `PrivateTmp`     |
 | Overlap protection | runner's own lock (exit code 4) + one timer                |
@@ -67,6 +70,19 @@ documented degraded mode, see `deploy/README-deploy.md`).
    no server sockets and accepts no inbound connections; its only network
    activity is outbound HTTPS/HTTP to the configured application API and to
    Slack.
+9. **Private and authenticated API ingress.** The repository does not contain
+   API-auth middleware and the runner does not invent an authorization token.
+   Production therefore requires an IT-owned ingress boundary that is both
+   private and authenticates the runner workload. Private routing alone is not
+   authentication, and this remains an external production blocker until
+   verified.
+10. **Application and sidecar egress enforcement.** Application code validates
+    HTTP(S), DNS A/AAAA answers, blocked address ranges, and each native
+    redirect. Host/container policy must enforce the same destination rules
+    for both the application and Scrapling sidecar, including browser-managed
+    redirects and DNS-rebinding cases that application checks cannot fully
+    contain. Required public HTTP(S), trusted DNS, and the app-to-sidecar path
+    must be explicitly allowed.
 
 ## 3. Node.js runtime requirement
 
@@ -79,28 +95,46 @@ documented degraded mode, see `deploy/README-deploy.md`).
   wrapper — never via the interactive user's `PATH`, never via the main
   application's runtime, and never via a system-wide Node upgrade.
 
-## 4. Scheduling contract
+## 4. Scheduling contract — a single automation model
 
-- Full audit (`run --all`): **daily at 03:00 Africa/Cairo**.
-- Slack notification retry (`retry-notifications`): **hourly**.
-- **Both timers are disabled by default at install time**, and installation
-  never enables scheduling automatically. Enabling is a separate, explicit
-  administrator action (`systemctl enable --now …`) allowed only after the
-  production gates pass (see `docs/PRODUCTION_GATES.md`). If a later phase
-  adds an explicit opt-in installer flag, it must still enforce those gates.
+**One authority, one timer, one service:**
 
-Timezone handling — two supported options, pick exactly one per host:
+    seo-runner-tick.timer (*:0/5) → seo-runner-tick.service → worker --once
 
-1. Set the host timezone to Cairo: `timedatectl set-timezone Africa/Cairo`,
-   then use `OnCalendar=*-*-* 03:00:00`.
-2. Keep the host on UTC and pin the timezone in the calendar expression
-   (supported by systemd >= 235): `OnCalendar=*-*-* 03:00:00 Africa/Cairo`.
-   Verify with `systemd-analyze calendar '*-*-* 03:00:00 Africa/Cairo'`.
+That tick is the entire automation. Within one tick the runner, reading only
+its own SQLite state, performs: crash recovery → stale-execution recovery →
+enqueue of due schedule occurrences (at most one job per occurrence) →
+sequential execution of queued jobs under the process lock → retry of
+queued/failed Slack notifications. Nothing else is scheduled by anything
+else, which is what makes "did this audit run twice?" answerable.
 
-Never configure both cron and the systemd timer for the same runner command
-on the same host. The runner's lock makes an overlap safe (second instance
-exits with code 4), but duplicate scheduling produces alert noise and wasted
-audits.
+- **Audit times are runner state, not unit configuration.** They are created
+  with `seo-audit-runner schedule ...` and each carries its own IANA
+  timezone (default `Africa/Cairo`), so DST correctness belongs to the
+  runner and the host timezone is irrelevant. The 5-minute tick has nothing
+  to catch up (`Persistent=false`); the runner's own 24 h catch-up window,
+  bounded to one job per occurrence, handles downtime.
+- **Work per tick is bounded.** `RUNNER_MAX_JOBS_PER_TICK` defaults to 6 for
+  the current systemd time budget. The initial TEST pilot uses 1, together
+  with `RUNNER_CONCURRENCY=1` and project-specific schedules; see
+  `docs/TEST_PILOT_RUNBOOK.md`.
+- **No second timer.** There is no daily `run --all` timer and no
+  notification-retry timer; a superseded `seo-audit-runner.timer` or
+  `seo-runner-retry.timer` left on a host is a misconfiguration that
+  `install.sh` warns about, `smoke-test.sh` fails on, and `doctor` fails on
+  when enabled.
+- **The timer is disabled at install time** and installation never invokes
+  `systemctl`. Enabling is a separate, explicit administrator action
+  (`systemctl enable --now seo-runner-tick.timer`) allowed only after the
+  pre-enable validation in `deploy/SERVER-HANDOVER.md` §7 and the production
+  gates in `docs/PRODUCTION_GATES.md`. If a later phase adds an explicit
+  opt-in installer flag, it must still enforce those gates.
+- **Cron is a documented degraded mode for hosts without systemd only**
+  (`deploy/cron.example`: the same tick, every 5 minutes, fully commented
+  out). Cron and systemd are mutually exclusive for this runner. The
+  runner's lock makes an accidental overlap safe (second instance exits
+  with code 4), but duplicate scheduling produces alert noise and wasted
+  audits.
 
 ## 5. SQLite state ownership and persistence
 
@@ -131,15 +165,18 @@ audits.
   Only the explicit `purge` operation may delete it, and only after taking a
   final backup.
 
-## 6. Scope restriction
+## 6. Runner-deployment scope restriction
 
-Every Phase 4 change — code, scripts, units, docs, tests — lives under:
+Every runner deployment artifact — code, scripts, units, docs, tests — lives
+under:
 
     ops/seo-audit-runner/
 
-Enforcement is Gate 2 in `docs/PRODUCTION_GATES.md`: before any review or
-commit, `git diff --name-only <base>...HEAD` must return paths starting with
-`ops/seo-audit-runner/` and nothing else.
+Enforcement is Gate 2 in `docs/PRODUCTION_GATES.md`: before any runner
+deployment, review the deployment artifact diff independently and confirm it
+does not modify the main application's runtime or configuration. Application
+security changes may exist in their own reviewed phases; they are not deployed
+by the runner installer.
 
 ## 7. Line endings
 

@@ -1,12 +1,15 @@
 /**
  * Scheduler-tick worker.
  *
- * Designed for the systemd model "a timer starts the worker; the runner
- * determines due jobs from its own state database": the tick timer runs
- * `seo-audit-runner worker --once` every few minutes as the seo-runner
- * user. One tick:
+ * Designed for the single systemd model "one timer starts the worker; the
+ * runner determines everything else from its own state database":
+ * seo-runner-tick.timer runs `seo-audit-runner worker --once` every few
+ * minutes as the seo-runner user, and it is the ONLY scheduling authority
+ * on the host. One tick therefore owns the complete cycle:
  *
- *   1. crash recovery — dead RUNNING jobs become FAILED;
+ *   1. crash recovery — dead RUNNING jobs become FAILED; a job whose
+ *      execution was claimed and abandoned (stale lease, or a lease from a
+ *      previous boot) is recovered rather than left stuck;
  *   2. enqueue — every enabled schedule whose latest occurrence is due
  *      (within the catch-up window) gets AT MOST one job, enforced by the
  *      unique (schedule_id, occurrence_key) index;
@@ -15,20 +18,30 @@
  *      (`run --all|--project <id>`) with structured argv — no shell, no
  *      eval, no string interpolation. The child takes the runner's
  *      process lock, so a worker job can never overlap a manual run: the
- *      child exits 4 and the job returns to QUEUED for the next tick.
+ *      child exits 4 and the job returns to QUEUED for the next tick;
+ *   4. notification retry — queued/failed Slack deliveries are retried
+ *      last (see `retryNotifications` below), so no second timer is needed.
  *
  * The worker never runs as root (systemd User=seo-runner; the CLI refuses
  * root via the wrapper). Job exit codes map to job states in jobs.js.
+ *
+ * While a job runs, the worker renews its lease (`heartbeat_at`) once a
+ * minute. That is what lets a later tick tell "still working" apart from
+ * "claimed and abandoned" without guessing — see JobStore.recoverInterrupted.
  */
 
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { latestOccurrence, DEFAULT_CATCHUP_WINDOW_MS } from './schedules.js';
-import { JOB_STATUS } from './jobs.js';
+import { JOB_STATUS, JobError } from './jobs.js';
+import { OUTCOME } from './report.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLI_ENTRYPOINT = path.resolve(__dirname, '..', 'bin', 'seo-audit-runner.js');
+
+/** Lease renewal interval; well under jobs.js DEFAULT_LEASE_MS. */
+export const DEFAULT_HEARTBEAT_INTERVAL_MS = 60_000;
 
 /** Build the argv for one job. Structured arguments only. */
 export function jobArgs(job) {
@@ -45,21 +58,61 @@ export function spawnJobExecutor({ signal } = {}) {
     new Promise((resolve) => {
       const child = spawn(
         process.execPath,
-        [...process.execArgv, CLI_ENTRYPOINT, ...jobArgs(job)],
-        { stdio: ['ignore', 'ignore', 'pipe'], signal, shell: false },
+        [...process.execArgv, CLI_ENTRYPOINT, ...jobArgs(job), '--output', 'json'],
+        { stdio: ['ignore', 'pipe', 'pipe'], signal, shell: false },
       );
+      let stdout = '';
       let stderrTail = '';
+      child.stdout.on('data', (chunk) => {
+        stdout = (stdout + chunk.toString()).slice(-1_000_000);
+      });
       child.stderr.on('data', (chunk) => {
         stderrTail = (stderrTail + chunk.toString()).slice(-2000);
       });
       child.on('error', (err) => resolve({ exitCode: 1, stderr: err.message }));
-      child.on('close', (code) => resolve({ exitCode: code ?? 1, stderr: stderrTail }));
+      child.on('close', (code) => {
+        let report = null;
+        try {
+          const envelope = JSON.parse(stdout);
+          report = envelope?.data?.entries ? envelope.data : null;
+        } catch {
+          // A missing/malformed machine report means a nominal exit 0 cannot
+          // be trusted as a completed scheduled audit.
+        }
+        if ((code ?? 1) === 0 && !report) {
+          resolve({
+            exitCode: 1,
+            stderr: `${stderrTail} child produced no valid JSON run report`.trim(),
+            report: null,
+          });
+          return;
+        }
+        resolve({ exitCode: code ?? 1, stderr: stderrTail, report });
+      });
     });
+}
+
+/** A single-project collision is temporary work still owed. */
+export function isTemporaryProjectDefer(job, execution) {
+  if (job?.project_id == null || execution?.exitCode !== 0) return false;
+  const entries = execution?.report?.entries;
+  if (!Array.isArray(entries) || entries.length !== 1) return false;
+  const entry = entries[0];
+  return (
+    String(entry?.projectId) === String(job.project_id) &&
+    entry?.outcome === OUTCOME.SKIPPED_ALREADY_RUNNING
+  );
 }
 
 /**
  * Enqueue due occurrences for all enabled schedules.
  * Returns the newly created jobs.
+ *
+ * Disabled schedules are never listed here, so disabling a schedule stops
+ * future enqueue immediately. An occurrence that overlaps work already
+ * QUEUED or RUNNING is DEFERRED, not dropped: its occurrence key stays
+ * unused, so the next tick retries it while it is still inside the catch-up
+ * window.
  */
 export function enqueueDueSchedules({
   scheduleStore,
@@ -74,6 +127,16 @@ export function enqueueDueSchedules({
     if (!occurrence) continue;
     const age = now.getTime() - occurrence.at.getTime();
     if (age > catchupWindowMs) continue; // too old — skipped, never batched
+
+    const conflict = jobStore.findActiveConflict({ projectId: schedule.project_id });
+    if (conflict) {
+      logger?.warn?.(
+        `Schedule ${schedule.id} occurrence ${occurrence.occurrenceKey} deferred: ` +
+          `job ${conflict.id} is already ${conflict.status} for an overlapping target`,
+      );
+      continue;
+    }
+
     const job = jobStore.createForOccurrence({ schedule, occurrenceKey: occurrence.occurrenceKey });
     if (job) {
       created.push(job);
@@ -88,6 +151,14 @@ export function enqueueDueSchedules({
 /**
  * One worker tick. Returns a summary object.
  * `executeJob` is injectable for tests; production uses spawnJobExecutor().
+ *
+ * `retryNotifications` implements the single-timer model: when supplied it is
+ * awaited at the end of the tick, after job execution, so the one tick timer
+ * owns both audits and notification retries. The CLI wires it via
+ * `createTickNotificationRetry` whenever Slack is configured; it stays null
+ * when it is not (nothing could be delivered, so nothing can be retried), and
+ * for tests. `retry-notifications` remains available as a manual command.
+ * Notification failures never fail a tick or the audits in it.
  */
 export async function workerTick({
   scheduleStore,
@@ -96,16 +167,26 @@ export async function workerTick({
   redact = (s) => s,
   now = new Date(),
   catchupWindowMs = DEFAULT_CATCHUP_WINDOW_MS,
-  maxJobs = 10,
+  maxJobs = 6,
   executeJob = null,
+  heartbeatIntervalMs = DEFAULT_HEARTBEAT_INTERVAL_MS,
+  retryNotifications = null,
 }) {
-  const summary = { recovered: 0, enqueued: 0, executed: 0, succeeded: 0, failed: 0, deferred: 0 };
+  const summary = {
+    recovered: 0,
+    enqueued: 0,
+    executed: 0,
+    succeeded: 0,
+    failed: 0,
+    deferred: 0,
+    notificationsRetried: 0,
+  };
   const exec = executeJob ?? spawnJobExecutor();
 
-  const recovered = jobStore.recoverInterrupted();
+  const recovered = jobStore.recoverInterrupted({ now });
   summary.recovered = recovered.length;
   for (const job of recovered) {
-    logger?.warn?.(`Recovered interrupted job ${job.id} -> FAILED`);
+    logger?.warn?.(`Recovered interrupted job ${job.id} -> FAILED (${job.error})`);
   }
 
   summary.enqueued = enqueueDueSchedules({ scheduleStore, jobStore, now, catchupWindowMs, logger }).length;
@@ -114,8 +195,48 @@ export async function workerTick({
     const job = jobStore.claimNext();
     if (!job) break;
     logger?.info?.(`Executing job ${job.id} (${job.project_id ? `project ${job.project_id}` : 'all projects'})`);
-    const { exitCode, stderr } = await exec(job);
-    const finished = jobStore.finish(job.id, { exitCode, error: exitCode === 0 ? null : stderr, redact });
+
+    // Renew the lease while the child runs, so a long audit is never
+    // mistaken for an abandoned claim.
+    const lease = setInterval(() => {
+      try {
+        jobStore.heartbeat(job.id, job.execution_id);
+      } catch (err) {
+        logger?.debug?.(`Heartbeat for job ${job.id} failed: ${err.message}`);
+      }
+    }, heartbeatIntervalMs);
+    lease.unref?.();
+
+    let execution;
+    try {
+      execution = await exec(job);
+    } finally {
+      clearInterval(lease);
+    }
+
+    let finished;
+    try {
+      if (isTemporaryProjectDefer(job, execution)) {
+        finished = jobStore.defer(job.id, {
+          reason: 'deferred: the selected project already has a running audit',
+          executionId: job.execution_id,
+        });
+      } else {
+        finished = jobStore.finish(job.id, {
+          exitCode: execution.exitCode,
+          error: execution.exitCode === 0 ? null : execution.stderr,
+          redact,
+          executionId: job.execution_id,
+        });
+      }
+    } catch (err) {
+      if (!(err instanceof JobError)) throw err;
+      // The job was recovered or re-claimed while this execution ran; its
+      // current owner decides the outcome, not this one.
+      logger?.warn?.(`Job ${job.id} outcome not recorded: ${err.message}`);
+      continue;
+    }
+
     summary.executed += 1;
     if (finished.status === JOB_STATUS.SUCCEEDED) summary.succeeded += 1;
     else if (finished.status === JOB_STATUS.QUEUED) {
@@ -124,5 +245,15 @@ export async function workerTick({
       break; // the lock holder is still active — stop this tick
     } else summary.failed += 1;
   }
+
+  if (typeof retryNotifications === 'function') {
+    try {
+      const result = await retryNotifications();
+      summary.notificationsRetried = result?.sent ?? 0;
+    } catch (err) {
+      logger?.warn?.(`Notification retry step failed (tick unaffected): ${redact(err.message)}`);
+    }
+  }
+
   return summary;
 }

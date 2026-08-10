@@ -11,6 +11,7 @@
  *   - Crawl summary with stats
  */
 import { Router } from 'express';
+import { safeFetch as fetch } from '../../shared/outbound-url-safety.js';
 import { normalizeUrl, shouldDenyUrl, parseRobotsTxt } from '../lib/url-utils.js';
 import { analyzeInternalLinking } from '../lib/modules/internal-linking.js';
 import { analyzeCrawlDepth } from '../lib/modules/crawl-depth.js';

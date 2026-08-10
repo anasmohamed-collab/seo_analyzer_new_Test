@@ -7,9 +7,21 @@ import {
   SLACK_POST_MESSAGE_URL,
 } from '../src/slackClient.js';
 import { createLogger } from '../src/logger.js';
+import { buildProjectMessages, criticalMentionToken } from '../src/slackFormat.js';
 
 const FAKE_TOKEN = 'xoxb-000-000-VERYSECRETFAKETOKEN';
 const FAKE_WEBHOOK = 'https://hooks.slack.com/services/T0/B0/SECRETWEBHOOKPATH';
+
+/** One P0 issue, shaped exactly as criticalFilter.js produces it. */
+const criticalIssue = {
+  fingerprint: 'fp-1',
+  area: 'content',
+  message: 'Missing H1 tag',
+  fixHint: 'Add exactly one descriptive H1 to the page.',
+  pageUrl: 'https://www.arabtimesonline.com/',
+  pageType: 'home',
+  source: 'page',
+};
 
 const botConfig = (over = {}) => ({
   slackMethod: 'bot',
@@ -169,4 +181,51 @@ test('logger redacts a bot token registered as a secret', () => {
   logger.info(`something mentioning ${FAKE_TOKEN} accidentally`);
   assert.ok(!stream.data.includes(FAKE_TOKEN));
   assert.ok(stream.data.includes('[REDACTED]'));
+});
+
+// ── Channel-wide mention survives delivery, on both methods ─────────
+
+test('a bot-token payload preserves the mention in the top-level text and the blocks', async () => {
+  const fetchImpl = fetchQueue([jsonRes({ ok: true })]);
+  const sender = createSlackSender({ config: botConfig(), fetchImpl, sleepFn: noSleep });
+  const [message] = buildProjectMessages({
+    projectName: 'Arab Times',
+    domain: 'arabtimesonline.com',
+    projectId: 'p1',
+    auditRunId: '77830569-aaaa',
+    lifecycle: { new: [criticalIssue], reopened: [], unchanged: [], resolved: [] },
+    mode: 'new_or_regressed',
+    siteChecks: { robots: { status: 'FOUND' }, sitemap: { status: 'FOUND' }, newsSitemap: { status: 'NOT_FOUND' } },
+    mention: criticalMentionToken('channel'),
+  });
+
+  await sender.send(message);
+  const body = JSON.parse(fetchImpl.calls[0].init.body);
+  assert.equal(body.text.split('<!channel>').length - 1, 1, 'the fallback text carries it exactly once');
+  assert.match(body.blocks[0].text.text, /<!channel>/, 'the first mrkdwn section carries it too');
+  assert.equal(
+    body.blocks.reduce((n, b) => n + (b.text.text.split('<!channel>').length - 1), 0),
+    1,
+  );
+  assert.ok(!body.text.includes('@all'));
+});
+
+test('a webhook payload preserves the same mention behavior', async () => {
+  const fetchImpl = fetchQueue([new Response('ok', { status: 200 })]);
+  const sender = createSlackSender({ config: webhookConfig(), fetchImpl, sleepFn: noSleep });
+  const [message] = buildProjectMessages({
+    projectName: 'Arab Times',
+    domain: 'arabtimesonline.com',
+    projectId: 'p1',
+    auditRunId: '77830569-aaaa',
+    lifecycle: { new: [], reopened: [criticalIssue], unchanged: [], resolved: [] },
+    mode: 'new_or_regressed',
+    mention: criticalMentionToken('here'),
+  });
+
+  await sender.send(message);
+  const body = JSON.parse(fetchImpl.calls[0].init.body);
+  assert.equal(body.text.split('<!here>').length - 1, 1);
+  assert.match(body.blocks[0].text.text, /<!here>/);
+  assert.ok(!body.text.includes('@all'));
 });

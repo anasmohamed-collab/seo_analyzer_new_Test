@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { openStateDb } from '../src/db.js';
+import { JobStore, JOB_STATUS } from '../src/jobs.js';
 import {
   ScheduleStore,
   ScheduleError,
@@ -118,5 +119,85 @@ test('schedule store: create (disabled), enable, update, list, delete', () => {
   store.delete(created.id);
   assert.equal(store.list().length, 0);
   assert.throws(() => store.setEnabled(created.id, true), ScheduleError);
+  db.close();
+});
+
+// ── delete safety ──────────────────────────────────────────────────
+
+function scheduleWithJob(status) {
+  const db = openStateDb(':memory:');
+  const schedules = new ScheduleStore(db);
+  const jobs = new JobStore(db);
+  const schedule = schedules.create({ frequency: 'daily', atHour: 3, atMinute: 0 });
+  const job = jobs.createForOccurrence({ schedule, occurrenceKey: '2026-07-21' });
+  if (status === JOB_STATUS.RUNNING) jobs.claimNext();
+  else if (status === JOB_STATUS.SUCCEEDED) {
+    jobs.claimNext();
+    jobs.finish(job.id, { exitCode: 0 });
+  }
+  return { db, schedules, jobs, schedule, job };
+}
+
+test('deleting a schedule is refused while it has QUEUED jobs', () => {
+  const { db, schedules, jobs, schedule, job } = scheduleWithJob(JOB_STATUS.QUEUED);
+
+  assert.throws(() => schedules.delete(schedule.id), (err) => {
+    assert.ok(err instanceof ScheduleError);
+    assert.match(err.message, /QUEUED job/);
+    assert.match(err.message, new RegExp(job.id));
+    assert.match(err.message, /--force/);
+    return true;
+  });
+  assert.ok(schedules.get(schedule.id), 'the schedule must survive a refused delete');
+  assert.equal(jobs.get(job.id).status, JOB_STATUS.QUEUED, 'its queued job is untouched');
+  db.close();
+});
+
+test('--force cancels queued jobs (never deletes them) and then deletes the schedule', () => {
+  const { db, schedules, jobs, schedule, job } = scheduleWithJob(JOB_STATUS.QUEUED);
+
+  const { cancelledJobIds } = schedules.delete(schedule.id, { force: true });
+  assert.deepEqual(cancelledJobIds, [job.id]);
+  assert.equal(schedules.get(schedule.id), null);
+
+  const cancelled = jobs.get(job.id);
+  assert.equal(cancelled.status, JOB_STATUS.CANCELLED, 'the job row is cancelled, not removed');
+  assert.ok(cancelled.finished_at, 'cancellation is a recorded terminal state');
+  assert.equal(cancelled.schedule_id, schedule.id, 'history keeps the schedule it came from');
+  db.close();
+});
+
+test('a RUNNING job blocks the delete even with --force', () => {
+  const { db, schedules, jobs, schedule, job } = scheduleWithJob(JOB_STATUS.RUNNING);
+
+  for (const opts of [{}, { force: true }]) {
+    assert.throws(() => schedules.delete(schedule.id, opts), (err) => {
+      assert.ok(err instanceof ScheduleError);
+      assert.match(err.message, /RUNNING job/);
+      return true;
+    });
+  }
+  assert.ok(schedules.get(schedule.id));
+  assert.equal(jobs.get(job.id).status, JOB_STATUS.RUNNING, 'a running audit is never touched');
+  db.close();
+});
+
+test('finished jobs never block a schedule delete and keep their history', () => {
+  const { db, schedules, jobs, schedule, job } = scheduleWithJob(JOB_STATUS.SUCCEEDED);
+
+  const { cancelledJobIds } = schedules.delete(schedule.id);
+  assert.deepEqual(cancelledJobIds, []);
+  assert.equal(schedules.get(schedule.id), null);
+  assert.equal(jobs.get(job.id).status, JOB_STATUS.SUCCEEDED, 'history is preserved after the delete');
+  db.close();
+});
+
+test('disabling a schedule leaves its already-queued job alone', () => {
+  const { db, schedules, jobs, schedule, job } = scheduleWithJob(JOB_STATUS.QUEUED);
+
+  const disabled = schedules.setEnabled(schedule.id, false);
+  assert.equal(disabled.enabled, 0);
+  assert.equal(jobs.get(job.id).status, JOB_STATUS.QUEUED, 'disable stops future enqueue only');
+  assert.equal(schedules.list({ enabledOnly: true }).length, 0);
   db.close();
 });

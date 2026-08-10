@@ -1,19 +1,34 @@
-# cron.example — DOCUMENTED FALLBACK ONLY, never installed automatically.
+# cron.example — DOCUMENTATION ONLY, never installed automatically.
 #
-# Use cron ONLY on hosts without systemd, and NEVER together with the
-# systemd timers for the same command (duplicate scheduling contract,
-# deploy/README-deploy.md §4). Cron runs in the HOST timezone: set the host
-# to Africa/Cairo (timedatectl set-timezone Africa/Cairo) or adjust the
-# hour. Cron has no Persistent= catch-up: a run missed while the host was
-# down is skipped (the tick model catches up by itself within 24h).
+# Every line in this file is commented out on purpose. No script in this
+# repository writes /etc/cron.d entries or calls crontab; installing cron
+# is always a deliberate, manual administrator action.
 #
-# Install as /etc/cron.d/seo-audit-runner (mode 0644, owner root:root).
+# WHEN TO USE THIS FILE: only on a host WITHOUT systemd. The single
+# production scheduling authority is the systemd tick timer
+# (seo-runner-tick.timer -> seo-runner-tick.service -> worker --once,
+# deploy/systemd/). Cron and systemd are MUTUALLY EXCLUSIVE: never enable
+# the tick timer and a cron entry for the same runner on the same host —
+# the runner's lock keeps that safe (second instance exits 4), but it
+# produces duplicate audits and alert noise.
+#
+# The cron line below is the exact cron equivalent of the tick timer, and
+# it is the ONLY supported cron model: one tick, every 5 minutes. Audit
+# times are not configured here — they live in the runner's own schedules
+# (`seo-audit-runner schedule create|enable ...`), and the same tick also
+# retries queued Slack notifications. Do NOT add extra cron lines for
+# `run --all` or `retry-notifications`; that re-introduces the multiple
+# scheduling authorities this model exists to prevent.
+#
+# Cron caveats vs. systemd: cron runs in the HOST timezone (set the host
+# with `timedatectl set-timezone Africa/Cairo` if you care, though
+# schedules carry their own IANA timezone), there is no Persistent=
+# catch-up (a tick missed while the host was down is simply skipped — the
+# runner's own 24h catch-up window covers it), and output goes to a file
+# instead of journald, so install deploy/logrotate.example alongside it.
+#
+# To use it: uncomment the single line, then install this file as
+# /etc/cron.d/seo-audit-runner (mode 0644, owner root:root).
 # Format: m h dom mon dow user command
 
-# EITHER: classic daily full audit at 03:00 host time + hourly retry
-0 3 * * *   seo-runner  /usr/local/bin/seo-audit-runner run --all >> /var/log/seo-audit-runner/cron.log 2>&1
-0 * * * *   seo-runner  /usr/local/bin/seo-audit-runner retry-notifications >> /var/log/seo-audit-runner/cron.log 2>&1
-
-# OR: scheduler tick every 5 minutes (runner-managed schedules; comment the
-# daily line above if schedules cover the full audit)
-#*/5 * * * * seo-runner  /usr/local/bin/seo-audit-runner worker --once >> /var/log/seo-audit-runner/cron.log 2>&1
+#*/5 * * * *  seo-runner  /usr/local/bin/seo-audit-runner worker --once >> /var/log/seo-audit-runner/cron.log 2>&1

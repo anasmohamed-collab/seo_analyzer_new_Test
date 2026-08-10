@@ -3,6 +3,7 @@
  * Delegates to shared technical-checks module.
  */
 import { Router } from 'express';
+import { safeFetch as fetch } from '../../shared/outbound-url-safety.js';
 import { analyzeTechnical, generateRecommendations, createErrorResponse } from '../lib/technical-checks.js';
 
 export const seoIntelligenceRouter = Router();

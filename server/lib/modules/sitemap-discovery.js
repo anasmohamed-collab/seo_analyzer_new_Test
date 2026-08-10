@@ -20,6 +20,8 @@
  * sitemap index recursion (max depth 3, max 20 files total).
  */
 
+import { safeFetch as fetch } from '../../../shared/outbound-url-safety.js';
+
 import { gunzipSync } from 'node:zlib';
 
 const FETCH_TIMEOUT = 10000;

@@ -20,6 +20,14 @@ const skip = bashMissing() ? 'no bash available on this machine' : false;
 const BACKUP_SH = path.join(RUNNER_ROOT, 'deploy', 'backup.sh');
 const RESTORE_SH = path.join(RUNNER_ROOT, 'deploy', 'restore.sh');
 
+// Prelude for the raw bash invocations below (which do NOT go through a
+// self-hardening deploy script): a clean POSIX PATH so their coreutils
+// (tar, ls, mktemp, sleep) resolve even when the test runner was launched
+// with a minimal or Windows-only PATH — e.g. from PowerShell, where the GNU
+// tools are absent and Windows find.exe/sort.exe/tar.exe would shadow them.
+const BASH_PATH_PRELUDE =
+  'export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"; ';
+
 function fixture() {
   const work = makeWorkspace();
   const stateDir = path.join(work, 'state');
@@ -70,7 +78,7 @@ test('backup produces a validated archive containing db and journals', { skip },
 
 // Run an inline bash command through the harness bash.
 function runScriptRaw(command) {
-  const r = spawnSync(findBash(), ['-c', command], { encoding: 'utf8' });
+  const r = spawnSync(findBash(), ['-c', BASH_PATH_PRELUDE + command], { encoding: 'utf8' });
   return { status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '', output: (r.stdout ?? '') + (r.stderr ?? '') };
 }
 
@@ -145,7 +153,7 @@ test('restore refuses while the runner lock is held by a live process', { skip }
   // A live process VISIBLE TO BASH: spawn bash, capture its $$, keep it alive.
   const bash = findBash();
   const pidFile = toPosix(path.join(fx.work, 'holder.pid'));
-  const holder = spawn(bash, ['-c', `echo $$ > '${pidFile}'; sleep 15`], { stdio: 'ignore' });
+  const holder = spawn(bash, ['-c', `${BASH_PATH_PRELUDE}echo $$ > '${pidFile}'; sleep 15`], { stdio: 'ignore' });
   try {
     let bashPid = null;
     for (let i = 0; i < 50 && !bashPid; i += 1) {

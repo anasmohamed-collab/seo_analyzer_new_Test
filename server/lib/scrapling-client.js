@@ -11,6 +11,11 @@
  * the Python service running.
  */
 
+import {
+  assertSafeOutboundUrl,
+  safeFetch,
+} from '../../shared/outbound-url-safety.js';
+
 const SIDECAR_BASE = (process.env.SCRAPLING_SIDECAR_URL || 'http://localhost:5000').replace(/\/+$/, '');
 
 // Cache the health-check result for 60 s so we don't probe on every request.
@@ -49,6 +54,7 @@ async function isSidecarAvailable() {
  * @returns {Promise<{html:string, status:number, headers:object, url:string, elapsed_ms:number}>}
  */
 async function scraplingFetch(url, opts = {}) {
+  await assertSafeOutboundUrl(url);
   const payload = {
     url,
     timeout: opts.timeout ?? 20,
@@ -72,6 +78,7 @@ async function scraplingFetch(url, opts = {}) {
     if (!res.ok || data.error) {
       throw new Error(data.error || `Sidecar returned ${res.status}`);
     }
+    await assertSafeOutboundUrl(data.url || url);
     return data;
   } finally {
     clearTimeout(timer);
@@ -86,6 +93,7 @@ async function scraplingFetch(url, opts = {}) {
  * @returns {Promise<Array<{url:string, html?:string, status?:number, headers?:object, error?:string, elapsed_ms:number}>>}
  */
 async function scraplingFetchBatch(urls, opts = {}) {
+  await Promise.all(urls.map(url => assertSafeOutboundUrl(url)));
   const payload = {
     urls,
     timeout: opts.timeout ?? 20,
@@ -106,6 +114,7 @@ async function scraplingFetchBatch(urls, opts = {}) {
 
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || `Sidecar returned ${res.status}`);
+    await Promise.all((data.results || []).map(result => assertSafeOutboundUrl(result.url)));
     return data.results;
   } finally {
     clearTimeout(timer);
@@ -124,6 +133,7 @@ async function scraplingFetchBatch(urls, opts = {}) {
  * @returns {Promise<{html:string, status:number, headers:object, url:string, elapsed_ms:number, source:'scrapling'|'native'}>}
  */
 async function smartFetch(url, opts = {}) {
+  await assertSafeOutboundUrl(url);
   const available = await isSidecarAvailable();
 
   if (available) {
@@ -142,9 +152,8 @@ async function smartFetch(url, opts = {}) {
   const start = Date.now();
 
   try {
-    const res = await fetch(url, {
+    const res = await safeFetch(url, {
       signal: ctrl.signal,
-      redirect: 'follow',
       headers: {
         'User-Agent':     opts.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept':         'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',

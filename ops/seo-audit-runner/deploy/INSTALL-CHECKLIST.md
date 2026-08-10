@@ -21,6 +21,8 @@ Print this and tick every box in order. Details for every step:
 - [ ] Slack: set `SLACK_BOT_TOKEN` + `SLACK_CHANNEL_ID`, then `NOTIFICATIONS_ENABLED=true`
 - [ ] `sudo chmod 0640 /etc/seo-audit-runner/runner.env && sudo chown root:seo-runner /etc/seo-audit-runner/runner.env`
 - [ ] `sudo -u seo-runner seo-audit-runner validate-config` → `Configuration OK`
+- [ ] `sudo -u seo-runner seo-audit-runner init` → state DB created as `seo-runner`
+      (always `-u seo-runner`, never plain root — root would leave root-owned state files)
 
 ## Verify
 - [ ] `sudo bash deploy/smoke-test.sh --with-dry-run` → `RESULT: PASS`
@@ -33,14 +35,20 @@ Print this and tick every box in order. Details for every step:
 - [ ] Results, Slack message, and application health reviewed
 
 ## Automation (only after the above)
-- [ ] Scheduling model chosen: ☐ A (daily timer) ☐ B (tick + schedules) ☐ none yet
-- [ ] Model A: `sudo systemctl enable --now seo-audit-runner.timer seo-runner-retry.timer`
-- [ ] Model B: schedule created + enabled, then `sudo systemctl enable --now seo-runner-tick.timer seo-runner-retry.timer`
-- [ ] `systemctl list-timers 'seo-*'` shows the expected next run
-- [ ] NOT both models; NOT cron and systemd together
+One authority only: `seo-runner-tick.timer` → `seo-runner-tick.service` →
+`worker --once`. It ships disabled. Details: `SERVER-HANDOVER.md` §7.
+- [ ] Schedule created and enabled: `schedule create --frequency daily --at 03:00 --all`, then `schedule enable <id>`
+- [ ] `sudo -u seo-runner seo-audit-runner schedule list` shows it `ENABLED` with the expected `next=`
+- [ ] Pre-enable validation done (SERVER-HANDOVER.md §7 step 2): smoke test PASS, `doctor` clean, one manual `worker --once` reviewed
+- [ ] `systemctl list-unit-files 'seo-*'` lists ONLY `seo-runner-tick.timer` and `seo-runner-tick.service`
+- [ ] `sudo systemctl enable --now seo-runner-tick.timer`
+- [ ] `systemctl list-timers 'seo-*'` shows the expected next tick
+- [ ] NOT cron and systemd together; no leftover `seo-audit-runner.timer` / `seo-runner-retry.timer`
 
 ## Safety net
 - [ ] `sudo -u seo-runner bash deploy/backup.sh` produced `state-<stamp>.tar.gz`
-- [ ] Restore procedure read (`deploy/restore.sh --help`)
-- [ ] Rollback procedure read (`deploy/rollback.sh --help`)
-- [ ] Handover guide delivered to the operating team
+- [ ] Restore procedure read (`deploy/restore.sh --help`, runbook §2)
+- [ ] Rollback procedure read (`deploy/rollback.sh --help`, runbook §4)
+- [ ] Emergency disable understood: `sudo systemctl disable --now seo-runner-tick.timer` (runbook §5)
+- [ ] Monitoring checks agreed (runbook §6); alert on exit 1 and 4, accept 0 and 2
+- [ ] Handover guide + `docs/OPERATIONS_RUNBOOK.md` delivered to the operating team
