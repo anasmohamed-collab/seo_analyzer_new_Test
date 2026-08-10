@@ -14,6 +14,12 @@
 const MAX_MESSAGES_PER_NOTIFICATION = 5;
 const BLOCK_TEXT_LIMIT = 2900; // Slack section block limit is 3000
 
+// Pings everyone in the channel (online or not) on project critical-issue
+// updates. Only the first message of a (possibly split) notification carries
+// it, so a multi-part update pings once, not once per part. Run summaries
+// intentionally do not use this — they are informational, not an alert.
+const MENTION_CHANNEL = '<!channel>';
+
 export function escapeSlack(value) {
   return String(value ?? '')
     .replace(/&/g, '&amp;')
@@ -134,7 +140,7 @@ export function buildProjectMessages({
       break;
     }
     const headerText = projectHeader(ctx, items.length > 0 && (index > 0 || part > 1) ? part : null);
-    const bodyParts = [headerText];
+    const bodyParts = part === 1 ? [MENTION_CHANNEL, headerText] : [headerText];
     if (part === 1) bodyParts.push(countsBlock(counts));
 
     let issuesInMessage = 0;

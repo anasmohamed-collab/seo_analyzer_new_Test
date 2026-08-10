@@ -141,6 +141,17 @@ test('site-wide issues render a scope line instead of a URL', () => {
   assert.match(messages[0].text, /Scope: site-wide/);
 });
 
+test('project messages open with an @channel mention, once per notification', () => {
+  const many = Array.from({ length: 12 }, (_, i) => mkIssue(i + 1));
+  const messages = buildProjectMessages(
+    baseArgs(lc({ new: many }), { maxIssuesPerMessage: 5 }),
+  );
+  assert.equal(messages.length, 3);
+  assert.ok(messages[0].text.startsWith('<!channel>'));
+  assert.ok(!messages[1].text.includes('<!channel>'), 'later parts must not re-ping the channel');
+  assert.ok(!messages[2].text.includes('<!channel>'));
+});
+
 test('run summary message contains all totals', () => {
   const { text, blocks } = buildRunSummaryMessage({
     runnerExecutionId: 'exec-1',
@@ -163,4 +174,5 @@ test('run summary message contains all totals', () => {
   assert.match(text, /New: 2 \| Reopened: 1 \| Unchanged: 4 \| Resolved: 3/);
   assert.match(text, /Failed Slack notifications: 1/);
   assert.ok(blocks.length > 0);
+  assert.ok(!text.includes('<!channel>'), 'run summaries are informational and must not ping the channel');
 });
