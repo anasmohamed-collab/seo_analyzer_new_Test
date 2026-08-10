@@ -20,7 +20,7 @@ exactly the shape systemd serves best:
 | Concern            | How Option A covers it                                    |
 |--------------------|-----------------------------------------------------------|
 | Isolation          | dedicated system user, own runtime, own state dir         |
-| Scheduling         | `Type=oneshot` service + timer, `Persistent=true` catch-up |
+| Scheduling         | `Type=oneshot` service + `Persistent=false` timer; runner-owned catch-up |
 | Logging            | journald (rotation, retention, `journalctl -u`)            |
 | Hardening          | `ProtectSystem=strict`, `ReadWritePaths=`, `PrivateTmp`     |
 | Overlap protection | runner's own lock (exit code 4) + one timer                |
@@ -70,6 +70,19 @@ documented degraded mode, see `deploy/README-deploy.md`).
    no server sockets and accepts no inbound connections; its only network
    activity is outbound HTTPS/HTTP to the configured application API and to
    Slack.
+9. **Private and authenticated API ingress.** The repository does not contain
+   API-auth middleware and the runner does not invent an authorization token.
+   Production therefore requires an IT-owned ingress boundary that is both
+   private and authenticates the runner workload. Private routing alone is not
+   authentication, and this remains an external production blocker until
+   verified.
+10. **Application and sidecar egress enforcement.** Application code validates
+    HTTP(S), DNS A/AAAA answers, blocked address ranges, and each native
+    redirect. Host/container policy must enforce the same destination rules
+    for both the application and Scrapling sidecar, including browser-managed
+    redirects and DNS-rebinding cases that application checks cannot fully
+    contain. Required public HTTP(S), trusted DNS, and the app-to-sidecar path
+    must be explicitly allowed.
 
 ## 3. Node.js runtime requirement
 
@@ -101,6 +114,10 @@ else, which is what makes "did this audit run twice?" answerable.
   runner and the host timezone is irrelevant. The 5-minute tick has nothing
   to catch up (`Persistent=false`); the runner's own 24 h catch-up window,
   bounded to one job per occurrence, handles downtime.
+- **Work per tick is bounded.** `RUNNER_MAX_JOBS_PER_TICK` defaults to 6 for
+  the current systemd time budget. The initial TEST pilot uses 1, together
+  with `RUNNER_CONCURRENCY=1` and project-specific schedules; see
+  `docs/TEST_PILOT_RUNBOOK.md`.
 - **No second timer.** There is no daily `run --all` timer and no
   notification-retry timer; a superseded `seo-audit-runner.timer` or
   `seo-runner-retry.timer` left on a host is a misconfiguration that
@@ -148,15 +165,18 @@ else, which is what makes "did this audit run twice?" answerable.
   Only the explicit `purge` operation may delete it, and only after taking a
   final backup.
 
-## 6. Scope restriction
+## 6. Runner-deployment scope restriction
 
-Every Phase 4 change — code, scripts, units, docs, tests — lives under:
+Every runner deployment artifact — code, scripts, units, docs, tests — lives
+under:
 
     ops/seo-audit-runner/
 
-Enforcement is Gate 2 in `docs/PRODUCTION_GATES.md`: before any review or
-commit, `git diff --name-only <base>...HEAD` must return paths starting with
-`ops/seo-audit-runner/` and nothing else.
+Enforcement is Gate 2 in `docs/PRODUCTION_GATES.md`: before any runner
+deployment, review the deployment artifact diff independently and confirm it
+does not modify the main application's runtime or configuration. Application
+security changes may exist in their own reviewed phases; they are not deployed
+by the runner installer.
 
 ## 7. Line endings
 

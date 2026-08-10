@@ -10,6 +10,8 @@
  * Detects outdated content and inconsistencies.
  */
 
+import { safeFetch as fetch } from '../../../shared/outbound-url-safety.js';
+
 const FETCH_TIMEOUT = 10000;
 
 function parseDate(str) {

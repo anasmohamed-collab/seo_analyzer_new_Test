@@ -10,10 +10,15 @@
 import { describe, it, expect, vi } from 'vitest';
 import { gzipSync } from 'node:zlib';
 import {
-  runFetchEngine,
+  runFetchEngine as runFetchEngineRaw,
   isCloudflareChallengePage,
+  type FetchEngineOptions,
   type FetchEngineResult,
 } from '../fetchEngine.js';
+
+const TEST_RESOLVER = async () => [{ address: '93.184.216.34', family: 4 }];
+const runFetchEngine = (url: string, options: FetchEngineOptions = {}) =>
+  runFetchEngineRaw(url, { resolver: TEST_RESOLVER, ...options });
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -452,5 +457,39 @@ describe('runFetchEngine — parser failure edge cases', () => {
     // Not a security block
     expect(r.blockedConfidence).not.toBe('HIGH');
     expect(r.challengeDetected).toBe(false);
+  });
+});
+
+describe('runFetchEngine — outbound URL safety', () => {
+  it('blocks a DNS-to-private page before any HTTP request', async () => {
+    const fetchSpy = vi.fn(async (_input?: string | URL | Request, _init?: RequestInit) =>
+      makeResponse(200, REAL_HTML));
+
+    const result = await runFetchEngine('https://public-name.example/page', {
+      fetchFn: fetchSpy as unknown as typeof fetch,
+      resolver: async () => [{ address: '10.20.30.40', family: 4 }],
+    });
+
+    expect(result.fetchOk).toBe(false);
+    expect(result.profilesTried).toHaveLength(1);
+    expect(result.profilesTried[0].failure_kind).toBe('dns_error');
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('blocks a redirect to metadata before requesting the redirected URL', async () => {
+    const fetchSpy = vi.fn(async (_input?: string | URL | Request, _init?: RequestInit) => makeResponse(
+      302,
+      '',
+      { location: 'http://169.254.169.254/latest/meta-data' },
+    ));
+
+    const result = await runFetchEngine('https://public-name.example/page', {
+      fetchFn: fetchSpy as unknown as typeof fetch,
+    });
+
+    expect(result.fetchOk).toBe(false);
+    expect(result.profilesTried[0].failure_kind).toBe('dns_error');
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy.mock.calls[0]?.[1]).toMatchObject({ redirect: 'manual' });
   });
 });

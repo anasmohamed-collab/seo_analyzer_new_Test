@@ -382,7 +382,11 @@ test('the run summary is compact and carries no broad mention', () => {
   });
 
   assert.match(text, /^:clipboard: \*SEO Audit Summary\*/);
-  assert.match(text, /Audited: 1 \| Failed: 0 \| Timed out: 0 \| Skipped: 0/);
+  assert.match(text, /Discovered: 1 \| Eligible: 1 \| Attempted: 1/);
+  assert.match(
+    text,
+    /Completed: 1 \| Deferred: 0 \| Skipped: 0 \| Failed: 0 \| Timed out: 0 \| Trigger unknown: 0/,
+  );
   assert.match(text, /Critical projects: 1 \| P0: 1 \| New: 1 \| Resolved: 0/);
   assert.match(text, /Robots: ✅ 1 \| ❌ 0 \| ⚠️ 0 \| ❓ 0/);
   assert.match(text, /Sitemaps: ✅ 1 \| ❌ 0 \| ⚠️ 0 \| ❓ 0/);
@@ -408,7 +412,7 @@ test('operational counters appear only when non-zero', () => {
     totals: summaryTotals({ deduplicated: 2, triggerOutcomeUnknown: 1, notificationFailures: 3 }),
   });
   assert.match(text, /Duplicates skipped: 2/);
-  assert.match(text, /Trigger outcome unknown: 1/);
+  assert.match(text, /Trigger unknown: 1/);
   assert.match(text, /Failed Slack notifications: 3/);
 });
 
@@ -424,8 +428,11 @@ test('a run with zero completed audits never claims a zero critical state', () =
     }),
   });
   assert.match(text, /No audits completed in this cycle\./);
-  assert.match(text, /Discovered: 13 \| Due\/selected: 5/);
-  assert.match(text, /Failed: 0 \| Timed out: 0 \| Skipped: 3/);
+  assert.match(text, /Discovered: 13 \| Eligible: 5 \| Attempted: 0/);
+  assert.match(
+    text,
+    /Completed: 0 \| Deferred: 2 \| Skipped: 1 \| Failed: 0 \| Timed out: 0 \| Trigger unknown: 0/,
+  );
   assert.match(text, /Duration: 20s \| Execution: `1033403c`/);
   assert.ok(!/critical/i.test(text), 'no critical-state conclusion without a completed audit');
   assert.ok(!/Robots:/.test(text), 'no technical aggregate without a completed audit');

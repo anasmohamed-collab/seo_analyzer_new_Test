@@ -500,20 +500,31 @@ export function buildRunSummaryMessage({
 }) {
   const t = totals ?? {};
   const completed = num(t.completed);
-  const skipped = num(t.skippedAlreadyRunning) + num(t.skippedMissingConfig);
+  const deferred = num(t.deferred ?? t.skippedAlreadyRunning);
+  const skipped = num(t.skipped ?? t.skippedMissingConfig);
+  const triggerUnknown = num(t.triggerOutcomeUnknown);
+  const eligible = num(t.eligible ?? t.selected);
+  const attempted = num(
+    t.attempted ?? (completed + num(t.failed) + num(t.timedOut) + triggerUnknown),
+  );
 
   const lines = [':clipboard: *SEO Audit Summary*', ''];
+
+  lines.push(
+    `Discovered: ${num(t.discovered)} | Eligible: ${eligible} | Attempted: ${attempted}`,
+  );
+  lines.push(
+    `Completed: ${completed} | Deferred: ${deferred} | Skipped: ${skipped} | ` +
+      `Failed: ${num(t.failed)} | Timed out: ${num(t.timedOut)} | ` +
+      `Trigger unknown: ${triggerUnknown}`,
+  );
 
   if (completed === 0) {
     // No completed audit means no current critical-state conclusion exists —
     // the critical and technical sections are omitted, not printed as zeros.
-    lines.push('No audits completed in this cycle.', '');
-    lines.push(`Discovered: ${num(t.discovered)} | Due/selected: ${num(t.selected)}`);
-    lines.push(`Failed: ${num(t.failed)} | Timed out: ${num(t.timedOut)} | Skipped: ${skipped}`);
+    lines.push('', 'No audits completed in this cycle.');
   } else {
-    lines.push(
-      `Audited: ${completed} | Failed: ${num(t.failed)} | Timed out: ${num(t.timedOut)} | Skipped: ${skipped}`,
-    );
+    lines.push('');
     let critical =
       `Critical projects: ${num(t.projectsWithCritical)} | P0: ${num(t.currentP0)} | ` +
       `New: ${num(t.newIssues)}`;
@@ -527,7 +538,6 @@ export function buildRunSummaryMessage({
 
   const extras = [];
   if (num(t.deduplicated) > 0) extras.push(`Duplicates skipped: ${num(t.deduplicated)}`);
-  if (num(t.triggerOutcomeUnknown) > 0) extras.push(`Trigger outcome unknown: ${num(t.triggerOutcomeUnknown)}`);
   if (num(t.notificationFailures) > 0) extras.push(`Failed Slack notifications: ${num(t.notificationFailures)}`);
   if (extras.length > 0) lines.push('', ...extras);
 

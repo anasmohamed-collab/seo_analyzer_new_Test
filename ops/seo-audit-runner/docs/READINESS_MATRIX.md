@@ -1,7 +1,8 @@
 # Final Readiness Matrix — SEO Audit Runner
 
-Last updated: **2026-07-27**, after the CLI-contract-and-documentation pass
-(the fourth and final local preparation phase).
+Last updated: **2026-08-10**, after the seven production-readiness
+implementation phases. The controlled TEST pilot remains prepared, not
+executed.
 
 ## Verdict summary
 
@@ -9,7 +10,7 @@ Last updated: **2026-07-27**, after the CLI-contract-and-documentation pass
 |---|---|
 | **Local automation readiness** | ✅ **PASS** — full runner suite green on Node 24 / Windows |
 | **Linux staging readiness** | ⏳ **NEEDS LINUX STAGING** — never executed on a systemd host |
-| **Production readiness** | ⛔ **NOT READY** — blocked by staging *and* Gate 6 |
+| **Production readiness** | ⛔ **NOT READY** — private/authenticated ingress, app + sidecar egress, staging, and pilot evidence remain external blockers |
 | **Timer activation readiness** | ⛔ **NOT READY** — timer ships disabled; gates unmet |
 
 The honest bottom line: **local completion is achievable and achieved.**
@@ -32,7 +33,7 @@ amount of local testing can change that.
 
 | Item | Status | Evidence |
 |---|---|---|
-| Full runner test suite | **PASS** | `npm test` — 414 tests, 413 pass, 1 skip, 0 fail (Node 24.14.0; the skip is a Windows-only file-symlink case) |
+| Full runner test suite | **PASS** | `npm test` — 471 tests, 470 pass, 1 skip, 0 fail (the skip is the existing Windows symlink case) |
 | Zero production dependencies | **PASS** | `package.json` `dependencies: {}`; Node built-ins + `node:sqlite` only |
 | Versioned JSON envelope | **PASS** | `test/cliContract.test.js` — `schemaVersion`/`command`/`ok`/`generatedAt` on every JSON command |
 | JSON-mode stdout is JSON only | **PASS** | same suite — asserted at `RUNNER_LOG_LEVEL=debug`; logger writes to stderr |
@@ -53,7 +54,7 @@ amount of local testing can change that.
 | Deployment scripts staged-dir tested | **PASS** | install/upgrade/rollback/backup/restore/uninstall/purge suites against temp dirs |
 | Windows Git Bash + PowerShell portability | **PASS** | suite green from both shells; `deploy/*.sh` self-harden `PATH` |
 | Isolation: no app import, no PostgreSQL | **PASS** | source scan — no `pg`/`server/`/`backend/`/`src/` import anywhere under the runner |
-| Scope: changes confined to the runner | **PASS** | `git diff --name-only` returns only `ops/seo-audit-runner/**` |
+| Runner isolation | **PASS** | runner source imports no application module and never connects to application PostgreSQL; app security/type fixes are separate phase commits |
 
 **What "PASS" does not mean here.** All HTTP is mocked and all SQLite
 databases are temporary. No real audit ran, no real Slack message was sent, no
@@ -78,6 +79,9 @@ Nothing in this section has been executed on Linux. Gate 5 in
 | journald logging and rotation | **NEEDS LINUX STAGING** | no journald locally |
 | `ProtectSystem=strict` / `ReadWritePaths=` hardening effective | **NEEDS LINUX STAGING** | systemd sandboxing |
 | Memory cap (2 GB) enforced | **NEEDS LINUX STAGING** | systemd cgroup |
+| Timer `Persistent=false` effective | **NEEDS LINUX STAGING** | unit is correct locally; requires systemd verification |
+| Private + authenticated API ingress | **BLOCKED** | IT-owned boundary; repository has no API-auth middleware |
+| Application + sidecar egress policy | **BLOCKED** | host/container enforcement and DNS-rebinding coverage require IT verification |
 | `doctor` systemd checks against real units | **NEEDS LINUX STAGING** | locally returns the documented "systemctl not available" warning |
 | End-to-end install→…→uninstall sequence | **NEEDS LINUX STAGING** | Gate 5 sequence |
 | Backup/restore round trip with the `sqlite3` CLI path | **NEEDS LINUX STAGING** | local runs exercise the Node fallback path |
@@ -92,38 +96,45 @@ with output recorded.
 
 | Gate | Status | Blocker |
 |---|---|---|
-| Gate 1 — baseline | **PASS** | recorded 2026-07-21 |
-| Gate 2 — scope enforcement | **PASS** | runner-only diff, re-checked this phase |
-| Gate 3 — local validation | **PASS** | except the systemd steps deferred to Gate 5 |
-| Gate 4 — review | **NOT VERIFIED** | this phase's diff is not yet reviewed |
+| Gate 1 — baseline | **PASS** | exact local branch/base and test baseline recorded; no production contact |
+| Gate 2 — scope enforcement | **PASS** | seven bounded phase commits; no migration or SEO-rule change |
+| Gate 3 — local validation | **PASS** | except Linux/systemd/network-boundary steps deferred to Gate 5 |
+| Gate 4 — review | **PASS** | each phase diff reviewed before its separate commit |
 | Gate 5 — isolated staging | **NEEDS LINUX STAGING** | §2 above |
-| Gate 6 — controlled production install | **BLOCKED** | the live application has **zero projects**; needs (a) projects recreated/migrated and (b) one operator-approved project for a single watched audit |
+| Controlled TEST pilot | **BLOCKED** | exact runbook prepared; ingress/egress evidence, Linux staging, authorization, and execution still required |
+| Gate 6 — controlled production install | **BLOCKED** | TEST evidence plus IT ingress/egress attestations and separately authorized production verification are required |
 | Gate 7 — first-week monitoring | **BLOCKED** | cannot start before Gate 6 |
 
-Production stays **NOT READY** until Gate 5 passes on Linux *and* Gate 6's
-blocking precondition is lifted by the operator.
+Production stays **NOT READY** until Linux staging and the controlled TEST
+pilot pass, both network-boundary attestations exist, and Gate 6 is separately
+authorized.
 
 ### Remaining production risks
 
-1. **The application API is unauthenticated.** The runner deliberately invents
-   no token. Mitigation: `SEO_API_BASE_URL` must be localhost, a private
-   address, or https — enforced by config validation.
-2. **Slack delivery is best-effort idempotent.** A crash in the narrow window
+1. **API ingress is not authenticated by repository code.** The runner
+   deliberately invents no token. Private reachability is insufficient; an
+   IT-owned boundary must authenticate the runner workload.
+2. **The complete network egress boundary is external.** Application code
+   validates HTTP(S), A/AAAA answers, blocked ranges, and native redirects, but
+   host/container controls are still required for DNS rebinding and headless
+   Scrapling redirects.
+3. **Slack delivery is best-effort idempotent.** A crash in the narrow window
    between Slack accepting a request and the local `DELIVERED` mark can
    duplicate one message on retry. Slack offers no client-supplied dedup key,
    so exactly-once is impossible.
-3. **Multi-part notifications re-send all parts** if one part fails.
-4. **`TIMED_OUT` is a runner-side give-up**, not a cancellation — the audit may
+4. **Multi-part notifications re-send all parts** if one part fails.
+5. **`TIMED_OUT` is a runner-side give-up**, not a cancellation — the audit may
    still complete server-side. The runner never modifies application status
    and a timed-out run never updates lifecycle state.
-5. **`running_count` is a best-effort guard** — the application has no
-   server-side audit lock.
-6. **First run after a state loss re-reports every active P0 as `NEW`** once.
-7. **Fingerprint v2 re-bases identities once** on the first run after upgrade
+6. **The pre-flight `running_count` can race**, but DB mode now closes the race
+   with a per-project transaction/advisory lock and HTTP 409 on an existing
+   RUNNING audit. In-memory mode is not automation-capable.
+7. **First run after a state loss re-reports every active P0 as `NEW`** once.
+8. **Fingerprint v2 re-bases identities once** on the first run after upgrade
    (old issues resolve, reappear as new, in a single transition).
-8. **Unverified load impact.** The effect of a full `run --all` on the live
-   application has never been measured. Gate 6 step 8 is a single project for
-   this reason.
+9. **Unverified load impact.** Start TEST with concurrency 1, max one job per
+   tick, one normal project, and one WAF project. Record duration and resource
+   headroom before any wider cohort.
 
 ## 4. Timer activation readiness — ⛔ NOT READY
 
@@ -141,6 +152,8 @@ The timer **ships disabled** and installation never invokes `systemctl`.
 | One controlled `run --project <id>` reviewed | **BLOCKED** (Gate 6) |
 | Gates 5–7 satisfied | **BLOCKED** |
 | State backup taken and restore rehearsed | **NEEDS LINUX STAGING** |
+| Private/authenticated ingress attested | **BLOCKED** |
+| Application + sidecar egress attested | **BLOCKED** |
 
 Activation is a single deliberate act, only after all of the above:
 
@@ -166,7 +179,7 @@ PASS" is made of.
 - [x] State initialization explicit via `init`; implicit path documented + tested
 - [x] List output bounded by default with documented limits
 - [x] Node checker contract tested (18/20/22.4 reject · 22.5/23 flag · 24+ clean)
-- [x] Docs match the implementation after Prompts 1–3 and this pass
+- [x] Docs match the project-bound, eligibility, evidence, defer, and reporting implementation
 - [x] Runner/application boundaries stated (SQLite vs PostgreSQL, API-only)
 - [x] One tick timer only, stated everywhere scheduling is discussed
 - [x] cron/systemd exclusivity stated
@@ -177,6 +190,7 @@ PASS" is made of.
 - [x] Prompt 2 reliability tests pass
 - [x] Prompt 3 single-systemd-model tests pass
 - [x] `npm test` green; `git diff --check` clean
-- [x] No file outside `ops/seo-audit-runner/` changed
-- [x] No application behavior changed
+- [x] No runner deployment script modifies the application runtime
+- [x] No SEO scoring, severity, checklist, or recommendation behavior changed
+- [x] Controlled TEST pilot runbook prepared with Slack disabled and explicit IDs
 - [x] No real audit triggered, no real notification sent, no timer enabled

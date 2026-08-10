@@ -25,6 +25,7 @@ const OPERATOR_DOCS = [
   'docs/READINESS_MATRIX.md',
   'docs/DEPLOYMENT_ARCHITECTURE.md',
   'docs/PRODUCTION_GATES.md',
+  'docs/TEST_PILOT_RUNBOOK.md',
   'deploy/README-deploy.md',
   'deploy/SERVER-HANDOVER.md',
   'deploy/TROUBLESHOOTING.md',
@@ -165,6 +166,49 @@ test('the readiness matrix keeps Linux and production honestly unverified', () =
     !/production (is )?ready|ready for production/i.test(matrix),
     'the matrix must never claim production readiness',
   );
+});
+
+test('controlled TEST pilot contract stays conservative and unexecuted', () => {
+  const pilot = read('docs/TEST_PILOT_RUNBOOK.md');
+  assert.match(pilot, /PREPARED, NOT EXECUTED/);
+
+  const orderedSteps = [
+    'Slack disabled',
+    'Eligibility dry-run',
+    'One normal project',
+    'Assert expected project ID equals returned site ID',
+    'Inspect complete evidence',
+    'One WAF project',
+    'Small staggered cohort',
+    'Record durations and resources',
+    'Only then consider a wider fleet',
+  ];
+  let cursor = -1;
+  for (const [index, title] of orderedSteps.entries()) {
+    const next = pilot.indexOf(`### ${index + 1}. ${title}`);
+    assert.ok(next > cursor, `pilot step ${index + 1} is missing or out of order`);
+    cursor = next;
+  }
+
+  for (const setting of [
+    'RUNNER_CONCURRENCY=1',
+    'RUNNER_MAX_JOBS_PER_TICK=1',
+    'RUNNER_INCLUDE_PROJECT_IDS=',
+    'RUNNER_EXCLUDE_PROJECT_IDS=',
+    'RUNNER_EXCLUDE_NONPRODUCTION=true',
+    'RUNNER_REQUIRE_STORED_CONFIG=true',
+    'NOTIFICATIONS_ENABLED=false',
+    'SEO_RUNNER_ALERT_MODE=disabled',
+  ]) {
+    assert.ok(pilot.includes(setting), `pilot must pin ${setting}`);
+  }
+
+  assert.match(pilot, /private ingress/i);
+  assert.match(pilot, /authenticated workload identity/i);
+  assert.match(pilot, /application and the\s+Scrapling sidecar/i);
+  assert.match(pilot, /Persistent=false/);
+  assert.match(pilot, /systemctl disable --now seo-runner-tick\.timer/);
+  assert.match(pilot, /project-specific schedules/i);
 });
 
 test('docs never instruct enabling a timer without the pre-enable gates', () => {

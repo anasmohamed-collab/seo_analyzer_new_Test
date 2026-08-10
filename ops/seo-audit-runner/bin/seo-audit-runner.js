@@ -35,8 +35,15 @@ import { createLogger } from '../src/logger.js';
 import { ApiClient } from '../src/apiClient.js';
 import { acquireLock, LockError } from '../src/lock.js';
 import { runAudits } from '../src/orchestrator.js';
-import { computeExitCode, formatTextReport, summarize, EXIT_CODES, OUTCOME } from '../src/report.js';
-import { dedupeProjects, hasUsableFormValues } from '../src/dedupe.js';
+import {
+  computeExitCode,
+  executionFinalStatus,
+  formatTextReport,
+  summarize,
+  EXIT_CODES,
+} from '../src/report.js';
+import { dedupeProjects } from '../src/dedupe.js';
+import { evaluateProjectEligibility } from '../src/eligibility.js';
 import { openStateDb } from '../src/db.js';
 import { StateStore } from '../src/stateStore.js';
 import { createSlackSender } from '../src/slackClient.js';
@@ -98,6 +105,9 @@ Run options:
   --max-concurrency <n>     Override RUNNER_CONCURRENCY for this run
   --no-notifications        Disable notifications for this run
   --fail-on-critical        Exit with code 3 when critical (P0) issues exist
+  --allow-historical-fallback
+                            Manual --project only: use a prior completed audit
+                            when stored URL configuration is unavailable
 
 retry-notifications options:
   --limit <n>               Max notifications to retry (default ${DEFAULT_LIST_LIMIT})
@@ -130,6 +140,7 @@ async function main() {
         'max-concurrency': { type: 'string' },
         'no-notifications': { type: 'boolean', default: false },
         'fail-on-critical': { type: 'boolean', default: false },
+        'allow-historical-fallback': { type: 'boolean', default: false },
         limit: { type: 'string' },
         output: { type: 'string' },
         'env-file': { type: 'string' },
@@ -240,9 +251,14 @@ function validateConfigCommand(config, logger, out) {
   const data = {
     apiBaseUrl: config.apiBaseUrlRedacted,
     runnerConcurrency: config.runnerConcurrency,
+    runnerMaxJobsPerTick: config.runnerMaxJobsPerTick,
     pollIntervalMs: config.pollIntervalMs,
     pollTimeoutMs: config.pollTimeoutMs,
     httpRequestTimeoutMs: config.httpRequestTimeoutMs,
+    includeProjectIdCount: config.includeProjectIds.size,
+    excludeProjectIdCount: config.excludeProjectIds.size,
+    excludeNonproduction: config.excludeNonproduction,
+    requireStoredConfig: config.requireStoredConfig,
     stateDir: config.stateDir,
     stateDbPath: config.stateDbPath,
     logLevel: config.logLevel,
@@ -260,9 +276,14 @@ function validateConfigCommand(config, logger, out) {
     'Configuration OK',
     `  SEO_API_BASE_URL        = ${config.apiBaseUrlRedacted}`,
     `  RUNNER_CONCURRENCY      = ${config.runnerConcurrency}`,
+    `  RUNNER_MAX_JOBS_PER_TICK = ${config.runnerMaxJobsPerTick}`,
     `  POLL_INTERVAL_MS        = ${config.pollIntervalMs}`,
     `  POLL_TIMEOUT_MS         = ${config.pollTimeoutMs}`,
     `  HTTP_REQUEST_TIMEOUT_MS = ${config.httpRequestTimeoutMs}`,
+    `  RUNNER_INCLUDE_PROJECT_IDS = ${config.includeProjectIds.size} configured`,
+    `  RUNNER_EXCLUDE_PROJECT_IDS = ${config.excludeProjectIds.size} configured`,
+    `  RUNNER_EXCLUDE_NONPRODUCTION = ${config.excludeNonproduction}`,
+    `  RUNNER_REQUIRE_STORED_CONFIG = ${config.requireStoredConfig}`,
     `  RUNNER_STATE_DIR        = ${config.stateDir}`,
     `  RUNNER_STATE_DB_PATH    = ${config.stateDbPath}`,
     `  RUNNER_LOG_LEVEL        = ${config.logLevel}`,
@@ -339,7 +360,11 @@ async function listProjectsCommand(config, logger, out) {
     return EXIT_CODES.RUNNER_FAILURE;
   }
 
-  const { winners, duplicates } = dedupeProjects(projects);
+  const decisions = new Map(
+    projects.map((project) => [String(project.id), evaluateProjectEligibility(project, config)]),
+  );
+  const eligibleProjects = projects.filter((project) => decisions.get(String(project.id)).eligible);
+  const { winners, duplicates } = dedupeProjects(eligibleProjects);
   const winnerIds = new Set(winners.map((w) => String(w.project.id)));
   const duplicateById = new Map(duplicates.map((d) => [String(d.project.id), d.winnerId]));
 
@@ -350,27 +375,31 @@ async function listProjectsCommand(config, logger, out) {
       name: p.project_name ?? p.name ?? null,
       domain: p.domain ?? null,
       websiteUrl: p.website_url ? redactUrl(p.website_url) : null,
-      auditConfigUsable: hasUsableFormValues(p),
+      eligibility: decisions.get(id).eligible ? 'ELIGIBLE' : 'INELIGIBLE',
+      eligibilityReason: decisions.get(id).reason,
       lastAuditAt: p.last_audit_at ?? null,
       auditCount: p.audit_count ?? 0,
       completedCount: p.completed_count ?? 0,
-      dedupe: winnerIds.has(id) ? 'winner' : 'deduplicated',
-      coveredBy: winnerIds.has(id) ? null : (duplicateById.get(id) ?? null),
+      dedupe: decisions.get(id).eligible
+        ? (winnerIds.has(id) ? 'winner' : 'deduplicated')
+        : 'not-considered',
+      coveredBy: decisions.get(id).eligible && !winnerIds.has(id) ? (duplicateById.get(id) ?? null) : null,
     };
   });
 
   out.ok(
-    { discovered: projects.length, uniqueDomains: winners.length, projects: rows },
+    { discovered: projects.length, eligible: eligibleProjects.length, uniqueDomains: winners.length, projects: rows },
     () =>
       [
-        `${projects.length} project(s) — ${winners.length} unique domain(s)`,
+        `${projects.length} project(s) — ${eligibleProjects.length} eligible — ${winners.length} unique eligible domain(s)`,
         '',
         ...rows.map((r) =>
           `- ${r.id}\n` +
           `    name: ${r.name ?? '(unnamed)'} | domain: ${r.domain ?? '?'}\n` +
-          `    website_url: ${r.websiteUrl ?? '(none)'} | audit config usable: ${r.auditConfigUsable ? 'yes' : 'NO'}\n` +
+          `    website_url: ${r.websiteUrl ?? '(none)'}\n` +
+          `    ${r.eligibility}${r.eligibility === 'INELIGIBLE' ? ` — ${r.eligibilityReason}` : ''}\n` +
           `    last_audit_at: ${r.lastAuditAt ?? 'never'} | audits: ${r.auditCount} (completed: ${r.completedCount})\n` +
-          `    dedupe: ${r.dedupe === 'winner' ? 'winner' : `deduplicated: covered by ${r.coveredBy}`}`,
+          `    dedupe: ${r.dedupe === 'winner' ? 'winner' : r.dedupe === 'deduplicated' ? `deduplicated: covered by ${r.coveredBy}` : 'not considered'}`,
         ),
       ].join('\n'),
   );
@@ -384,6 +413,7 @@ async function runCommand(config, logger, values, out) {
   const projectId = values.project ?? null;
   const dryRun = Boolean(values['dry-run']);
   const noNotifications = Boolean(values['no-notifications']);
+  const allowHistoricalFallback = Boolean(values['allow-historical-fallback']);
 
   if (!all && !projectId) {
     out.fail(ERROR_CODES.USAGE, `run requires --all or --project <id>\n\n${USAGE}`);
@@ -391,6 +421,13 @@ async function runCommand(config, logger, values, out) {
   }
   if (all && projectId) {
     out.fail(ERROR_CODES.USAGE, 'run accepts either --all or --project <id>, not both');
+    return EXIT_CODES.RUNNER_FAILURE;
+  }
+  if (allowHistoricalFallback && (!projectId || all)) {
+    out.fail(
+      ERROR_CODES.USAGE,
+      '--allow-historical-fallback is permitted only with an explicit run --project <id>',
+    );
     return EXIT_CODES.RUNNER_FAILURE;
   }
 
@@ -442,10 +479,15 @@ async function runCommand(config, logger, values, out) {
   let pipeline = null;
   let runnerExecutionId = null;
   let stateStore = null;
+  let executionFinished = false;
   if (!dryRun) {
     try {
       stateDb = openStateDb(config.stateDbPath, { logger });
       stateStore = new StateStore(stateDb);
+      const recovered = stateStore.recoverAbandonedRuns();
+      if (recovered.length > 0) {
+        logger.warn(`Recovered ${recovered.length} abandoned runner execution row(s) as FAILED`);
+      }
       runnerExecutionId = randomUUID();
       stateStore.createRun({ id: runnerExecutionId, startedAt: new Date().toISOString() });
 
@@ -486,6 +528,7 @@ async function runCommand(config, logger, values, out) {
         projectId,
         dryRun,
         maxConcurrency,
+        allowHistoricalFallback,
         onProjectCompleted: pipeline
           ? (ctx) => pipeline.handleProjectCompleted(ctx)
           : undefined,
@@ -496,15 +539,17 @@ async function runCommand(config, logger, values, out) {
     if (!dryRun && pipeline && stateStore) {
       const s = summarize(report);
       const totals = {
-        discovered: report.discoveredProjects,
+        discovered: s.discovered,
+        eligible: s.eligible,
+        attempted: s.attempted,
         selected: report.selectedProjects,
         deduplicated: s.deduplicated,
         completed: s.completed,
-        failed: s.counts[OUTCOME.FAILED] ?? 0,
-        timedOut: s.counts[OUTCOME.TIMED_OUT] ?? 0,
-        skippedAlreadyRunning: s.counts[OUTCOME.SKIPPED_ALREADY_RUNNING] ?? 0,
-        skippedMissingConfig: s.counts[OUTCOME.SKIPPED_MISSING_AUDIT_CONFIG] ?? 0,
-        triggerOutcomeUnknown: s.counts[OUTCOME.TRIGGER_OUTCOME_UNKNOWN] ?? 0,
+        deferred: s.deferred,
+        skipped: s.skipped,
+        failed: s.failed,
+        timedOut: s.timedOut,
+        triggerOutcomeUnknown: s.triggerUnknown,
         projectsWithCritical: pipeline.lifecycleTotals.projectsWithCritical,
         currentP0: pipeline.lifecycleTotals.currentP0,
         newIssues: pipeline.lifecycleTotals.new,
@@ -527,15 +572,16 @@ async function runCommand(config, logger, values, out) {
       try {
         stateStore.finishRun(runnerExecutionId, {
           completedAt: report.finishedAt,
-          finalStatus: report.aborted ? 'ABORTED' : 'COMPLETED',
+          finalStatus: executionFinalStatus(report),
           totalProjects: report.discoveredProjects,
           successfulAudits: s.completed,
-          failedAudits: (s.counts[OUTCOME.FAILED] ?? 0) + (s.counts[OUTCOME.TRIGGER_FAILED] ?? 0),
-          timedOutAudits: s.counts[OUTCOME.TIMED_OUT] ?? 0,
+          failedAudits: s.failed + s.triggerUnknown,
+          timedOutAudits: s.timedOut,
           deduplicatedProjects: s.deduplicated,
           projectsWithCritical: pipeline.lifecycleTotals.projectsWithCritical,
           notificationStatus: JSON.stringify(pipeline.counters),
         });
+        executionFinished = true;
       } catch (err) {
         logger.warn(`Could not record automation run in state DB: ${err.message}`);
       }
@@ -582,6 +628,19 @@ async function runCommand(config, logger, values, out) {
     logger.info(`Run finished with exit code ${code}`);
     return code;
   } catch (err) {
+    if (!dryRun && stateStore && runnerExecutionId && !executionFinished) {
+      try {
+        stateStore.finishRun(runnerExecutionId, {
+          completedAt: new Date().toISOString(),
+          finalStatus: 'FAILED',
+          failedAudits: 1,
+          notificationStatus: JSON.stringify({ runnerError: logger.redact(err.message) }),
+        });
+        executionFinished = true;
+      } catch (stateErr) {
+        logger.warn(`Could not persist failed runner execution: ${stateErr.message}`);
+      }
+    }
     logger.error(`Runner failure: ${err.stack ?? err.message}`);
     out.fail(ERROR_CODES.INTERNAL, `Runner failure: ${logger.redact(err.message)}`);
     return EXIT_CODES.RUNNER_FAILURE;

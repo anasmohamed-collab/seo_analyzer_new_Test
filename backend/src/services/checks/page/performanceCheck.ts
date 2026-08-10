@@ -2,6 +2,7 @@
  * Performance & CWV MVP — light timings + optional PageSpeed Insights.
  */
 import process from 'node:process';
+import { safeFetch as fetch } from '../../../../../shared/outbound-url-safety.js';
 
 export interface PsiData {
   performance: number | null;

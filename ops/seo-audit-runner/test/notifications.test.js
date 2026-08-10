@@ -33,11 +33,34 @@ function mockSender({ failWith = null, failTimes = 0 } = {}) {
   };
 }
 
-const project = { id: 'p1', domain: 'example.com', website_url: 'https://example.com', project_name: 'Example' };
+const submittedUrls = {
+  homeUrl: 'https://example.com/',
+  articleUrl: 'https://example.com/article',
+};
+const project = {
+  id: 'p1',
+  domain: 'example.com',
+  website_url: 'https://example.com',
+  project_name: 'Example',
+  last_form_values: submittedUrls,
+};
 
 const results = (issues = 1, over = {}) => ({
   status: 'COMPLETED',
-  results: Array.from({ length: Math.max(1, issues) }, (_, i) => ({ url: `https://example.com/${i}` })),
+  siteRecommendations: [],
+  siteChecks: siteChecks(),
+  results: [
+    {
+      url: submittedUrls.homeUrl,
+      data: { pageType: 'home', page_state: 'OK', httpStatus: 200, checkErrors: [] },
+      recommendations: [],
+    },
+    {
+      url: submittedUrls.articleUrl,
+      data: { pageType: 'article', page_state: 'OK', httpStatus: 200, checkErrors: [] },
+      recommendations: [],
+    },
+  ],
   ...over,
 });
 
@@ -62,7 +85,7 @@ const critical = (n) => ({
 });
 
 function pipelineWith(store, sender, configOver = {}) {
-  return createNotificationPipeline({
+  const pipeline = createNotificationPipeline({
     config: {
       alertMode: 'new_or_regressed',
       sendRunSummary: true,
@@ -74,6 +97,25 @@ function pipelineWith(store, sender, configOver = {}) {
     slackSender: sender,
     runnerExecutionId: 'exec-1',
   });
+  const handleProjectCompleted = pipeline.handleProjectCompleted;
+  pipeline.handleProjectCompleted = (args) => {
+    const expectedProject = args.project?.id ?? project.id;
+    const expectedUrls = args.project?.last_form_values ?? submittedUrls;
+    const payload = args.results && typeof args.results === 'object'
+      ? {
+          id: args.results.id ?? args.auditRunId,
+          siteId: args.results.siteId ?? expectedProject,
+          ...args.results,
+        }
+      : args.results;
+    return handleProjectCompleted({
+      ...args,
+      siteId: args.siteId ?? expectedProject,
+      submittedUrls: args.submittedUrls ?? expectedUrls,
+      results: payload,
+    });
+  };
+  return pipeline;
 }
 
 test('delivered project notification is persisted and issues marked alerted', async () => {
@@ -179,7 +221,12 @@ test('already-delivered notification is not resent (idempotency)', async () => {
   db2.prepare('DELETE FROM issue_states').run();
   db2.prepare('DELETE FROM project_snapshots').run();
   const outcome = await p2.handleProjectCompleted({
-    project, auditRunId: 'r1', results: results(), criticalIssues: [critical(1)],
+    project,
+    siteId: 'p1',
+    auditRunId: 'r1',
+    submittedUrls,
+    results: { id: 'r1', siteId: 'p1', ...results() },
+    criticalIssues: [critical(1)],
   });
   assert.equal(outcome.notificationStatus, 'already-delivered');
   assert.equal(sender.sent.length, 1, 'no duplicate Slack send');
@@ -439,20 +486,20 @@ test('the project alert reports robots, sitemap, and news sitemap from the audit
   db.close();
 });
 
-test('an audit result without siteChecks reports Unknown, never Missing', async () => {
+test('an audit result without siteChecks is incomplete and sends no project alert', async () => {
   const { db, store } = freshStore();
   const sender = mockSender();
   const pipeline = pipelineWith(store, sender);
 
-  await pipeline.handleProjectCompleted({
-    project, auditRunId: 'r1', results: results(), criticalIssues: [critical(1)],
+  const outcome = await pipeline.handleProjectCompleted({
+    project,
+    auditRunId: 'r1',
+    results: results(1, { siteChecks: undefined }),
+    criticalIssues: [critical(1)],
   });
 
-  assert.match(
-    sender.sent[0].text,
-    /\*Technical:\* Robots ❓ Unknown \| Sitemap ❓ Unknown \| News sitemap ❓ Unknown/,
-  );
-  assert.ok(!sender.sent[0].text.includes('Missing'));
+  assert.equal(outcome.notificationStatus, 'skipped-incomplete-evidence');
+  assert.equal(sender.sent.length, 0);
   db.close();
 });
 
@@ -474,16 +521,16 @@ test('run-summary technical aggregates count only completed audits and total exa
   const skipped = await pipeline.handleProjectCompleted({
     project: { ...project, id: 'p3' }, auditRunId: 'r3', results: { status: 'FAILED' }, criticalIssues: [],
   });
-  assert.equal(skipped.notificationStatus, 'skipped-partial-results');
+  assert.equal(skipped.notificationStatus, 'skipped-incomplete-evidence');
 
   const totals = pipeline.technicalTotals;
-  assert.equal(totals.completedAudits, 2, 'only complete COMPLETED payloads are aggregated');
+  assert.equal(totals.completedAudits, 1, 'failed site-check evidence is not aggregated');
   for (const key of ['robots', 'sitemap', 'newsSitemap']) {
     const b = totals[key];
     assert.equal(b.found + b.missing + b.error + b.unknown, totals.completedAudits, `${key} must total`);
   }
-  assert.deepEqual(totals.robots, { found: 1, missing: 0, error: 1, unknown: 0 });
-  assert.deepEqual(totals.newsSitemap, { found: 0, missing: 2, error: 0, unknown: 0 });
+  assert.deepEqual(totals.robots, { found: 1, missing: 0, error: 0, unknown: 0 });
+  assert.deepEqual(totals.newsSitemap, { found: 0, missing: 1, error: 0, unknown: 0 });
 
   await pipeline.sendRunSummary({
     startedAt: '2026-07-13T06:00:00.000Z',
@@ -496,9 +543,10 @@ test('run-summary technical aggregates count only completed audits and total exa
     },
   });
   const summary = sender.sent.at(-1).text;
-  assert.match(summary, /Audited: 2 \| Failed: 1/);
-  assert.match(summary, /Robots: ✅ 1 \| ❌ 0 \| ⚠️ 1 \| ❓ 0/);
-  assert.match(summary, /News sitemaps: ✅ 0 \| ❌ 2 \| ⚠️ 0 \| ❓ 0/);
+  assert.match(summary, /Discovered: 3 \| Eligible: 3 \| Attempted: 3/);
+  assert.match(summary, /Completed: 2 .* Failed: 1/);
+  assert.match(summary, /Robots: .* 1 \| .* 0 \| .* 0 \| .* 0/);
+  assert.match(summary, /News sitemaps: .* 0 \| .* 1 \| .* 0 \| .* 0/);
   db.close();
 });
 
@@ -520,7 +568,8 @@ test('a run with zero completed audits sends the no-audits summary', async () =>
 
   const summary = sender.sent[0].text;
   assert.match(summary, /No audits completed in this cycle\./);
-  assert.match(summary, /Discovered: 13 \| Due\/selected: 4/);
+  assert.match(summary, /Discovered: 13 \| Eligible: 4 \| Attempted: 0/);
+  assert.match(summary, /Completed: 0 \| Deferred: 4 \| Skipped: 0/);
   assert.ok(!/critical/i.test(summary), 'a zero-audit run states no critical conclusion');
   assert.ok(!/Robots:/.test(summary), 'and no technical aggregate');
   db.close();

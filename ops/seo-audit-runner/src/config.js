@@ -29,10 +29,15 @@ const LOG_LEVELS = ['error', 'warn', 'info', 'debug'];
 const DEFAULTS = {
   SEO_API_BASE_URL: 'http://localhost:3000',
   RUNNER_CONCURRENCY: '1',
+  RUNNER_MAX_JOBS_PER_TICK: '6',
   POLL_INTERVAL_MS: '5000',
   POLL_TIMEOUT_MS: '900000',
   HTTP_REQUEST_TIMEOUT_MS: '30000',
   RUNNER_LOG_LEVEL: 'info',
+  RUNNER_INCLUDE_PROJECT_IDS: '',
+  RUNNER_EXCLUDE_PROJECT_IDS: '',
+  RUNNER_EXCLUDE_NONPRODUCTION: 'true',
+  RUNNER_REQUIRE_STORED_CONFIG: 'true',
   NOTIFICATIONS_ENABLED: 'false',
   ALLOW_INSECURE_PUBLIC_API: 'false',
   SEO_RUNNER_ALERT_MODE: 'new_or_regressed',
@@ -84,6 +89,28 @@ export function redactUrl(raw) {
 
 function parseBool(value) {
   return ['true', '1', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+}
+
+function parseStrictBool(key, value, problems) {
+  const normalized = String(value).trim().toLowerCase();
+  if (['true', '1', 'yes', 'on'].includes(normalized)) return true;
+  if (['false', '0', 'no', 'off'].includes(normalized)) return false;
+  problems.push(`${key} must be true or false, got: ${value || '(empty)'}`);
+  return null;
+}
+
+function parseProjectIds(key, value, problems) {
+  const ids = new Set();
+  for (const rawId of String(value ?? '').split(',')) {
+    const id = rawId.trim();
+    if (!id) continue;
+    if (!/^[A-Za-z0-9._:-]{1,128}$/.test(id)) {
+      problems.push(`${key} contains an invalid project ID: ${id}`);
+      continue;
+    }
+    ids.add(id);
+  }
+  return ids;
 }
 
 /**
@@ -157,9 +184,33 @@ export function loadConfig(env = process.env) {
     return value;
   };
   const runnerConcurrency = parsePositiveInt('RUNNER_CONCURRENCY');
+  const runnerMaxJobsPerTick = parsePositiveInt('RUNNER_MAX_JOBS_PER_TICK');
   const pollIntervalMs = parsePositiveInt('POLL_INTERVAL_MS', { min: 100 });
   const pollTimeoutMs = parsePositiveInt('POLL_TIMEOUT_MS', { min: 1000 });
   const httpRequestTimeoutMs = parsePositiveInt('HTTP_REQUEST_TIMEOUT_MS', { min: 1000 });
+
+  // Project-selection safety policy. Exclusions are applied after includes,
+  // so an ID present in both sets is always excluded.
+  const includeProjectIds = parseProjectIds(
+    'RUNNER_INCLUDE_PROJECT_IDS',
+    raw('RUNNER_INCLUDE_PROJECT_IDS'),
+    problems,
+  );
+  const excludeProjectIds = parseProjectIds(
+    'RUNNER_EXCLUDE_PROJECT_IDS',
+    raw('RUNNER_EXCLUDE_PROJECT_IDS'),
+    problems,
+  );
+  const excludeNonproduction = parseStrictBool(
+    'RUNNER_EXCLUDE_NONPRODUCTION',
+    raw('RUNNER_EXCLUDE_NONPRODUCTION'),
+    problems,
+  );
+  const requireStoredConfig = parseStrictBool(
+    'RUNNER_REQUIRE_STORED_CONFIG',
+    raw('RUNNER_REQUIRE_STORED_CONFIG'),
+    problems,
+  );
 
   // ── Logging ─────────────────────────────────────────────────────
   const logLevel = raw('RUNNER_LOG_LEVEL').toLowerCase();
@@ -239,9 +290,14 @@ export function loadConfig(env = process.env) {
     apiBaseUrl,
     apiBaseUrlRedacted: redactUrl(apiBaseUrl).replace(/\/+$/, ''),
     runnerConcurrency,
+    runnerMaxJobsPerTick,
     pollIntervalMs,
     pollTimeoutMs,
     httpRequestTimeoutMs,
+    includeProjectIds,
+    excludeProjectIds,
+    excludeNonproduction,
+    requireStoredConfig,
     stateDir,
     stateDbPath,
     logLevel,

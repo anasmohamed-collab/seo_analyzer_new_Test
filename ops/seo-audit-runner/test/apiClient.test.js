@@ -137,6 +137,14 @@ test('trigger response without auditRunId is ambiguous', async () => {
   );
 });
 
+test('trigger response without siteId is ambiguous', async () => {
+  const fetchImpl = fetchQueue([json({ auditRunId: 'r1' })]);
+  await assert.rejects(
+    () => client(fetchImpl).startAudit({ homeUrl: 'https://x', articleUrl: 'https://x/a' }),
+    AmbiguousTriggerError,
+  );
+});
+
 test('in-memory mode response is a definitive failure with a clear message', async () => {
   const fetchImpl = fetchQueue([json({ mode: 'in-memory', status: 'COMPLETED', results: [] })]);
   await assert.rejects(

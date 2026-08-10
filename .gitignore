@@ -10,6 +10,8 @@ node_modules
 dist
 dist-ssr
 backend/dist
+__pycache__/
+*.py[cod]
 *.local
 
 .vscode/*

@@ -132,7 +132,7 @@ function ModuleCard({ title, data }: { title: string; data: ModuleResult }) {
           )}
           {data.module === 'canonical_consistency' && (
             <div className="mt-3 space-y-1 text-xs">
-              {(data.canonical as Record<string, unknown>)?.declared && (
+              {Boolean((data.canonical as Record<string, unknown>)?.declared) && (
                 <p className="text-slate-600">Canonical: <span className="font-mono text-slate-800">{String((data.canonical as Record<string, unknown>).declared).substring(0, 80)}</span></p>
               )}
               <p className="text-slate-600">Self-referencing: <span className="font-semibold">{(data.canonical as Record<string, unknown>)?.is_self_referencing ? 'Yes' : 'No'}</span></p>

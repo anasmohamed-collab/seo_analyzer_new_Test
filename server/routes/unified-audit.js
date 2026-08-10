@@ -6,6 +6,7 @@
  * POST /api/unified-audit  { url: string, mode: "technical" | "news" }
  */
 import { Router } from 'express';
+import { safeFetch as fetch } from '../../shared/outbound-url-safety.js';
 import { analyzeTechnical, generateRecommendations } from '../lib/technical-checks.js';
 import { discoverSitemaps } from '../lib/modules/sitemap-discovery.js';
 import { analyzeNewsSitemap } from '../lib/modules/news-sitemap.js';

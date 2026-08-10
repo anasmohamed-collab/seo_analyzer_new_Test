@@ -35,6 +35,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { latestOccurrence, DEFAULT_CATCHUP_WINDOW_MS } from './schedules.js';
 import { JOB_STATUS, JobError } from './jobs.js';
+import { OUTCOME } from './report.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLI_ENTRYPOINT = path.resolve(__dirname, '..', 'bin', 'seo-audit-runner.js');
@@ -57,16 +58,50 @@ export function spawnJobExecutor({ signal } = {}) {
     new Promise((resolve) => {
       const child = spawn(
         process.execPath,
-        [...process.execArgv, CLI_ENTRYPOINT, ...jobArgs(job)],
-        { stdio: ['ignore', 'ignore', 'pipe'], signal, shell: false },
+        [...process.execArgv, CLI_ENTRYPOINT, ...jobArgs(job), '--output', 'json'],
+        { stdio: ['ignore', 'pipe', 'pipe'], signal, shell: false },
       );
+      let stdout = '';
       let stderrTail = '';
+      child.stdout.on('data', (chunk) => {
+        stdout = (stdout + chunk.toString()).slice(-1_000_000);
+      });
       child.stderr.on('data', (chunk) => {
         stderrTail = (stderrTail + chunk.toString()).slice(-2000);
       });
       child.on('error', (err) => resolve({ exitCode: 1, stderr: err.message }));
-      child.on('close', (code) => resolve({ exitCode: code ?? 1, stderr: stderrTail }));
+      child.on('close', (code) => {
+        let report = null;
+        try {
+          const envelope = JSON.parse(stdout);
+          report = envelope?.data?.entries ? envelope.data : null;
+        } catch {
+          // A missing/malformed machine report means a nominal exit 0 cannot
+          // be trusted as a completed scheduled audit.
+        }
+        if ((code ?? 1) === 0 && !report) {
+          resolve({
+            exitCode: 1,
+            stderr: `${stderrTail} child produced no valid JSON run report`.trim(),
+            report: null,
+          });
+          return;
+        }
+        resolve({ exitCode: code ?? 1, stderr: stderrTail, report });
+      });
     });
+}
+
+/** A single-project collision is temporary work still owed. */
+export function isTemporaryProjectDefer(job, execution) {
+  if (job?.project_id == null || execution?.exitCode !== 0) return false;
+  const entries = execution?.report?.entries;
+  if (!Array.isArray(entries) || entries.length !== 1) return false;
+  const entry = entries[0];
+  return (
+    String(entry?.projectId) === String(job.project_id) &&
+    entry?.outcome === OUTCOME.SKIPPED_ALREADY_RUNNING
+  );
 }
 
 /**
@@ -132,7 +167,7 @@ export async function workerTick({
   redact = (s) => s,
   now = new Date(),
   catchupWindowMs = DEFAULT_CATCHUP_WINDOW_MS,
-  maxJobs = 10,
+  maxJobs = 6,
   executeJob = null,
   heartbeatIntervalMs = DEFAULT_HEARTBEAT_INTERVAL_MS,
   retryNotifications = null,
@@ -172,22 +207,28 @@ export async function workerTick({
     }, heartbeatIntervalMs);
     lease.unref?.();
 
-    let exitCode;
-    let stderr;
+    let execution;
     try {
-      ({ exitCode, stderr } = await exec(job));
+      execution = await exec(job);
     } finally {
       clearInterval(lease);
     }
 
     let finished;
     try {
-      finished = jobStore.finish(job.id, {
-        exitCode,
-        error: exitCode === 0 ? null : stderr,
-        redact,
-        executionId: job.execution_id,
-      });
+      if (isTemporaryProjectDefer(job, execution)) {
+        finished = jobStore.defer(job.id, {
+          reason: 'deferred: the selected project already has a running audit',
+          executionId: job.execution_id,
+        });
+      } else {
+        finished = jobStore.finish(job.id, {
+          exitCode: execution.exitCode,
+          error: execution.exitCode === 0 ? null : execution.stderr,
+          redact,
+          executionId: job.execution_id,
+        });
+      }
     } catch (err) {
       if (!(err instanceof JobError)) throw err;
       // The job was recovered or re-claimed while this execution ran; its

@@ -27,7 +27,11 @@ notification-retry timer, because one tick owns the whole cycle:
    (`run --all` / `run --project <id>`) with structured argv — no shell,
    no eval. The child takes the runner's process lock, so a job can never
    overlap a manual run: on lock contention the child exits 4 and the job
-   returns to QUEUED (attempt refunded) for the next tick;
+   returns to QUEUED (attempt refunded) for the next tick. The worker claims at
+   most `RUNNER_MAX_JOBS_PER_TICK` jobs per tick (default 6). A single-project
+   child report containing only `SKIPPED_ALREADY_RUNNING` is also a temporary
+   defer: claim fields are cleared and the job returns to QUEUED. A partially
+   completed all-project child is not replayed wholesale;
 4. **retry notifications** — queued/failed Slack deliveries are retried
    last, under the same single-instance lock (skipped, not forced, if a
    manual `run`/`retry-notifications` holds it). This step is wired only
@@ -93,8 +97,9 @@ calendars, not cron syntax).
   affect schedules (they carry their own zone).
 - **Missed occurrences** (host down, timer disabled): only the MOST
   RECENT missed occurrence is considered, and only within the 24 h
-  catch-up window — at most one catch-up job, mirroring systemd
-  `Persistent=true`. Older misses are skipped, never batched.
+  catch-up window — at most one catch-up job. The systemd timer uses
+  `Persistent=false`; the runner owns catch-up and older misses are skipped,
+  never batched.
 - **At-most-once**: the occurrence key is a calendar bucket
   (`YYYY-MM-DD` for daily/weekly, `YYYY-MM` for monthly). The unique
   `(schedule_id, occurrence_key)` index makes one occurrence → one job a
@@ -164,12 +169,12 @@ to the PID check.
 
 ## Notification retries
 
-`retry-notifications` (its own hourly timer) remains the **only active**
-retry path today. `workerTick` accepts an optional `retryNotifications`
-hook that runs after job execution, so one timer can own both audits and
-notification retries; it is null by default and the CLI does not wire it
-yet. A failure in that step is logged and never fails the tick or changes
-a job outcome. Notification identity and retry scheduling are unchanged.
+`worker --once` owns the scheduled retry path. When Slack is configured, the
+CLI wires the retry step after job execution under the same process lock. No
+notification-retry timer exists. `retry-notifications` remains available as a
+manual command. A failure in the retry step is logged and never fails the tick
+or changes a job outcome; notification identity and retry scheduling are
+unchanged.
 
 ## Locking summary
 
