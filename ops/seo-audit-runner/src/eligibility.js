@@ -79,7 +79,15 @@ export function evaluateProjectEligibility(
 
   const projectDomain = normalizeDomainKey(project?.domain ?? project?.website_url);
   if (!projectDomain) return result(false, 'project domain is missing or invalid');
-  if (config.excludeNonproduction !== false && hasNonproductionLabel(projectDomain)) {
+  // An explicit persisted Beta classification is authoritative. Beta projects
+  // still run scheduled audits; their notification suppression happens later
+  // in the alert pipeline. The domain-name heuristic remains for unclassified
+  // legacy projects.
+  if (
+    config.excludeNonproduction !== false &&
+    project?.is_beta !== true &&
+    hasNonproductionLabel(projectDomain)
+  ) {
     return result(false, 'domain contains a non-production environment label');
   }
 

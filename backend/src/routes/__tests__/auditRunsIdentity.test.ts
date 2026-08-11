@@ -2,9 +2,9 @@ import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import express from 'express';
 import type { AddressInfo } from 'node:net';
 
-type Site = { id: string; domain: string };
+type Site = { id: string; domain: string; is_beta: boolean };
 
-const sites: Site[] = [{ id: 'project-1', domain: 'example.com' }];
+const sites: Site[] = [{ id: 'project-1', domain: 'example.com', is_beta: false }];
 const transactionSql: string[] = [];
 const backgroundSql: string[] = [];
 const insertedResultUrls: string[] = [];
@@ -19,7 +19,7 @@ const client = {
     transactionSql.push(sql);
     if (/^(BEGIN|COMMIT|ROLLBACK)$/i.test(sql.trim())) return { rows: [] };
     if (/pg_advisory_xact_lock/i.test(sql)) return { rows: [{}] };
-    if (/SELECT id, domain FROM sites WHERE id/i.test(sql)) {
+    if (/SELECT id, domain, is_beta FROM sites WHERE id/i.test(sql)) {
       const site = sites.find((row) => row.id === String(params[0]));
       return { rows: site ? [site] : [] };
     }
@@ -27,7 +27,7 @@ const client = {
       const domain = String(params[0]);
       let site = sites.find((row) => row.domain === domain);
       if (!site) {
-        site = { id: `legacy-${sites.length + 1}`, domain };
+        site = { id: `legacy-${sites.length + 1}`, domain, is_beta: false };
         sites.push(site);
       }
       return { rows: [site] };
@@ -49,11 +49,12 @@ const pool = {
   connect: vi.fn(async () => client),
   async query(sql: string, params: unknown[] = []) {
     backgroundSql.push(sql);
-    if (/SELECT \* FROM audit_runs WHERE id/i.test(sql)) {
+    if (/FROM audit_runs ar[\s\S]*JOIN sites s/i.test(sql)) {
       return {
         rows: [{
           id: String(params[0]),
           site_id: 'project-1',
+          is_beta: false,
           status: 'COMPLETED',
           finished_at: '2026-08-09T12:00:00.000Z',
           site_checks: {
@@ -124,7 +125,7 @@ const boundRequest = {
 };
 
 beforeEach(() => {
-  sites.splice(0, sites.length, { id: 'project-1', domain: 'example.com' });
+  sites.splice(0, sites.length, { id: 'project-1', domain: 'example.com', is_beta: false });
   transactionSql.length = 0;
   backgroundSql.length = 0;
   insertedResultUrls.length = 0;
@@ -169,7 +170,7 @@ describe('POST /api/technical-analyzer/run project binding', () => {
     expect(client.release).toHaveBeenCalledOnce();
     expect(transactionSql.some((sql) => /INSERT INTO sites/i.test(sql))).toBe(false);
     const lockAt = transactionSql.findIndex((sql) => /pg_advisory_xact_lock/i.test(sql));
-    const siteAt = transactionSql.findIndex((sql) => /SELECT id, domain FROM sites/i.test(sql));
+    const siteAt = transactionSql.findIndex((sql) => /SELECT id, domain, is_beta FROM sites/i.test(sql));
     const runningAt = transactionSql.findIndex((sql) => /FROM audit_runs/i.test(sql));
     const seedsAt = transactionSql.findIndex((sql) => /DELETE FROM seed_urls/i.test(sql));
     expect(lockAt).toBeGreaterThan(-1);

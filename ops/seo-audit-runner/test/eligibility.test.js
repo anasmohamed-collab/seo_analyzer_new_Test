@@ -64,6 +64,22 @@ test('obvious beta and next environment labels are excluded by default', () => {
   }
 });
 
+test('explicit Beta classification remains eligible for auditing despite the domain label', () => {
+  const domain = 'staging.example.com';
+  const decision = evaluateProjectEligibility(
+    project({
+      domain,
+      website_url: `https://${domain}`,
+      is_beta: true,
+      last_form_values: { homeUrl: `https://${domain}`, articleUrl: `https://${domain}/a` },
+    }),
+    config(),
+  );
+
+  assert.equal(decision.eligible, true);
+  assert.equal(decision.source, 'last_form_values');
+});
+
 test('subdomains are preserved when matching project identity', () => {
   const decision = evaluateProjectEligibility(
     project({
