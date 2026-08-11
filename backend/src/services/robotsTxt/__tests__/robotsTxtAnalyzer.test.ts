@@ -71,6 +71,21 @@ describe('analyzeRobotsTxtContent', () => {
     expect(r.score).toBeLessThanOrEqual(20);
   });
 
+  it('treats full crawler blocking as expected for a Beta/Staging project', () => {
+    const r = analyzeRobotsTxtContent('User-agent: *\nDisallow: /', ctx({ isBeta: true }));
+    expect(r.summary.googlebotStatus).toBe('Blocked');
+    expect(r.summary.googlebotNewsStatus).toBe('Blocked');
+    expect(r.issues.some(i => i.type === 'googlebot_fully_blocked')).toBe(false);
+    expect(r.issues.some(i => i.type === 'googlebot_news_fully_blocked')).toBe(false);
+  });
+
+  it('warns when a Beta/Staging robots.txt leaves search crawlers unblocked', () => {
+    const r = analyzeRobotsTxtContent('User-agent: *\nAllow: /', ctx({ isBeta: true }));
+    const issue = r.issues.find(i => i.type === 'beta_search_crawlers_not_blocked');
+    expect(issue).toMatchObject({ severity: 'warning', priority: 'normal' });
+    expect(issue?.message).toContain('Beta/Staging site is crawlable');
+  });
+
   it('flags Googlebot-News fully blocked as top_critical (caps at 30 when GB allowed)', () => {
     const txt = [
       'User-agent: Googlebot',

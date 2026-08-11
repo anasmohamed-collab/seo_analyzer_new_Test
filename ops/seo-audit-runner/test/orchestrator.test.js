@@ -80,6 +80,44 @@ test('completed audit: polls until COMPLETED and extracts P0 issues', async () =
   assert.ok(apiClient.calls.getRunResults.length >= 3);
 });
 
+test('Beta projects remain included in scheduled audit processing', async () => {
+  const projects = [
+    project({ is_beta: false }),
+    project({
+      id: 'p2',
+      domain: 'staging.example.com',
+      website_url: 'https://staging.example.com',
+      project_name: 'Staging',
+      is_beta: true,
+      last_form_values: {
+        homeUrl: 'https://staging.example.com',
+        articleUrl: 'https://staging.example.com/a',
+      },
+    }),
+  ];
+  const completedProjects = [];
+  const apiClient = stubClient({
+    projects,
+    getRunResults: () => ({ status: 'COMPLETED', results: [] }),
+  });
+
+  const report = await runAudits({
+    config: fastConfig,
+    apiClient,
+    options: {
+      onProjectCompleted: async ({ project: completedProject }) => {
+        completedProjects.push(completedProject);
+        return { notificationStatus: completedProject.is_beta ? 'skipped-beta' : 'not-required' };
+      },
+    },
+  });
+
+  assert.equal(apiClient.calls.startAudit.length, 2);
+  assert.equal(report.entries.filter((entry) => entry.outcome === OUTCOME.COMPLETED).length, 2);
+  assert.deepEqual(completedProjects.map((item) => item.id), ['p1', 'p2']);
+  assert.equal(report.entries.find((entry) => entry.projectId === 'p2').notification, 'skipped-beta');
+});
+
 test('failed audit: FAILED status is terminal', async () => {
   const apiClient = stubClient({ getRunResults: () => ({ status: 'FAILED' }) });
   const report = await runAudits({ config: fastConfig, apiClient, options: {} });

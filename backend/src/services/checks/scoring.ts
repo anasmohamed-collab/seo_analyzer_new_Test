@@ -26,6 +26,10 @@ export interface ScoringResult {
   recommendations: Recommendation[];
 }
 
+export interface ScoringOptions {
+  isBeta?: boolean;
+}
+
 // ── Helpers ─────────────────────────────────────────────────────
 
 interface CheckData {
@@ -95,9 +99,10 @@ interface CheckData {
 
 // ── Score a single AuditResult ──────────────────────────────────
 
-export function scoreResult(data: CheckData): ScoringResult {
+export function scoreResult(data: CheckData, options: ScoringOptions = {}): ScoringResult {
   const recs: Recommendation[] = [];
   let worst: Status = 'PASS';
+  const isBeta = options.isBeta === true;
 
   const escalate = (s: Status) => {
     if (s === 'FAIL') worst = 'FAIL';
@@ -320,7 +325,7 @@ export function scoreResult(data: CheckData): ScoringResult {
   const isCrawlBlocked = data.httpStatus === 401 || data.httpStatus === 403;
 
   if (data.contentMeta) {
-    if (data.contentMeta.robotsMeta.noindex && !isCrawlBlocked) {
+    if (data.contentMeta.robotsMeta.noindex && !isCrawlBlocked && !isBeta) {
       // Only report noindex when we have a genuine page — not a 403 error page
       escalate('FAIL');
       recs.push({
@@ -442,12 +447,26 @@ export function scoreResult(data: CheckData): ScoringResult {
     }
 
     // X-Robots-Tag — only trust on non-blocked responses (403 error pages may have their own headers)
-    if (data.contentMeta.xRobotsTag?.noindex && !isCrawlBlocked) {
+    if (data.contentMeta.xRobotsTag?.noindex && !isCrawlBlocked && !isBeta) {
       escalate('FAIL');
       recs.push({
         priority: 'P0', area: 'meta',
         message: 'X-Robots-Tag HTTP header contains noindex',
         fixHint: 'Remove noindex from X-Robots-Tag header (often set by CDN or server config).',
+      });
+    }
+
+    if (
+      isBeta &&
+      !isCrawlBlocked &&
+      !data.contentMeta.robotsMeta.noindex &&
+      !data.contentMeta.xRobotsTag?.noindex
+    ) {
+      escalate('WARN');
+      recs.push({
+        priority: 'P1', area: 'meta',
+        message: 'Beta/Staging seed URL is indexable (no noindex directive detected)',
+        fixHint: 'Add a meta robots noindex directive or an X-Robots-Tag noindex header before exposing the Beta/Staging site.',
       });
     }
 
@@ -567,9 +586,10 @@ interface SiteChecksData {
   };
 }
 
-export function scoreSiteChecks(data: SiteChecksData | null): Recommendation[] {
+export function scoreSiteChecks(data: SiteChecksData | null, options: ScoringOptions = {}): Recommendation[] {
   if (!data) return [];
   const recs: Recommendation[] = [];
+  const isBeta = options.isBeta === true;
 
   if (data.robots) {
     if (data.robots.status === 'NOT_FOUND') {
@@ -602,7 +622,7 @@ export function scoreSiteChecks(data: SiteChecksData | null): Recommendation[] {
     // Robots.txt rule analysis
     if (data.robots.rules) {
       const wildcardRule = data.robots.rules.find(r => r.userAgent === '*');
-      if (wildcardRule?.disallow.includes('/')) {
+      if (!isBeta && wildcardRule?.disallow.includes('/')) {
         recs.push({
           priority: 'P0', area: 'robots',
           message: 'robots.txt blocks all crawling with Disallow: /',
@@ -611,12 +631,30 @@ export function scoreSiteChecks(data: SiteChecksData | null): Recommendation[] {
       }
       // Check for Googlebot-News blocked
       const newsRule = data.robots.rules.find(r => r.userAgent.toLowerCase() === 'googlebot-news');
-      if (newsRule?.disallow.includes('/')) {
+      if (!isBeta && newsRule?.disallow.includes('/')) {
         recs.push({
           priority: 'P0', area: 'robots',
           message: 'robots.txt blocks Googlebot-News from crawling entire site',
           fixHint: 'Remove "Disallow: /" under User-agent: Googlebot-News to appear in Google News.',
         });
+      }
+
+      if (isBeta && (data.robots.status === 'FOUND' || data.robots.status === 'NOT_FOUND')) {
+        const googleRule = data.robots.rules.find(r => r.userAgent.toLowerCase() === 'googlebot');
+        const fullyBlocks = (rule: typeof wildcardRule): boolean => Boolean(rule?.disallow.includes('/'));
+        const googleBlocked = fullyBlocks(googleRule ?? wildcardRule);
+        const newsBlocked = fullyBlocks(newsRule ?? googleRule ?? wildcardRule);
+        if (!googleBlocked || !newsBlocked) {
+          const exposed = [
+            !googleBlocked ? 'Googlebot' : null,
+            !newsBlocked ? 'Googlebot-News' : null,
+          ].filter(Boolean).join(' and ');
+          recs.push({
+            priority: 'P1', area: 'robots',
+            message: `Beta/Staging site is crawlable by ${exposed}`,
+            fixHint: 'Block search crawlers on the Beta/Staging environment (for example with an environment-specific robots.txt) until it is ready for Production.',
+          });
+        }
       }
     }
 

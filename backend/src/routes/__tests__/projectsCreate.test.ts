@@ -19,6 +19,7 @@ interface SiteRow {
   domain: string;
   project_name: string | null;
   website_url: string | null;
+  is_beta: boolean;
   last_form_values: Record<string, string> | null;
   created_at: string;
   last_audit_at: string | null;
@@ -32,11 +33,12 @@ function fakeQuery(sql: string, params: unknown[] = []) {
   executedSql.push(sql);
 
   if (/INSERT INTO sites/i.test(sql)) {
-    const [domain, projectName, websiteUrl, formValues] = params as [
+    const [domain, projectName, websiteUrl, formValues, isBeta] = params as [
       string,
       string,
       string,
       string | null,
+      boolean | null,
     ];
     const existing = sites.find((s) => s.domain === domain);
 
@@ -45,6 +47,8 @@ function fakeQuery(sql: string, params: unknown[] = []) {
       existing.website_url = websiteUrl;
       // COALESCE(EXCLUDED.last_form_values, sites.last_form_values)
       if (formValues !== null) existing.last_form_values = JSON.parse(formValues);
+      // Omission preserves the existing classification.
+      if (isBeta !== null) existing.is_beta = isBeta;
       return Promise.resolve({ rows: [{ ...existing, created: false }] });
     }
 
@@ -53,12 +57,22 @@ function fakeQuery(sql: string, params: unknown[] = []) {
       domain,
       project_name: projectName,
       website_url: websiteUrl,
+      is_beta: isBeta ?? false,
       last_form_values: formValues === null ? null : JSON.parse(formValues),
       created_at: new Date().toISOString(),
       last_audit_at: null,
     };
     sites.push(row);
     return Promise.resolve({ rows: [{ ...row, created: true }] });
+  }
+
+  if (/^\s*UPDATE sites/i.test(sql)) {
+    const [projectName, isBeta, id] = params as [string | null, boolean | null, string];
+    const existing = sites.find((s) => s.id === id);
+    if (!existing) return Promise.resolve({ rows: [] });
+    if (projectName !== null) existing.project_name = projectName;
+    if (isBeta !== null) existing.is_beta = isBeta;
+    return Promise.resolve({ rows: [{ ...existing }] });
   }
 
   if (/FROM sites s/i.test(sql)) {
@@ -105,6 +119,14 @@ interface ListResponse {
 function postProject(body: unknown) {
   return fetch(`${base}/api/projects`, {
     method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+function patchProject(id: string, body: unknown) {
+  return fetch(`${base}/api/projects/${id}`, {
+    method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
@@ -163,6 +185,46 @@ describe('POST /api/projects — created vs updated', () => {
 
     expect(res.status).toBe(201);
     expect(sites).toHaveLength(2);
+  });
+});
+
+describe('project environment classification', () => {
+  it('defaults an existing-compatible create request to Production', async () => {
+    const body = await createProject({ website_url: 'https://example.com' });
+    expect(body.project.is_beta).toBe(false);
+  });
+
+  it('persists a new Beta project', async () => {
+    const body = await createProject({
+      website_url: 'https://beta.example.com',
+      is_beta: true,
+    });
+    expect(body.project.is_beta).toBe(true);
+
+    const listed = await json<ListResponse>(await fetch(`${base}/api/projects`));
+    expect(listed.projects[0].is_beta).toBe(true);
+  });
+
+  it('preserves an existing Beta classification when an old API client omits the flag', async () => {
+    await postProject({ website_url: 'https://beta.example.com', is_beta: true });
+    const body = await createProject({ website_url: 'https://beta.example.com', project_name: 'Renamed' });
+
+    expect(body.created).toBe(false);
+    expect(body.project.is_beta).toBe(true);
+  });
+
+  it('lets PATCH update classification without breaking rename-only requests', async () => {
+    const created = await createProject({ website_url: 'https://example.com' });
+
+    const betaRes = await patchProject(created.project.id, { is_beta: true });
+    expect(betaRes.status).toBe(200);
+    expect((await json<CreateResponse>(betaRes)).project.is_beta).toBe(true);
+
+    const renameRes = await patchProject(created.project.id, { project_name: 'Renamed' });
+    expect(renameRes.status).toBe(200);
+    const renamed = await json<CreateResponse>(renameRes);
+    expect(renamed.project.project_name).toBe('Renamed');
+    expect(renamed.project.is_beta).toBe(true);
   });
 });
 

@@ -9,7 +9,7 @@
  *   GET    /api/projects                          — list all projects
  *   POST   /api/projects                          — create (201) / update existing (200)
  *   GET    /api/projects/:id                      — single project + stats
- *   PATCH  /api/projects/:id                      — rename project
+ *   PATCH  /api/projects/:id                      — update name and/or environment
  *   DELETE /api/projects/:id                      — delete project (cascades)
  *   GET    /api/projects/:id/audits               — paginated audit history
  *   GET    /api/projects/:id/audits/latest        — latest completed audit
@@ -49,6 +49,7 @@ projectsRouter.get('/projects', async (_req: Request, res: Response) => {
         s.domain,
         s.project_name,
         s.website_url,
+        s.is_beta,
         s.created_at,
         s.last_audit_at,
         s.last_form_values,
@@ -82,7 +83,7 @@ projectsRouter.post('/projects', async (req: Request, res: Response) => {
     return;
   }
 
-  const { domain, websiteUrl, projectName, formValues } = parsed;
+  const { domain, websiteUrl, projectName, isBeta, formValues } = parsed;
 
   try {
     // `xmax = 0` is true only for a freshly inserted row, so a single
@@ -91,15 +92,19 @@ projectsRouter.post('/projects', async (req: Request, res: Response) => {
     // complete, valid audit configuration — never erased by a request
     // that omitted it.
     const { rows } = await db.query<Record<string, unknown> & { created: boolean }>(
-      `INSERT INTO sites (domain, project_name, website_url, last_form_values, updated_at)
-       VALUES ($1, $2, $3, $4::jsonb, NOW())
+      `INSERT INTO sites (domain, project_name, website_url, last_form_values, is_beta, updated_at)
+       VALUES ($1, $2, $3, $4::jsonb, COALESCE($5::boolean, FALSE), NOW())
        ON CONFLICT (domain) DO UPDATE
          SET project_name     = EXCLUDED.project_name,
              website_url      = EXCLUDED.website_url,
              last_form_values = COALESCE(EXCLUDED.last_form_values, sites.last_form_values),
+             is_beta          = CASE
+                                  WHEN $5::boolean IS NULL THEN sites.is_beta
+                                  ELSE EXCLUDED.is_beta
+                                END,
              updated_at       = NOW()
        RETURNING *, (xmax = 0) AS created`,
-      [domain, projectName, websiteUrl, formValues ? JSON.stringify(formValues) : null],
+      [domain, projectName, websiteUrl, formValues ? JSON.stringify(formValues) : null, isBeta],
     );
 
     const { created, ...project } = rows[0];
@@ -150,19 +155,34 @@ projectsRouter.patch('/projects/:id', async (req: Request, res: Response) => {
   const db = requireDb(res);
   if (!db) return;
 
-  const { project_name } = req.body ?? {};
-  if (!project_name || typeof project_name !== 'string' || !project_name.trim()) {
-    res.status(400).json({ error: 'project_name is required' });
+  const body = req.body ?? {};
+  const projectName = body.project_name;
+  const rawIsBeta = body.is_beta ?? body.isBeta;
+  const hasProjectName = projectName !== undefined;
+  const hasIsBeta = rawIsBeta !== undefined;
+
+  if (!hasProjectName && !hasIsBeta) {
+    res.status(400).json({ error: 'project_name or is_beta is required' });
+    return;
+  }
+  if (hasProjectName && (typeof projectName !== 'string' || !projectName.trim())) {
+    res.status(400).json({ error: 'project_name must be a non-empty string' });
+    return;
+  }
+  if (hasIsBeta && typeof rawIsBeta !== 'boolean') {
+    res.status(400).json({ error: 'is_beta must be a boolean' });
     return;
   }
 
   try {
     const { rows } = await db.query(
       `UPDATE sites
-       SET project_name = $1, updated_at = NOW()
-       WHERE id = $2
+       SET project_name = COALESCE($1, project_name),
+           is_beta = COALESCE($2::boolean, is_beta),
+           updated_at = NOW()
+       WHERE id = $3
        RETURNING *`,
-      [project_name.trim(), req.params.id],
+      [hasProjectName ? projectName.trim() : null, hasIsBeta ? rawIsBeta : null, req.params.id],
     );
     if (!rows.length) {
       res.status(404).json({ error: 'Project not found' });

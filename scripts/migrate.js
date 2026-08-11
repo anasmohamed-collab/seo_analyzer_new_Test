@@ -255,7 +255,7 @@ try {
     ORDER BY ordinal_position;
   `);
   const cols = colRes.rows.map(r => r.column_name);
-  const projectCols = ['project_name', 'website_url', 'last_audit_at'];
+  const projectCols = ['project_name', 'website_url', 'last_audit_at', 'is_beta'];
   for (const col of projectCols) {
     if (cols.includes(col)) {
       ok(`sites.${col} column exists`);

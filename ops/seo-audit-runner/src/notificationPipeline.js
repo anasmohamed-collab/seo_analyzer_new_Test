@@ -173,6 +173,15 @@ export function createNotificationPipeline({
      * notification when the alert mode requires it.
      */
     async handleProjectCompleted({ project, auditRunId, results, criticalIssues }) {
+      // Beta/Staging projects still complete their audits, but they are outside
+      // the scheduled alerting lifecycle. Skipping before snapshot/notification
+      // persistence also prevents a later retry from sending a suppressed alert.
+      if (project?.is_beta === true) {
+        counters.notRequired++;
+        logger?.info?.(`Project ${project.id}: Beta/Staging project — scheduled Slack alert skipped`);
+        return { notificationStatus: 'skipped-beta' };
+      }
+
       // Guard: only a structurally complete COMPLETED payload may update
       // lifecycle state. A clean audit with ZERO current P0 issues (and even
       // zero page rows) is complete and MUST resolve previously active issues.

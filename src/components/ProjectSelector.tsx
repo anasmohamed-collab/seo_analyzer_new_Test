@@ -39,6 +39,8 @@ export interface Project {
   domain: string;
   project_name: string | null;
   website_url: string | null;
+  /** Missing on an older API response is treated as Production. */
+  is_beta?: boolean;
   created_at: string;
   last_audit_at: string | null;
   audit_count: number;
@@ -72,6 +74,7 @@ export default function ProjectSelector({
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState('');
   const [newUrl, setNewUrl] = useState('');
+  const [newIsBeta, setNewIsBeta] = useState(false);
   const [createError, setCreateError] = useState('');
   const [createNotice, setCreateNotice] = useState('');
 
@@ -120,7 +123,13 @@ export default function ProjectSelector({
       const res = await fetch(`${apiBase}/api/projects`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project_name: newName.trim() || undefined, website_url: newUrl.trim() }),
+        body: JSON.stringify({
+          project_name: newName.trim() || undefined,
+          website_url: newUrl.trim(),
+          // Omit false so an old/existing project keeps its classification.
+          // The database default still makes every new unchecked row Production.
+          is_beta: newIsBeta ? true : undefined,
+        }),
       });
       let data: { project?: Project; created?: boolean; automation_ready?: boolean; error?: string };
       try {
@@ -134,6 +143,7 @@ export default function ProjectSelector({
       setCreating(false);
       setNewName('');
       setNewUrl('');
+      setNewIsBeta(false);
       setCreateNotice(describeCreateOutcome(data).text);
       if (data.project) onSelect(data.project);
     } catch {
@@ -154,6 +164,22 @@ export default function ProjectSelector({
       if (res.ok) {
         await fetchProjects();
         setRenaming(false);
+      }
+    } catch { /* ignore */ }
+  };
+
+  const handleToggleBeta = async () => {
+    if (!activeProject) return;
+    try {
+      const res = await fetch(`${apiBase}/api/projects/${activeProject.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ is_beta: !activeProject.is_beta }),
+      });
+      if (res.ok) {
+        const data = await res.json() as { project?: Project };
+        await fetchProjects();
+        if (data.project) onSelect(data.project);
       }
     } catch { /* ignore */ }
   };
@@ -229,6 +255,15 @@ export default function ProjectSelector({
                 onKeyDown={e => { if (e.key === 'Enter') handleCreate(); }}
               />
             </div>
+            <label className="flex items-center gap-2 text-xs text-slate-600 py-1 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={newIsBeta}
+                onChange={e => setNewIsBeta(e.target.checked)}
+                className="rounded border-slate-300"
+              />
+              Beta / Staging site
+            </label>
             {createError && <p className="text-xs text-red-500">{createError}</p>}
             <div className="flex gap-2 pt-1">
               <button
@@ -238,7 +273,7 @@ export default function ProjectSelector({
                 Create
               </button>
               <button
-                onClick={() => { setCreating(false); setCreateError(''); setNewName(''); setNewUrl(''); }}
+                onClick={() => { setCreating(false); setCreateError(''); setNewName(''); setNewUrl(''); setNewIsBeta(false); }}
                 className="flex-1 border border-slate-200 text-slate-600 text-sm rounded px-3 py-1.5 hover:bg-slate-50"
               >
                 Cancel
@@ -288,7 +323,9 @@ export default function ProjectSelector({
                   p.id === activeProjectId ? 'text-blue-600 bg-blue-50' : 'text-slate-700'
                 }`}
               >
-                <span className="truncate">{p.project_name ?? p.domain}</span>
+                <span className="truncate">
+                  {p.project_name ?? p.domain}{p.is_beta ? ' · Beta' : ''}
+                </span>
                 <span className="text-xs text-slate-400 flex-shrink-0">{p.completed_count} audits</span>
               </button>
             ))}
@@ -319,6 +356,17 @@ export default function ProjectSelector({
             title="Rename project"
           >
             <Pencil size={13} />
+          </button>
+          <button
+            onClick={handleToggleBeta}
+            className={`text-[10px] rounded px-2 py-1 border ${
+              activeProject.is_beta
+                ? 'text-violet-700 bg-violet-50 border-violet-200'
+                : 'text-slate-500 bg-white border-slate-200 hover:bg-slate-50'
+            }`}
+            title={activeProject.is_beta ? 'Mark this project as Production' : 'Mark this project as Beta / Staging'}
+          >
+            {activeProject.is_beta ? 'Beta' : 'Production'}
           </button>
           <button
             onClick={() => setConfirmDelete(true)}

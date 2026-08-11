@@ -114,6 +114,7 @@ async function auditSingleUrl(
   url: string,
   seenTitles: Set<string>,
   seedType?: string,
+  isBeta = false,
 ): Promise<Record<string, unknown>> {
   if (!isSafeUrl(url)) {
     return { url, error: 'Blocked by SSRF guard', status: 'FAIL', page_state: 'FETCH_ERROR',
@@ -234,7 +235,7 @@ async function auditSingleUrl(
     performance: performance ? toJson(performance) : null,
     checkErrors: checkErrors.length > 0 ? checkErrors : undefined,
   };
-  const scored = scoreResult(data as Parameters<typeof scoreResult>[0]);
+  const scored = scoreResult(data as Parameters<typeof scoreResult>[0], { isBeta });
 
   let layeredScore = null;
   try { layeredScore = computeLayeredScore(data as unknown as AuditData); } catch (err) {
@@ -252,6 +253,7 @@ async function auditSingleUrl(
 interface AnalyzerBody {
   homeUrl: string;
   articleUrl: string;
+  isBeta?: boolean;
   optionalUrls?: {
     section?: string;
     tag?: string;
@@ -286,6 +288,7 @@ auditRunsRouter.post('/technical-analyzer/run', async (req: Request, res: Respon
     // registered manually or implicitly here. `domain` above is untouched and
     // remains what the audit engine actually crawls.
     const siteDomain = normalizeProjectDomain(body.homeUrl) ?? domain;
+    const requestedIsBeta = body.isBeta === true;
 
     const urlMap: Record<string, string> = { home: body.homeUrl, article: body.articleUrl };
     if (body.optionalUrls) {
@@ -302,7 +305,7 @@ auditRunsRouter.post('/technical-analyzer/run', async (req: Request, res: Respon
       // ── DB mode ──────────────────────────────────────────────
       try {
         // Upsert site
-        const siteRes = await db.query<{ id: string; domain: string }>(
+        const siteRes = await db.query<{ id: string; domain: string; is_beta: boolean }>(
           `INSERT INTO sites (domain, updated_at)
            VALUES ($1, NOW())
            ON CONFLICT (domain) DO UPDATE SET updated_at = NOW()
@@ -310,6 +313,7 @@ auditRunsRouter.post('/technical-analyzer/run', async (req: Request, res: Respon
           [siteDomain],
         );
         const site = siteRes.rows[0];
+        const isBeta = site.is_beta === true;
 
         // Replace seed URLs
         await db.query('DELETE FROM seed_urls WHERE site_id = $1', [site.id]);
@@ -356,7 +360,7 @@ auditRunsRouter.post('/technical-analyzer/run', async (req: Request, res: Respon
 
             for (const seed of seedRes.rows) {
               try {
-                const result = await auditSingleUrl(seed.url, seenTitles, seed.page_type ?? undefined);
+                const result = await auditSingleUrl(seed.url, seenTitles, seed.page_type ?? undefined, isBeta);
                 const resultData = (result.data ?? { error: result.error }) as Record<string, unknown>;
                 const resultStatus = (result.status as string) ?? 'FAIL';
                 const resultRecs = Array.isArray(result.recommendations) && result.recommendations.length > 0
@@ -418,7 +422,7 @@ auditRunsRouter.post('/technical-analyzer/run', async (req: Request, res: Respon
 
     for (const [type, url] of Object.entries(urlMap)) {
       try {
-        results.push({ ...await auditSingleUrl(url, seenTitles, type), seedType: type });
+        results.push({ ...await auditSingleUrl(url, seenTitles, type, requestedIsBeta), seedType: type });
       } catch (err) {
         results.push({ url, seedType: type, status: 'FAIL',
           error: err instanceof Error ? err.message : 'unknown',
@@ -426,7 +430,9 @@ auditRunsRouter.post('/technical-analyzer/run', async (req: Request, res: Respon
       }
     }
 
-    const siteRecs = scoreSiteChecks(siteChecks as Parameters<typeof scoreSiteChecks>[0]);
+    const siteRecs = scoreSiteChecks(siteChecks as Parameters<typeof scoreSiteChecks>[0], {
+      isBeta: requestedIsBeta,
+    });
 
     const grouped: Record<string, unknown[]> = {};
     for (const r of results) {
@@ -457,7 +463,13 @@ auditRunsRouter.get('/audit-runs/:id/results', async (req: Request, res: Respons
 
     const id = req.params['id'] as string;
 
-    const runRes = await db.query('SELECT * FROM audit_runs WHERE id = $1', [id]);
+    const runRes = await db.query(
+      `SELECT ar.*, s.is_beta
+       FROM audit_runs ar
+       JOIN sites s ON s.id = ar.site_id
+       WHERE ar.id = $1`,
+      [id],
+    );
     const run = runRes.rows[0] ?? null;
     if (!run) {
       res.status(404).json({ error: 'AuditRun not found' });
@@ -478,7 +490,9 @@ auditRunsRouter.get('/audit-runs/:id/results', async (req: Request, res: Respons
       grouped[pageType].push(r);
     }
 
-    const siteRecs = scoreSiteChecks(run.site_checks as Parameters<typeof scoreSiteChecks>[0]);
+    const siteRecs = scoreSiteChecks(run.site_checks as Parameters<typeof scoreSiteChecks>[0], {
+      isBeta: run.is_beta === true,
+    });
 
     res.json({
       id: run.id, status: run.status,

@@ -38,6 +38,7 @@ export default function ProjectsPage({ apiBase, onOpenProject }: ProjectsPagePro
   const [newUrl, setNewUrl] = useState('');
   const [newHomeUrl, setNewHomeUrl] = useState('');
   const [newArticleUrl, setNewArticleUrl] = useState('');
+  const [newIsBeta, setNewIsBeta] = useState(false);
   const [createError, setCreateError] = useState('');
   const [createLoading, setCreateLoading] = useState(false);
 
@@ -85,6 +86,9 @@ export default function ProjectsPage({ apiBase, onOpenProject }: ProjectsPagePro
           website_url: newUrl.trim(),
           homeUrl: newHomeUrl.trim() || undefined,
           articleUrl: newArticleUrl.trim() || undefined,
+          // Omit false so re-submitting an existing project cannot silently
+          // overwrite its classification; new rows still default Production.
+          is_beta: newIsBeta ? true : undefined,
         }),
       });
 
@@ -109,6 +113,7 @@ export default function ProjectsPage({ apiBase, onOpenProject }: ProjectsPagePro
       setNewUrl('');
       setNewHomeUrl('');
       setNewArticleUrl('');
+      setNewIsBeta(false);
     } catch {
       setCreateError('Could not reach the server');
     } finally {
@@ -216,6 +221,15 @@ export default function ProjectsPage({ apiBase, onOpenProject }: ProjectsPagePro
                 onKeyDown={e => { if (e.key === 'Enter') handleCreate(); if (e.key === 'Escape') setCreating(false); }}
               />
             </div>
+            <label className="flex items-center gap-2 text-xs text-slate-600 pb-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={newIsBeta}
+                onChange={e => setNewIsBeta(e.target.checked)}
+                className="rounded border-slate-300"
+              />
+              Beta / Staging site
+            </label>
             <button
               onClick={handleCreate}
               disabled={createLoading}
@@ -226,7 +240,7 @@ export default function ProjectsPage({ apiBase, onOpenProject }: ProjectsPagePro
             <button
               onClick={() => {
                 setCreating(false); setCreateError('');
-                setNewName(''); setNewUrl(''); setNewHomeUrl(''); setNewArticleUrl('');
+                setNewName(''); setNewUrl(''); setNewHomeUrl(''); setNewArticleUrl(''); setNewIsBeta(false);
               }}
               className="text-sm border border-slate-200 bg-white rounded px-3 py-1.5 hover:bg-slate-50"
             >
@@ -293,6 +307,11 @@ export default function ProjectsPage({ apiBase, onOpenProject }: ProjectsPagePro
                 >
                   <td className="px-4 py-3 font-medium text-slate-700">
                     {p.project_name ?? p.domain}
+                    {p.is_beta ? (
+                      <span className="ml-2 text-[10px] font-normal text-violet-700 bg-violet-50 border border-violet-200 rounded px-1.5 py-0.5">
+                        Beta
+                      </span>
+                    ) : null}
                     {!p.last_form_values?.homeUrl || !p.last_form_values?.articleUrl ? (
                       <span
                         className="ml-2 text-[10px] font-normal text-amber-700 bg-amber-50 border border-amber-200 rounded px-1.5 py-0.5"

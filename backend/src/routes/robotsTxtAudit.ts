@@ -14,6 +14,7 @@
  *       xmlSitemapUrl?: string,   // verify it is declared in robots.txt
  *       newsSitemapUrl?: string,  // verify it is declared in robots.txt
  *       importantUrls?: string[]  // content URLs to test for blocking
+ *       isBeta?: boolean          // apply Beta/Staging crawlability expectations
  *     }
  *
  * Designed for both the UI and future scheduled (cron) audits, which can read a
@@ -50,6 +51,7 @@ robotsTxtAuditRouter.post('/robots-txt/audit', async (req: Request, res: Respons
       newsSitemapUrl: str(body.newsSitemapUrl),
       importantUrls,
       expectedDomain: str(body.expectedDomain),
+      isBeta: body.isBeta === true,
     });
     res.json({ robotsTxt: result });
   } catch (err) {

@@ -95,6 +95,8 @@ export interface AnalyzeRobotsTxtOptions {
   importantUrls?: string[];
   /** Restrict sitemap/host checks to this domain. Defaults to homeUrl's host. */
   expectedDomain?: string;
+  /** Interpret crawler blocking as intentional for a Beta/Staging project. */
+  isBeta?: boolean;
   /** Fetch timeout. Default 15 000 ms. */
   timeoutMs?: number;
   /** Max response bytes. Default 2 MB. */
@@ -397,6 +399,7 @@ export interface RobotsAnalyzeContext {
 
 export function analyzeRobotsTxtContent(text: string, ctx: RobotsAnalyzeContext): RobotsTxtAuditResult {
   const result = emptyResult(ctx.url, ctx.autoDetected);
+  const isBeta = ctx.options.isBeta === true;
   result.analyzed = true;
   result.fetched = true;
   result.finalUrl = ctx.finalUrl;
@@ -464,7 +467,7 @@ export function analyzeRobotsTxtContent(text: string, ctx: RobotsAnalyzeContext)
   const gb = resolveAgent(parsed, 'googlebot');
   const gbStatus = crawlStatus(gb.rules);
   result.summary.googlebotStatus = gbStatus.status;
-  if (gbStatus.fullyBlocked) {
+  if (gbStatus.fullyBlocked && !isBeta) {
     addIssue(result, {
       severity: 'critical', priority: 'top_critical', type: 'googlebot_fully_blocked',
       message: 'Googlebot is blocked from crawling the entire website.',
@@ -474,6 +477,8 @@ export function analyzeRobotsTxtContent(text: string, ctx: RobotsAnalyzeContext)
     });
     result.recommendations.push('Review the Disallow: / rule blocking Googlebot — it can prevent Google from crawling and indexing the website.');
     result.scoreBreakdown.googlebotCrawlability = 0;
+  } else if (gbStatus.fullyBlocked) {
+    result.scoreBreakdown.googlebotCrawlability = 25;
   } else if (gbStatus.status === 'Partially Blocked') {
     result.scoreBreakdown.googlebotCrawlability = 18;
   } else {
@@ -484,7 +489,7 @@ export function analyzeRobotsTxtContent(text: string, ctx: RobotsAnalyzeContext)
   const gbn = resolveAgent(parsed, 'googlebot-news');
   const gbnStatus = crawlStatus(gbn.rules);
   result.summary.googlebotNewsStatus = gbnStatus.status;
-  if (gbnStatus.fullyBlocked) {
+  if (gbnStatus.fullyBlocked && !isBeta) {
     addIssue(result, {
       severity: 'critical', priority: 'top_critical', type: 'googlebot_news_fully_blocked',
       message: 'Googlebot-News is blocked from crawling the website.',
@@ -494,10 +499,25 @@ export function analyzeRobotsTxtContent(text: string, ctx: RobotsAnalyzeContext)
     });
     result.recommendations.push('Review the Disallow rule affecting Googlebot-News — it can prevent news articles from being discovered for Google News.');
     result.scoreBreakdown.googlebotNewsCrawlability = 0;
+  } else if (gbnStatus.fullyBlocked) {
+    result.scoreBreakdown.googlebotNewsCrawlability = 15;
   } else if (gbnStatus.status === 'Partially Blocked') {
     result.scoreBreakdown.googlebotNewsCrawlability = 10;
   } else {
     result.scoreBreakdown.googlebotNewsCrawlability = 15;
+  }
+
+  if (isBeta && (!gbStatus.fullyBlocked || !gbnStatus.fullyBlocked)) {
+    const exposed = [
+      !gbStatus.fullyBlocked ? 'Googlebot' : null,
+      !gbnStatus.fullyBlocked ? 'Googlebot-News' : null,
+    ].filter(Boolean).join(' and ');
+    addIssue(result, {
+      severity: 'warning', priority: 'normal', type: 'beta_search_crawlers_not_blocked',
+      message: `Beta/Staging site is crawlable by ${exposed}.`,
+      recommendation: 'Block search crawlers on the Beta/Staging environment until it is ready for Production.',
+    });
+    result.recommendations.push('Block Googlebot and Googlebot-News on the Beta/Staging environment until launch.');
   }
 
   // ── Important path blocking ──
@@ -507,7 +527,7 @@ export function analyzeRobotsTxtContent(text: string, ctx: RobotsAnalyzeContext)
     try { path = new URL(iu).pathname; } catch { continue; }
     if (path === '/' || !path) continue;
     const blockedForGoogle = !isPathAllowed(gb.rules, path);
-    if (blockedForGoogle) {
+    if (blockedForGoogle && !isBeta) {
       addIssue(result, {
         severity: 'critical', priority: 'normal', type: 'important_news_path_blocked',
         message: 'An important content path appears to be blocked by robots.txt for Googlebot.',

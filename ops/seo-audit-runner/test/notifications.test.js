@@ -33,7 +33,7 @@ function mockSender({ failWith = null, failTimes = 0 } = {}) {
   };
 }
 
-const project = { id: 'p1', domain: 'example.com', website_url: 'https://example.com', project_name: 'Example' };
+const project = { id: 'p1', domain: 'example.com', website_url: 'https://example.com', project_name: 'Example', is_beta: false };
 
 const results = (issues = 1) => ({
   status: 'COMPLETED',
@@ -81,6 +81,72 @@ test('delivered project notification is persisted and issues marked alerted', as
   assert.equal(sender.sent.length, 1);
   const active = store.listActiveIssues('p1');
   assert.ok(active[0].last_alerted_at, 'delivered alert must stamp last_alerted_at');
+  db.close();
+});
+
+test('Beta project completes without creating or sending a scheduled Slack alert', async () => {
+  const { db, store } = freshStore();
+  const sender = mockSender();
+  const pipeline = pipelineWith(store, sender);
+
+  const outcome = await pipeline.handleProjectCompleted({
+    project: { ...project, is_beta: true },
+    auditRunId: 'r1',
+    results: results(),
+    criticalIssues: [critical(1)],
+  });
+
+  assert.equal(outcome.notificationStatus, 'skipped-beta');
+  assert.equal(sender.sent.length, 0);
+  assert.equal(store.listActiveIssues('p1').length, 0, 'Beta issues must not enter the alert lifecycle');
+  assert.equal(store.listRetryableNotifications({}).length, 0, 'no suppressed Beta payload may be retried later');
+  assert.deepEqual(pipeline.lifecycleTotals, {
+    new: 0, reopened: 0, unchanged: 0, resolved: 0, currentP0: 0, projectsWithCritical: 0,
+  });
+  db.close();
+});
+
+test('Production filtering remains false-by-default when is_beta is absent', async () => {
+  const { db, store } = freshStore();
+  const sender = mockSender();
+  const pipeline = pipelineWith(store, sender);
+  const { is_beta: _ignored, ...legacyProject } = project;
+
+  const outcome = await pipeline.handleProjectCompleted({
+    project: legacyProject,
+    auditRunId: 'r1',
+    results: results(),
+    criticalIssues: [critical(1)],
+  });
+
+  assert.equal(outcome.notificationStatus, 'delivered');
+  assert.equal(sender.sent.length, 1);
+  db.close();
+});
+
+test('a Beta project does not suppress a Production alert in the same scheduled pipeline', async () => {
+  const { db, store } = freshStore();
+  const sender = mockSender();
+  const pipeline = pipelineWith(store, sender);
+
+  const betaOutcome = await pipeline.handleProjectCompleted({
+    project: { ...project, is_beta: true },
+    auditRunId: 'r-beta',
+    results: results(),
+    criticalIssues: [{ ...critical(1), auditRunId: 'r-beta' }],
+  });
+  const productionOutcome = await pipeline.handleProjectCompleted({
+    project: { ...project, id: 'p2', domain: 'production.example', project_name: 'Production' },
+    auditRunId: 'r-production',
+    results: results(),
+    criticalIssues: [{ ...critical(2), projectId: 'p2', auditRunId: 'r-production' }],
+  });
+
+  assert.equal(betaOutcome.notificationStatus, 'skipped-beta');
+  assert.equal(productionOutcome.notificationStatus, 'delivered');
+  assert.equal(sender.sent.length, 1, 'only the Production project should reach Slack');
+  assert.equal(store.listActiveIssues('p1').length, 0);
+  assert.equal(store.listActiveIssues('p2').length, 1);
   db.close();
 });
 

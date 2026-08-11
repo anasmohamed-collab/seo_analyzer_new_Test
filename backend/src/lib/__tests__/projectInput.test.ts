@@ -45,6 +45,31 @@ describe('parseCreateProjectBody — website_url', () => {
   });
 });
 
+describe('parseCreateProjectBody — project environment', () => {
+  it('treats an omitted Beta flag as an unspecified Production-compatible default', () => {
+    expect(parseCreateProjectBody({ website_url: 'https://example.com' })).toMatchObject({
+      ok: true,
+      isBeta: null,
+    });
+  });
+
+  it('accepts is_beta and the isBeta compatibility alias', () => {
+    expect(parseCreateProjectBody({ website_url: 'https://beta.example.com', is_beta: true }))
+      .toMatchObject({ ok: true, isBeta: true });
+    expect(parseCreateProjectBody({ website_url: 'https://beta.example.com', isBeta: true }))
+      .toMatchObject({ ok: true, isBeta: true });
+    expect(parseCreateProjectBody({ website_url: 'https://example.com', is_beta: false }))
+      .toMatchObject({ ok: true, isBeta: false });
+  });
+
+  it('rejects a non-boolean Beta flag', () => {
+    expect(parseCreateProjectBody({ website_url: 'https://example.com', is_beta: 'true' })).toEqual({
+      ok: false,
+      error: 'is_beta must be a boolean when supplied',
+    });
+  });
+});
+
 describe('parseCreateProjectBody — audit configuration', () => {
   it('allows creation with no audit configuration', () => {
     const r = parseCreateProjectBody({ website_url: 'https://example.com' });

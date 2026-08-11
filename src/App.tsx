@@ -126,6 +126,7 @@ export default function App() {
             key={activeProject?.id ?? 'no-project'}
             initialFormValues={formValues ?? undefined}
             initialRunData={loadedAudit ?? undefined}
+            isBeta={activeProject?.is_beta === true}
             onAuditStarted={handleAuditStarted}
           />
         </>

@@ -1976,6 +1976,8 @@ interface SEOAgentProps {
   initialFormValues?: SEOAgentFormValues;
   /** Pre-load a past audit result for display (bypasses running a new audit) */
   initialRunData?: AuditRunData;
+  /** Environment-aware interpretation for the selected project. */
+  isBeta?: boolean;
   /** Called once when a DB-mode audit run is initiated; siteId is the project id */
   onAuditStarted?: (siteId: string, values: SEOAgentFormValues) => void;
 }
@@ -1983,6 +1985,7 @@ interface SEOAgentProps {
 export default function SEOAgent({
   initialFormValues,
   initialRunData,
+  isBeta = false,
   onAuditStarted,
 }: SEOAgentProps = {}) {
   const [homeUrl, setHomeUrl] = useState(initialFormValues?.homeUrl ?? '');
@@ -2127,6 +2130,7 @@ export default function SEOAgent({
           xmlSitemapUrl: xmlUrl || undefined,
           newsSitemapUrl: newsUrl || undefined,
           importantUrls,
+          isBeta,
         }),
       });
       if (res.ok) {
@@ -2139,7 +2143,7 @@ export default function SEOAgent({
     } finally {
       setRobotsTxtLoading(false);
     }
-  }, []);
+  }, [isBeta]);
 
   // ── Start New Audit ───────────────────────────────────────────────
   // Resets only the current UI session state so the user can run another
@@ -2197,7 +2201,12 @@ export default function SEOAgent({
       const res = await fetch(`${apiBase}/api/technical-analyzer/run`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ homeUrl: homeUrl.trim(), articleUrl: articleUrl.trim(), optionalUrls }),
+        body: JSON.stringify({
+          homeUrl: homeUrl.trim(),
+          articleUrl: articleUrl.trim(),
+          optionalUrls,
+          isBeta,
+        }),
       });
 
       if (!res.ok) {

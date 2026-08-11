@@ -45,6 +45,8 @@ export type ParsedCreateProject =
       domain: string;
       websiteUrl: string;
       projectName: string;
+      /** null means the caller omitted the classification */
+      isBeta: boolean | null;
       /** null when the request supplied no audit configuration at all */
       formValues: FormValues | null;
     }
@@ -52,6 +54,12 @@ export type ParsedCreateProject =
 
 function cleanString(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function parseOptionalBeta(input: Record<string, unknown>): boolean | null | undefined {
+  const value = input.is_beta ?? input.isBeta;
+  if (value === undefined) return null;
+  return typeof value === 'boolean' ? value : undefined;
 }
 
 /**
@@ -110,6 +118,11 @@ export function parseCreateProjectBody(body: unknown): ParsedCreateProject {
     return { ok: false, error: 'website_url is required' };
   }
 
+  const isBeta = parseOptionalBeta(input);
+  if (isBeta === undefined) {
+    return { ok: false, error: 'is_beta must be a boolean when supplied' };
+  }
+
   const site = normalizeWebsiteUrl(input.website_url);
   if (!site.ok) {
     return { ok: false, error: describeUrlRejection('website_url', site.reason) };
@@ -124,6 +137,7 @@ export function parseCreateProjectBody(body: unknown): ParsedCreateProject {
       domain: site.domain,
       websiteUrl: site.websiteUrl,
       projectName: cleanString(input.project_name) ?? site.domain,
+      isBeta,
       formValues: null,
     };
   }
@@ -163,6 +177,7 @@ export function parseCreateProjectBody(body: unknown): ParsedCreateProject {
     domain: site.domain,
     websiteUrl: site.websiteUrl,
     projectName: cleanString(input.project_name) ?? site.domain,
+    isBeta,
     formValues,
   };
 }
