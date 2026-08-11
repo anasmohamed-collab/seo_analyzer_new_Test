@@ -366,7 +366,7 @@ auditRunsRouter.post('/technical-analyzer/run', async (req: Request, res: Respon
         const running = await tx.query<{ id: string }>(
           `SELECT id FROM audit_runs
            WHERE site_id = $1 AND status = 'RUNNING'
-           ORDER BY created_at DESC LIMIT 1`,
+           ORDER BY started_at DESC LIMIT 1`,
           [selectedSite.id],
         );
         if (running.rows.length > 0) {
