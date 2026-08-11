@@ -85,6 +85,19 @@ const critical = (n) => ({
   auditRunId: 'r1',
 });
 
+const betaExposure = (n, over = {}) => ({
+  priority: 'P1',
+  area: 'indexability',
+  message: 'Beta/Staging seed URL is indexable (no noindex directive detected)',
+  fixHint: `Block Beta exposure ${n}`,
+  source: 'page',
+  pageUrl: `https://example.com/beta-${n}`,
+  pageType: 'home',
+  projectId: 'p1',
+  auditRunId: 'r1',
+  ...over,
+});
+
 function pipelineWith(store, sender, configOver = {}) {
   const pipeline = createNotificationPipeline({
     config: {
@@ -136,7 +149,7 @@ test('delivered project notification is persisted and issues marked alerted', as
   db.close();
 });
 
-test('Beta project completes without creating or sending a scheduled Slack alert', async () => {
+test('Beta exposure findings enter the lifecycle without inflating P0 totals or paging the channel', async () => {
   const { db, store } = freshStore();
   const sender = mockSender();
   const pipeline = pipelineWith(store, sender);
@@ -145,13 +158,14 @@ test('Beta project completes without creating or sending a scheduled Slack alert
     project: { ...project, is_beta: true },
     auditRunId: 'r1',
     results: results(),
-    criticalIssues: [critical(1)],
+    criticalIssues: [betaExposure(1)],
   });
 
-  assert.equal(outcome.notificationStatus, 'skipped-beta');
-  assert.equal(sender.sent.length, 0);
-  assert.equal(store.listActiveIssues('p1').length, 0, 'Beta issues must not enter the alert lifecycle');
-  assert.equal(store.listRetryableNotifications({}).length, 0, 'no suppressed Beta payload may be retried later');
+  assert.equal(outcome.notificationStatus, 'delivered');
+  assert.equal(sender.sent.length, 1);
+  assert.match(sender.sent[0].text, /Beta SEO Exposure Alert/);
+  assert.ok(!/<!(channel|here|everyone)>/.test(sender.sent[0].text));
+  assert.equal(store.listActiveIssues('p1').length, 1);
   assert.deepEqual(pipeline.lifecycleTotals, {
     new: 0, reopened: 0, unchanged: 0, resolved: 0, currentP0: 0, projectsWithCritical: 0,
   });
@@ -176,7 +190,7 @@ test('Production filtering remains false-by-default when is_beta is absent', asy
   db.close();
 });
 
-test('a Beta project does not suppress a Production alert in the same scheduled pipeline', async () => {
+test('Beta exposure and Production P0 alerts are both delivered in the same scheduled pipeline', async () => {
   const { db, store } = freshStore();
   const sender = mockSender();
   const pipeline = pipelineWith(store, sender);
@@ -185,7 +199,7 @@ test('a Beta project does not suppress a Production alert in the same scheduled 
     project: { ...project, is_beta: true },
     auditRunId: 'r-beta',
     results: results(),
-    criticalIssues: [{ ...critical(1), auditRunId: 'r-beta' }],
+    criticalIssues: [betaExposure(1, { auditRunId: 'r-beta' })],
   });
   const productionOutcome = await pipeline.handleProjectCompleted({
     project: { ...project, id: 'p2', domain: 'production.example', project_name: 'Production' },
@@ -194,11 +208,47 @@ test('a Beta project does not suppress a Production alert in the same scheduled 
     criticalIssues: [{ ...critical(2), projectId: 'p2', auditRunId: 'r-production' }],
   });
 
-  assert.equal(betaOutcome.notificationStatus, 'skipped-beta');
+  assert.equal(betaOutcome.notificationStatus, 'delivered');
   assert.equal(productionOutcome.notificationStatus, 'delivered');
-  assert.equal(sender.sent.length, 1, 'only the Production project should reach Slack');
-  assert.equal(store.listActiveIssues('p1').length, 0);
+  assert.equal(sender.sent.length, 2);
+  assert.equal(store.listActiveIssues('p1').length, 1);
   assert.equal(store.listActiveIssues('p2').length, 1);
+  db.close();
+});
+
+test('Beta exposure lifecycle sends NEW and RESOLVED but suppresses UNCHANGED', async () => {
+  const { db, store } = freshStore();
+  const sender = mockSender();
+  const pipeline = pipelineWith(store, sender);
+  const betaProject = { ...project, is_beta: true };
+
+  const first = await pipeline.handleProjectCompleted({
+    project: betaProject,
+    auditRunId: 'r1',
+    results: results(),
+    criticalIssues: [betaExposure(1)],
+  });
+  const second = await pipeline.handleProjectCompleted({
+    project: betaProject,
+    auditRunId: 'r2',
+    results: results(),
+    criticalIssues: [betaExposure(1, { auditRunId: 'r2' })],
+  });
+  const third = await pipeline.handleProjectCompleted({
+    project: betaProject,
+    auditRunId: 'r3',
+    results: results(),
+    criticalIssues: [],
+  });
+
+  assert.equal(first.notificationStatus, 'delivered');
+  assert.equal(first.lifecycleCounts.new, 1);
+  assert.equal(second.notificationStatus, 'not-required');
+  assert.equal(second.lifecycleCounts.unchanged, 1);
+  assert.equal(third.notificationStatus, 'delivered');
+  assert.equal(third.lifecycleCounts.resolved, 1);
+  assert.equal(sender.sent.length, 2);
+  assert.ok(sender.sent.every((message) => !/<!(channel|here|everyone)>/.test(message.text)));
   db.close();
 });
 
@@ -611,7 +661,8 @@ test('run-summary technical aggregates count only completed audits and total exa
   });
   const summary = sender.sent.at(-1).text;
   assert.match(summary, /Discovered: 3 \| Eligible: 3 \| Attempted: 3/);
-  assert.match(summary, /Completed: 2 .* Failed: 1/);
+  assert.match(summary, /Audited: 2\/3 completed/);
+  assert.match(summary, /Failed: 1/);
   assert.match(summary, /Robots: .* 1 \| .* 0 \| .* 0 \| .* 0/);
   assert.match(summary, /News sitemaps: .* 0 \| .* 1 \| .* 0 \| .* 0/);
   db.close();
@@ -636,7 +687,7 @@ test('a run with zero completed audits sends the no-audits summary', async () =>
   const summary = sender.sent[0].text;
   assert.match(summary, /No audits completed in this cycle\./);
   assert.match(summary, /Discovered: 13 \| Eligible: 4 \| Attempted: 0/);
-  assert.match(summary, /Completed: 0 \| Deferred: 4 \| Skipped: 0/);
+  assert.match(summary, /Deferred\/Skipped: 4/);
   assert.ok(!/critical/i.test(summary), 'a zero-audit run states no critical conclusion');
   assert.ok(!/Robots:/.test(summary), 'and no technical aggregate');
   db.close();

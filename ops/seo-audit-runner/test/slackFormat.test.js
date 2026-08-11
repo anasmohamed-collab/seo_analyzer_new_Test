@@ -119,6 +119,22 @@ test('unchanged-only and resolved-only alerts carry no broad mention', () => {
   assert.match(resolved.text, /\*P0:\* none currently open \| \*Resolved:\* 1/);
 });
 
+test('Beta exposure alerts are distinct, preserve P1, and never carry a broad mention', () => {
+  const exposure = mkIssue(1, {
+    priority: 'P1',
+    message: 'Beta/Staging seed URL is indexable (no noindex directive detected)',
+  });
+  const [message] = buildProjectMessages(
+    baseArgs(lc({ new: [exposure] }), { isBeta: true, mention: null }),
+  );
+
+  assert.match(message.text, /^:warning: \*Beta SEO Exposure Alert\*/);
+  assert.match(message.text, /\*Exposure findings:\* 1 new/);
+  assert.match(message.text, /Beta\/Staging seed URL is indexable/);
+  assert.ok(!/<!(channel|here|everyone)>/.test(message.text));
+  assert.ok(!/\*P0:\*/.test(message.text));
+});
+
 // ── Compact critical format ─────────────────────────────────────────
 
 test('the critical alert is compact, scannable, and free of ID noise', () => {
@@ -364,6 +380,7 @@ test('technical checks are read from the audit result, including a JSON string',
 
 const summaryTotals = (over = {}) => ({
   discovered: 1, selected: 1, deduplicated: 0, completed: 1, failed: 0, timedOut: 0,
+  triggerFailed: 0,
   skippedAlreadyRunning: 0, skippedMissingConfig: 0, triggerOutcomeUnknown: 0,
   projectsWithCritical: 1, currentP0: 1, newIssues: 1, reopenedIssues: 0,
   unchangedIssues: 0, resolvedIssues: 0, notificationFailures: 0,
@@ -383,11 +400,8 @@ test('the run summary is compact and carries no broad mention', () => {
 
   assert.match(text, /^:clipboard: \*SEO Audit Summary\*/);
   assert.match(text, /Discovered: 1 \| Eligible: 1 \| Attempted: 1/);
-  assert.match(
-    text,
-    /Completed: 1 \| Deferred: 0 \| Skipped: 0 \| Failed: 0 \| Timed out: 0 \| Trigger unknown: 0/,
-  );
-  assert.match(text, /Critical projects: 1 \| P0: 1 \| New: 1 \| Resolved: 0/);
+  assert.match(text, /Audited: 1\/1 completed/);
+  assert.match(text, /Critical projects: 1 \| Current P0: 1 \| New P0: 1/);
   assert.match(text, /Robots: ✅ 1 \| ❌ 0 \| ⚠️ 0 \| ❓ 0/);
   assert.match(text, /Sitemaps: ✅ 1 \| ❌ 0 \| ⚠️ 0 \| ❓ 0/);
   assert.match(text, /News sitemaps: ✅ 0 \| ❌ 1 \| ⚠️ 0 \| ❓ 0/);
@@ -398,6 +412,8 @@ test('the run summary is compact and carries no broad mention', () => {
   assert.ok(!text.includes('Projects discovered'), 'zero-value noise is removed');
   assert.ok(!text.includes('Selected after deduplication'));
   assert.ok(!text.includes('Duplicates skipped'));
+  assert.ok(!text.includes('Deferred/Skipped: 0'));
+  assert.ok(!text.includes('Failed: 0'));
   assert.ok(!text.includes('Trigger outcome unknown'));
   assert.ok(!text.includes('Failed Slack notifications'));
   assert.ok(!text.includes('2026-07-13T06:00:00Z'), 'ISO timestamps are not shown');
@@ -417,6 +433,66 @@ test('operational counters appear only when non-zero', () => {
   assert.match(text, /Failed Slack notifications: 3/);
 });
 
+test('partial success stays a summary and surfaces only non-zero outcome counts', () => {
+  const { text } = buildRunSummaryMessage({
+    runnerExecutionId: 'exec-partial',
+    durationMs: 90_000,
+    totals: summaryTotals({
+      discovered: 13,
+      eligible: 8,
+      attempted: 8,
+      completed: 7,
+      failed: 1,
+      triggerFailed: 1,
+      projectsWithCritical: 3,
+      currentP0: 4,
+      newIssues: 1,
+      resolvedIssues: 2,
+    }),
+  });
+
+  assert.match(text, /^:clipboard: \*SEO Audit Summary\*/);
+  assert.match(text, /Audited: 7\/8 completed/);
+  assert.match(text, /Critical projects: 3 \| Current P0: 4 \| New P0: 1 \| Resolved P0: 2/);
+  assert.match(text, /Failed: 1/);
+  assert.ok(!text.includes('SEO Audit Runner Failure'));
+  assert.ok(!text.includes('Timed out: 0'));
+});
+
+test('an all-trigger failure is an operational alert with reason and affected domains', () => {
+  const failedDomains = Array.from({ length: 8 }, (_, index) => `site-${index + 1}.example.com`);
+  const { text } = buildRunSummaryMessage({
+    runnerExecutionId: 'failure-1234-5678',
+    durationMs: 45_000,
+    totals: summaryTotals({
+      discovered: 13,
+      eligible: 8,
+      attempted: 8,
+      completed: 0,
+      failed: 8,
+      triggerFailed: 8,
+      skipped: 5,
+      commonFailureReason: '500: column <created_at> does not exist',
+      failedDomains,
+      projectsWithCritical: 0,
+      currentP0: 0,
+      newIssues: 0,
+      resolvedIssues: 0,
+    }),
+  });
+
+  assert.match(text, /^:rotating_light: \*SEO Audit Runner Failure\*/);
+  assert.match(text, /8\/8 audit triggers failed\./);
+  assert.match(text, /No SEO audits completed\./);
+  assert.match(text, /\*Reason:\* 500: column &lt;created_at&gt; does not exist/);
+  assert.match(text, /\*Affected:\* `site-1\.example\.com`/);
+  assert.match(text, /\+ 3 more/);
+  assert.match(text, /Deferred\/Skipped: 5/);
+  assert.ok(!/critical/i.test(text));
+  assert.ok(!/Audited:/.test(text));
+  assert.ok(!/<!(channel|here|everyone)>/.test(text));
+});
+
 test('a run with zero completed audits never claims a zero critical state', () => {
   const { text } = buildRunSummaryMessage({
     runnerExecutionId: '1033403c-4444-4000-8000-000000000004',
@@ -430,14 +506,31 @@ test('a run with zero completed audits never claims a zero critical state', () =
   });
   assert.match(text, /No audits completed in this cycle\./);
   assert.match(text, /Discovered: 13 \| Eligible: 5 \| Attempted: 0/);
-  assert.match(
-    text,
-    /Completed: 0 \| Deferred: 2 \| Skipped: 1 \| Failed: 0 \| Timed out: 0 \| Trigger unknown: 0/,
-  );
+  assert.match(text, /Deferred\/Skipped: 3/);
   assert.match(text, /Duration: 20s \| Execution: `1033403c`/);
   assert.ok(!/critical/i.test(text), 'no critical-state conclusion without a completed audit');
   assert.ok(!/Robots:/.test(text), 'no technical aggregate without a completed audit');
   assert.ok(!/Audited:/.test(text));
+});
+
+test('zero eligible projects says why no audit count exists', () => {
+  const { text } = buildRunSummaryMessage({
+    runnerExecutionId: 'zero-eligible',
+    durationMs: 1000,
+    totals: summaryTotals({
+      discovered: 5,
+      eligible: 0,
+      selected: 0,
+      completed: 0,
+      projectsWithCritical: 0,
+      currentP0: 0,
+      newIssues: 0,
+      resolvedIssues: 0,
+    }),
+  });
+  assert.match(text, /Discovered: 5 \| Eligible: 0 \| Attempted: 0/);
+  assert.match(text, /No eligible projects were audited\./);
+  assert.ok(!/critical/i.test(text));
 });
 
 test('run-summary technical aggregates always total the completed-audit count', () => {

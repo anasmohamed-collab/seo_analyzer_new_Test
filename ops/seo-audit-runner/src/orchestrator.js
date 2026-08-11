@@ -14,7 +14,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { dedupeProjects } from './dedupe.js';
 import { buildRunRequest } from './buildRunRequest.js';
 import { evaluateProjectEligibility } from './eligibility.js';
-import { extractCriticalIssues } from './criticalFilter.js';
+import { extractAutomationAlertIssues, extractCriticalIssues } from './criticalFilter.js';
 import { AmbiguousTriggerError, TriggerFailedError } from './apiClient.js';
 import { OUTCOME } from './report.js';
 
@@ -211,8 +211,16 @@ export async function runAudits({ config, apiClient, logger = null, options = {}
         projectId: project.id,
         auditRunId: trigger.auditRunId,
       });
+      const alertIssues = extractAutomationAlertIssues(polled.results, {
+        projectId: project.id,
+        auditRunId: trigger.auditRunId,
+        isBeta: project.is_beta === true,
+      });
       report.criticalIssues.push(...criticals);
-      logger?.info?.(`Project ${label}: COMPLETED with ${criticals.length} critical (P0) issue(s)`);
+      logger?.info?.(
+        `Project ${label}: COMPLETED with ${criticals.length} critical (P0) issue(s)` +
+          `${alertIssues.length !== criticals.length ? ` and ${alertIssues.length - criticals.length} Beta exposure alert(s)` : ''}`,
+      );
       const completedEntry = makeEntry(
         project,
         OUTCOME.COMPLETED,
@@ -236,7 +244,7 @@ export async function runAudits({ config, apiClient, logger = null, options = {}
             siteId: trigger.siteId,
             auditRunId: trigger.auditRunId,
             results: polled.results,
-            criticalIssues: criticals,
+            criticalIssues: alertIssues,
             submittedUrls: built.body,
           });
           if (outcome?.evidenceComplete === false) {

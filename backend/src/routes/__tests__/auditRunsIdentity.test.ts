@@ -177,6 +177,8 @@ describe('POST /api/technical-analyzer/run project binding', () => {
     expect(lockAt).toBeLessThan(siteAt);
     expect(siteAt).toBeLessThan(runningAt);
     expect(runningAt).toBeLessThan(seedsAt);
+    expect(transactionSql[runningAt]).toMatch(/ORDER BY started_at DESC/i);
+    expect(transactionSql[runningAt]).not.toMatch(/ORDER BY created_at DESC/i);
   });
 
   it('rejects an existing RUNNING audit with 409', async () => {
