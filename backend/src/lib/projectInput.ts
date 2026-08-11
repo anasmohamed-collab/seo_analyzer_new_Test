@@ -39,6 +39,10 @@ const SAME_DOMAIN_KEYS: FormValueKey[] = ['homeUrl', 'articleUrl'];
 
 export type FormValues = Partial<Record<FormValueKey, string>>;
 
+export type ParsedProjectFormValues =
+  | { ok: true; formValues: FormValues | null }
+  | { ok: false; error: string };
+
 export type ParsedCreateProject =
   | {
       ok: true;
@@ -101,6 +105,62 @@ function collectRawFormValues(body: Record<string, unknown>): Record<string, str
 }
 
 /**
+ * Validate project audit configuration against an already-normalized project
+ * identity. Both create and update routes use this function so a project cannot
+ * become automation-ready through a weaker update contract.
+ */
+export function parseProjectFormValues(
+  body: unknown,
+  expectedDomain: string,
+  { requireConfiguration = false }: { requireConfiguration?: boolean } = {},
+): ParsedProjectFormValues {
+  const input =
+    body && typeof body === 'object' && !Array.isArray(body)
+      ? (body as Record<string, unknown>)
+      : {};
+  const raw = collectRawFormValues(input);
+  const providedKeys = Object.keys(raw) as FormValueKey[];
+
+  if (providedKeys.length === 0) {
+    return requireConfiguration
+      ? { ok: false, error: 'homeUrl and articleUrl are required' }
+      : { ok: true, formValues: null };
+  }
+
+  const missing = REQUIRED_FORM_KEYS.filter((key) => !raw[key]);
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      error:
+        `Audit configuration is incomplete — ${missing.join(' and ')} ` +
+        'must be supplied together with the other audit URLs',
+    };
+  }
+
+  const formValues: FormValues = {};
+  for (const key of providedKeys) {
+    const parsed = parseWebUrl(raw[key]);
+    if (!parsed.ok) {
+      return { ok: false, error: describeUrlRejection(key, parsed.reason) };
+    }
+
+    if (SAME_DOMAIN_KEYS.includes(key)) {
+      const keyDomain = normalizeProjectDomain(parsed.url.href);
+      if (keyDomain !== expectedDomain) {
+        return {
+          ok: false,
+          error: `${key} must belong to ${expectedDomain} (got ${keyDomain ?? 'an unusable domain'})`,
+        };
+      }
+    }
+
+    formValues[key] = raw[key];
+  }
+
+  return { ok: true, formValues };
+}
+
+/**
  * Validate and normalize a create-project request.
  *
  * Audit configuration is all-or-nothing: supplying any audit URL requires both
@@ -128,10 +188,10 @@ export function parseCreateProjectBody(body: unknown): ParsedCreateProject {
     return { ok: false, error: describeUrlRejection('website_url', site.reason) };
   }
 
-  const raw = collectRawFormValues(input);
-  const providedKeys = Object.keys(raw) as FormValueKey[];
+  const parsedFormValues = parseProjectFormValues(input, site.domain);
+  if (!parsedFormValues.ok) return parsedFormValues;
 
-  if (providedKeys.length === 0) {
+  if (parsedFormValues.formValues === null) {
     return {
       ok: true,
       domain: site.domain,
@@ -142,42 +202,12 @@ export function parseCreateProjectBody(body: unknown): ParsedCreateProject {
     };
   }
 
-  const missing = REQUIRED_FORM_KEYS.filter((key) => !raw[key]);
-  if (missing.length > 0) {
-    return {
-      ok: false,
-      error:
-        `Audit configuration is incomplete — ${missing.join(' and ')} ` +
-        'must be supplied together with the other audit URLs',
-    };
-  }
-
-  const formValues: FormValues = {};
-  for (const key of providedKeys) {
-    const parsed = parseWebUrl(raw[key]);
-    if (!parsed.ok) {
-      return { ok: false, error: describeUrlRejection(key, parsed.reason) };
-    }
-
-    if (SAME_DOMAIN_KEYS.includes(key)) {
-      const keyDomain = normalizeProjectDomain(parsed.url.href);
-      if (keyDomain !== site.domain) {
-        return {
-          ok: false,
-          error: `${key} must belong to ${site.domain} (got ${keyDomain ?? 'an unusable domain'})`,
-        };
-      }
-    }
-
-    formValues[key] = raw[key];
-  }
-
   return {
     ok: true,
     domain: site.domain,
     websiteUrl: site.websiteUrl,
     projectName: cleanString(input.project_name) ?? site.domain,
     isBeta,
-    formValues,
+    formValues: parsedFormValues.formValues,
   };
 }

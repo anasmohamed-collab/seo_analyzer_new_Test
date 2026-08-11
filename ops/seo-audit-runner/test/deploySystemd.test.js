@@ -5,81 +5,106 @@ import path from 'node:path';
 import { RUNNER_ROOT } from '../tools/shellHarness.js';
 
 const SYSTEMD_DIR = path.join(RUNNER_ROOT, 'deploy', 'systemd');
-const SERVICES = ['seo-audit-runner.service', 'seo-runner-retry.service', 'seo-runner-tick.service'];
-const TIMERS = ['seo-audit-runner.timer', 'seo-runner-retry.timer', 'seo-runner-tick.timer'];
+const SERVICE = 'seo-runner-tick.service';
+const TIMER = 'seo-runner-tick.timer';
+
+// Superseded by the single tick model: a daily `run --all` timer and a
+// separate notification-retry timer. They must not ship at all — the tick
+// owns due schedules, queued jobs, and notification retries.
+const SUPERSEDED = [
+  'seo-audit-runner.service',
+  'seo-audit-runner.timer',
+  'seo-runner-retry.service',
+  'seo-runner-retry.timer',
+];
 
 const read = (name) => fs.readFileSync(path.join(SYSTEMD_DIR, name), 'utf8');
 
-test('all six unit files exist with LF-only line endings', () => {
-  for (const name of [...SERVICES, ...TIMERS]) {
+test('exactly one installable timer and one service ship, with LF-only line endings', () => {
+  const shipped = fs.readdirSync(SYSTEMD_DIR).sort();
+  assert.deepEqual(shipped, [SERVICE, TIMER], 'deploy/systemd must contain the tick units and nothing else');
+  for (const name of shipped) {
     const bytes = fs.readFileSync(path.join(SYSTEMD_DIR, name));
     assert.ok(bytes.length > 0, `${name} missing or empty`);
     assert.ok(!bytes.includes(0x0d), `${name} contains CRLF`);
   }
 });
 
-test('services run as seo-runner, oneshot, via the wrapper, with the env file', () => {
-  const execStart = {
-    'seo-audit-runner.service': /^ExecStart=\/usr\/local\/bin\/seo-audit-runner run --all$/m,
-    'seo-runner-retry.service': /^ExecStart=\/usr\/local\/bin\/seo-audit-runner retry-notifications$/m,
-    'seo-runner-tick.service': /^ExecStart=\/usr\/local\/bin\/seo-audit-runner worker --once$/m,
-  };
-  for (const name of SERVICES) {
-    const unit = read(name);
-    assert.match(unit, /^Type=oneshot$/m, name);
-    assert.match(unit, /^User=seo-runner$/m, name);
-    assert.match(unit, /^Group=seo-runner$/m, name);
-    assert.match(unit, /^EnvironmentFile=\/etc\/seo-audit-runner\/runner\.env$/m, name);
-    assert.match(unit, execStart[name], name);
-    assert.ok(!/^User=root/m.test(unit), `${name} must never run as root`);
-  }
-});
-
-test('services are hardened and write-restricted to runner directories', () => {
-  for (const name of SERVICES) {
-    const unit = read(name);
-    for (const directive of [
-      'NoNewPrivileges=true',
-      'ProtectSystem=strict',
-      'ProtectHome=true',
-      'ReadWritePaths=/var/lib/seo-audit-runner /var/log/seo-audit-runner',
-      'PrivateTmp=true',
-      'RestrictSUIDSGID=true',
-      'CapabilityBoundingSet=',
-      'RuntimeDirectory=seo-audit-runner',
-      'UMask=0027',
-      'KillSignal=SIGTERM',
-    ]) {
-      assert.ok(unit.includes(directive), `${name} is missing ${directive}`);
+test('no superseded unit file is shipped anywhere under deploy/', () => {
+  const stack = [path.join(RUNNER_ROOT, 'deploy')];
+  const found = [];
+  while (stack.length) {
+    const dir = stack.pop();
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) stack.push(full);
+      else if (SUPERSEDED.includes(entry.name)) found.push(path.relative(RUNNER_ROOT, full));
     }
-    assert.match(unit, /^TimeoutStartSec=/m, name);
-    assert.match(unit, /^TimeoutStopSec=/m, name);
-    assert.match(unit, /^MemoryMax=/m, name);
-    assert.match(unit, /^TasksMax=/m, name);
   }
+  assert.deepEqual(found, [], 'a superseded unit file is still installable');
 });
 
-test('timers: daily audit pinned to Africa/Cairo with catch-up; tick every 5 minutes', () => {
-  const daily = read('seo-audit-runner.timer');
-  assert.match(daily, /^OnCalendar=\*-\*-\* 03:00:00 Africa\/Cairo$/m);
-  assert.match(daily, /^Persistent=true$/m);
-  assert.match(daily, /^RandomizedDelaySec=/m);
+test('the tick service runs `worker --once` as seo-runner, oneshot, with the env file', () => {
+  const unit = read(SERVICE);
+  assert.match(unit, /^Type=oneshot$/m);
+  assert.match(unit, /^User=seo-runner$/m);
+  assert.match(unit, /^Group=seo-runner$/m);
+  assert.match(unit, /^EnvironmentFile=\/etc\/seo-audit-runner\/runner\.env$/m);
+  assert.match(unit, /^ExecStart=\/usr\/local\/bin\/seo-audit-runner worker --once$/m);
+  assert.ok(!/^User=root/m.test(unit), 'the service must never run as root');
+  // journald is the default sink: no StandardOutput/StandardError override.
+  assert.ok(!/^Standard(Output|Error)=/m.test(unit), 'logging must stay on journald by default');
+});
 
-  const retry = read('seo-runner-retry.timer');
-  assert.match(retry, /^OnCalendar=hourly$/m);
-  assert.match(retry, /^Persistent=true$/m);
+test('the tick service is hardened and write-restricted to runner directories', () => {
+  const unit = read(SERVICE);
+  for (const directive of [
+    'NoNewPrivileges=true',
+    'ProtectSystem=strict',
+    'ProtectHome=true',
+    'ReadWritePaths=/var/lib/seo-audit-runner /var/log/seo-audit-runner',
+    'PrivateTmp=true',
+    'RestrictSUIDSGID=true',
+    'CapabilityBoundingSet=',
+    'RuntimeDirectory=seo-audit-runner',
+    'UMask=0027',
+    'KillSignal=SIGTERM',
+  ]) {
+    assert.ok(unit.includes(directive), `${SERVICE} is missing ${directive}`);
+  }
+  assert.match(unit, /^TimeoutStartSec=/m);
+  assert.match(unit, /^TimeoutStopSec=/m);
+  assert.match(unit, /^MemoryMax=/m);
+  assert.match(unit, /^TasksMax=/m);
+});
 
-  const tick = read('seo-runner-tick.timer');
-  assert.match(tick, /^OnCalendar=\*:0\/5$/m);
-  assert.match(tick, /^Persistent=false$/m);
+test('the tick timer fires every 5 minutes and needs no catch-up', () => {
+  const timer = read(TIMER);
+  assert.match(timer, /^OnCalendar=\*:0\/5$/m);
+  assert.match(timer, /^Persistent=false$/m, 'the runner catches up itself; systemd must not replay ticks');
+  assert.match(timer, /^Unit=seo-runner-tick\.service$/m);
+  assert.match(timer, /^WantedBy=timers\.target$/m);
+});
 
-  for (const name of TIMERS) {
-    assert.match(read(name), /^WantedBy=timers\.target$/m, name);
+test('the units document the single scheduling authority and that the timer ships disabled', () => {
+  for (const name of [SERVICE, TIMER]) {
+    const unit = read(name);
+    assert.match(unit, /SHIPS DISABLED|ships disabled/i, `${name} must state that the timer ships disabled`);
+    assert.match(unit, /SINGLE|ONLY/, `${name} must state that the tick is the only scheduling authority`);
+  }
+  // No unit may claim a second timer exists.
+  for (const name of [SERVICE, TIMER]) {
+    for (const superseded of SUPERSEDED) {
+      assert.ok(
+        !read(name).includes(superseded),
+        `${name} still points at the superseded unit ${superseded}`,
+      );
+    }
   }
 });
 
 test('unit files contain no secrets and no shell constructs', () => {
-  for (const name of [...SERVICES, ...TIMERS]) {
+  for (const name of [SERVICE, TIMER]) {
     const unit = read(name);
     assert.ok(!/xoxb-|hooks\.slack\.com\/services\/T/.test(unit), `${name} contains a credential-shaped value`);
     assert.ok(!/ExecStart=.*(\||&&|;|\$\(|`)/.test(unit), `${name} ExecStart must be a plain argv, no shell`);

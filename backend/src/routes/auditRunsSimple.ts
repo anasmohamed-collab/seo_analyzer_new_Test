@@ -7,6 +7,7 @@
 
 import { Router } from 'express';
 import type { Request, Response } from 'express';
+import type { PoolClient } from 'pg';
 import { getDb } from '../lib/db.js';
 import { normalizeProjectDomain } from '../lib/normalizeProjectDomain.js';
 import { runSiteChecks } from '../services/checks/siteChecks.js';
@@ -26,21 +27,7 @@ export const auditRunsRouter = Router();
 const PAGE_TIMEOUT = 30_000;
 const VALID_TYPES = ['home', 'section', 'article', 'search', 'tag', 'author', 'video_article'] as const;
 
-// ── SSRF guard ──────────────────────────────────────────────────
-
-const PRIVATE_RANGES = [
-  /^127\./, /^10\./, /^172\.(1[6-9]|2\d|3[01])\./,
-  /^192\.168\./, /^169\.254\./, /^0\./, /^localhost$/i, /^\[::1\]$/,
-];
-
-function isSafeUrl(raw: string): boolean {
-  try {
-    const u = new URL(raw);
-    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
-    for (const re of PRIVATE_RANGES) { if (re.test(u.hostname)) return false; }
-    return true;
-  } catch { return false; }
-}
+// Outbound URL safety is enforced inside the shared fetch engine.
 
 // ── Page state classification ───────────────────────────────────
 //
@@ -116,11 +103,6 @@ async function auditSingleUrl(
   seedType?: string,
   isBeta = false,
 ): Promise<Record<string, unknown>> {
-  if (!isSafeUrl(url)) {
-    return { url, error: 'Blocked by SSRF guard', status: 'FAIL', page_state: 'FETCH_ERROR',
-      recommendations: ['URL blocked by security policy'] };
-  }
-
   // ── Multi-profile fetch (Chrome → Firefox → Googlebot → Scrapling) ──────────
   const fetchResult = await runFetchEngine(url, { timeoutMs: PAGE_TIMEOUT });
 
@@ -251,6 +233,8 @@ async function auditSingleUrl(
 // ── Types ───────────────────────────────────────────────────────
 
 interface AnalyzerBody {
+  /** Optional safety binding used by automation; legacy manual callers may omit it. */
+  expectedProjectId?: string;
   homeUrl: string;
   articleUrl: string;
   isBeta?: boolean;
@@ -275,13 +259,20 @@ auditRunsRouter.post('/technical-analyzer/run', async (req: Request, res: Respon
       return;
     }
 
-    let domain: string;
+    let home: URL;
+    let article: URL;
     try {
-      domain = new URL(body.homeUrl).hostname;
+      home = new URL(body.homeUrl);
+      article = new URL(body.articleUrl);
     } catch {
-      res.status(400).json({ error: 'Invalid homeUrl' });
+      res.status(400).json({ error: 'Invalid homeUrl or articleUrl' });
       return;
     }
+    if (!['http:', 'https:'].includes(home.protocol) || !['http:', 'https:'].includes(article.protocol)) {
+      res.status(400).json({ error: 'homeUrl and articleUrl must use http or https' });
+      return;
+    }
+    const domain = home.hostname;
 
     // Identity key for the `sites` upsert only — shared with POST /api/projects
     // so the same website cannot end up as two rows depending on whether it was
@@ -289,6 +280,14 @@ auditRunsRouter.post('/technical-analyzer/run', async (req: Request, res: Respon
     // remains what the audit engine actually crawls.
     const siteDomain = normalizeProjectDomain(body.homeUrl) ?? domain;
     const requestedIsBeta = body.isBeta === true;
+    const articleDomain = normalizeProjectDomain(body.articleUrl);
+    const expectedProjectId = typeof body.expectedProjectId === 'string'
+      ? body.expectedProjectId.trim()
+      : '';
+    if (body.expectedProjectId !== undefined && !expectedProjectId) {
+      res.status(400).json({ error: 'expectedProjectId must be a non-empty string' });
+      return;
+    }
 
     const urlMap: Record<string, string> = { home: body.homeUrl, article: body.articleUrl };
     if (body.optionalUrls) {
@@ -298,41 +297,115 @@ auditRunsRouter.post('/technical-analyzer/run', async (req: Request, res: Respon
         }
       }
     }
+    // The current run owns this immutable snapshot. Persisted seed_urls remain
+    // project metadata and are never re-read to decide what this run should crawl.
+    const submittedSeeds = Object.entries(urlMap).map(([pageType, url]) => ({ pageType, url }));
 
     const db = getDb();
 
     if (db) {
       // ── DB mode ──────────────────────────────────────────────
+      let client: PoolClient | null = null;
+      let site: { id: string; domain: string; is_beta: boolean } | null = null;
+      let auditRun: { id: string } | null = null;
       try {
-        // Upsert site
-        const siteRes = await db.query<{ id: string; domain: string; is_beta: boolean }>(
-          `INSERT INTO sites (domain, updated_at)
-           VALUES ($1, NOW())
-           ON CONFLICT (domain) DO UPDATE SET updated_at = NOW()
-           RETURNING *`,
-          [siteDomain],
+        const tx = await db.connect();
+        client = tx;
+        await tx.query('BEGIN');
+        // Both bound automation calls and legacy manual calls take the same
+        // normalized-domain lock before touching the sites row. Keeping the
+        // lock order identical avoids a row-lock/advisory-lock deadlock.
+        await tx.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [siteDomain]);
+
+        if (expectedProjectId) {
+          const siteRes = await tx.query<{ id: string; domain: string; is_beta: boolean }>(
+            'SELECT id, domain, is_beta FROM sites WHERE id = $1 FOR UPDATE',
+            [expectedProjectId],
+          );
+          site = siteRes.rows[0] ?? null;
+          if (!site) {
+            await tx.query('ROLLBACK');
+            tx.release();
+            client = null;
+            res.status(404).json({ error: 'Expected project not found' });
+            return;
+          }
+          if (siteDomain !== site.domain) {
+            await tx.query('ROLLBACK');
+            tx.release();
+            client = null;
+            res.status(400).json({
+              error: `homeUrl must belong to expected project domain ${site.domain} (got ${siteDomain})`,
+            });
+            return;
+          }
+          if (articleDomain !== site.domain) {
+            await tx.query('ROLLBACK');
+            tx.release();
+            client = null;
+            res.status(400).json({
+              error: `articleUrl must belong to expected project domain ${site.domain} (got ${articleDomain ?? 'an unusable domain'})`,
+            });
+            return;
+          }
+        } else {
+          const siteRes = await tx.query<{ id: string; domain: string; is_beta: boolean }>(
+            `INSERT INTO sites (domain, updated_at)
+             VALUES ($1, NOW())
+             ON CONFLICT (domain) DO UPDATE SET updated_at = NOW()
+             RETURNING id, domain, is_beta`,
+            [siteDomain],
+          );
+          site = siteRes.rows[0];
+          if (!site) throw new Error('Site upsert returned no row');
+        }
+
+        if (!site) throw new Error('Site resolution returned no row');
+        const selectedSite = site;
+        const isBeta = selectedSite.is_beta === true;
+        const running = await tx.query<{ id: string }>(
+          `SELECT id FROM audit_runs
+           WHERE site_id = $1 AND status = 'RUNNING'
+           ORDER BY created_at DESC LIMIT 1`,
+          [selectedSite.id],
         );
-        const site = siteRes.rows[0];
-        const isBeta = site.is_beta === true;
+        if (running.rows.length > 0) {
+          await tx.query('ROLLBACK');
+          tx.release();
+          client = null;
+          res.status(409).json({
+            error: 'An audit is already running for this project',
+            siteId: selectedSite.id,
+            auditRunId: running.rows[0].id,
+          });
+          return;
+        }
 
         // Replace seed URLs
-        await db.query('DELETE FROM seed_urls WHERE site_id = $1', [site.id]);
-        for (const [type, url] of Object.entries(urlMap)) {
-          await db.query(
+        await tx.query('DELETE FROM seed_urls WHERE site_id = $1', [selectedSite.id]);
+        for (const seed of submittedSeeds) {
+          await tx.query(
             'INSERT INTO seed_urls (site_id, url, page_type) VALUES ($1, $2, $3)',
-            [site.id, url, type],
+            [selectedSite.id, seed.url, seed.pageType],
           );
         }
 
         // Create audit run
-        const runRes = await db.query<{ id: string }>(
-          `INSERT INTO audit_runs (site_id, status) VALUES ($1, 'RUNNING') RETURNING *`,
-          [site.id],
+        const runRes = await tx.query<{ id: string }>(
+          `INSERT INTO audit_runs (site_id, status) VALUES ($1, 'RUNNING') RETURNING id`,
+          [selectedSite.id],
         );
-        const auditRun = runRes.rows[0];
+        auditRun = runRes.rows[0];
+        if (!auditRun) throw new Error('Audit insert returned no row');
+        await tx.query('COMMIT');
+        tx.release();
+        client = null;
+
+        const committedSite = selectedSite;
+        const committedAuditRun = auditRun;
 
         // Return immediately
-        res.json({ siteId: site.id, auditRunId: auditRun.id });
+        res.json({ siteId: committedSite.id, auditRunId: committedAuditRun.id });
 
         // Fire-and-forget background audit
         (async () => {
@@ -349,18 +422,14 @@ auditRunsRouter.post('/technical-analyzer/run', async (req: Request, res: Respon
 
             await db.query(
               'UPDATE audit_runs SET site_checks = $1 WHERE id = $2',
-              [JSON.stringify(siteChecks), auditRun.id],
+              [JSON.stringify(siteChecks), committedAuditRun.id],
             );
 
-            const seedRes = await db.query<{ url: string; page_type: string | null }>(
-              'SELECT url, page_type FROM seed_urls WHERE site_id = $1',
-              [site.id],
-            );
             const seenTitles = new Set<string>();
 
-            for (const seed of seedRes.rows) {
+            for (const seed of submittedSeeds) {
               try {
-                const result = await auditSingleUrl(seed.url, seenTitles, seed.page_type ?? undefined, isBeta);
+                const result = await auditSingleUrl(seed.url, seenTitles, seed.pageType, isBeta);
                 const resultData = (result.data ?? { error: result.error }) as Record<string, unknown>;
                 const resultStatus = (result.status as string) ?? 'FAIL';
                 const resultRecs = Array.isArray(result.recommendations) && result.recommendations.length > 0
@@ -369,14 +438,14 @@ auditRunsRouter.post('/technical-analyzer/run', async (req: Request, res: Respon
                 await db.query(
                   `INSERT INTO audit_results (audit_run_id, url, data, status, recommendations)
                    VALUES ($1, $2, $3, $4, $5)`,
-                  [auditRun.id, seed.url, JSON.stringify(resultData), resultStatus,
+                  [committedAuditRun.id, seed.url, JSON.stringify(resultData), resultStatus,
                     resultRecs ? JSON.stringify(resultRecs) : null],
                 );
               } catch (err) {
                 await db.query(
                   `INSERT INTO audit_results (audit_run_id, url, data, status, recommendations)
                    VALUES ($1, $2, $3, $4, $5)`,
-                  [auditRun.id, seed.url,
+                  [committedAuditRun.id, seed.url,
                     JSON.stringify({ error: err instanceof Error ? err.message : 'unknown' }),
                     'FAIL', JSON.stringify(['Audit failed for this URL'])],
                 );
@@ -385,21 +454,33 @@ auditRunsRouter.post('/technical-analyzer/run', async (req: Request, res: Respon
 
             await db.query(
               `UPDATE audit_runs SET status = 'COMPLETED', finished_at = NOW() WHERE id = $1`,
-              [auditRun.id],
+              [committedAuditRun.id],
             );
           } catch (err) {
             console.error('[audit] Background audit error:', err);
             await db.query(
               `UPDATE audit_runs SET status = 'FAILED', finished_at = NOW() WHERE id = $1`,
-              [auditRun.id],
+              [committedAuditRun.id],
             ).catch(() => {});
           }
         })();
         return;
 
       } catch (dbErr) {
-        console.warn('[audit] DB call failed, falling back to in-memory:', dbErr);
+        if (client) {
+          await client.query('ROLLBACK').catch(() => {});
+          client.release();
+          client = null;
+        }
+        console.error('[audit] DB audit creation failed:', dbErr);
+        if (!res.headersSent) res.status(500).json({ error: 'Failed to create audit run' });
+        return;
       }
+    }
+
+    if (expectedProjectId) {
+      res.status(503).json({ error: 'Database required when expectedProjectId is supplied' });
+      return;
     }
 
     // ── In-memory mode ───────────────────────────────────────────
@@ -495,7 +576,7 @@ auditRunsRouter.get('/audit-runs/:id/results', async (req: Request, res: Respons
     });
 
     res.json({
-      id: run.id, status: run.status,
+      id: run.id, siteId: run.site_id, status: run.status, finished_at: run.finished_at,
       siteChecks: run.site_checks,
       siteRecommendations: siteRecs,
       resultsByType: grouped,

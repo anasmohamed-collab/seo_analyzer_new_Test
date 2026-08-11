@@ -12,6 +12,22 @@
 set -Euo pipefail
 # NOTE: not -e — every check's failure is caught and reported.
 
+# Guarantee core system utilities (sed, realpath, id, mktemp, cat, …)
+# resolve even when invoked with a minimal or reset PATH. The caller's PATH
+# is kept FIRST so operator overrides and the rootless deployment tests'
+# mocked commands still take precedence; standard system directories are
+# only appended as a fallback.
+# Drop Windows system directories (their find.exe/sort.exe/tar.exe shadow
+# the GNU tools) before appending the standard system directories.
+seo_path=; seo_ifs=$IFS; IFS=:
+for seo_d in ${PATH:-}; do
+  case $seo_d in ''|/[A-Za-z]/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]|/[A-Za-z]/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]/*|[A-Za-z]:/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]|[A-Za-z]:/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]/*) continue ;; esac
+  seo_path=${seo_path:+$seo_path:}$seo_d
+done
+IFS=$seo_ifs
+export PATH="${seo_path:+$seo_path:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+unset seo_path seo_ifs seo_d
+
 DESTDIR=
 WITH_DRY_RUN=0
 
@@ -35,7 +51,13 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# Resolve this script's own directory with shell builtins only, so the
+# bootstrap never depends on `dirname` being on PATH.
+SCRIPT_SOURCE=${BASH_SOURCE[0]:-$0}
+case $SCRIPT_SOURCE in
+  */*) SCRIPT_DIR=$(CDPATH= cd -- "${SCRIPT_SOURCE%/*}" && pwd) ;;
+  *)   SCRIPT_DIR=$(CDPATH= cd -- . && pwd) ;;
+esac
 OPT_DIR=$DESTDIR/opt/seo-audit-runner
 NODE_BIN=$OPT_DIR/node/bin/node
 WRAPPER=$DESTDIR/usr/local/bin/seo-audit-runner
@@ -129,16 +151,30 @@ else
 fi
 
 # 7. systemd unit files + syntax + disabled state
+#    The single scheduling authority is seo-runner-tick.timer ->
+#    seo-runner-tick.service. Exactly these two units must be installed.
 units_present=1
-for unit in seo-audit-runner.service seo-audit-runner.timer seo-runner-retry.service \
-            seo-runner-retry.timer seo-runner-tick.service seo-runner-tick.timer; do
+for unit in seo-runner-tick.service seo-runner-tick.timer; do
   [ -f "$SYSTEMD_DIR/$unit" ] || { units_present=0; failv "unit file $unit" "missing from $SYSTEMD_DIR"; }
 done
-[ "$units_present" -eq 1 ] && pass "all six systemd unit files installed"
+[ "$units_present" -eq 1 ] && pass "the single tick timer and service are installed"
+
+# Superseded units are a duplicate-scheduling hazard, not a cosmetic leftover.
+legacy_present=
+for unit in seo-audit-runner.timer seo-audit-runner.service \
+            seo-runner-retry.timer seo-runner-retry.service; do
+  [ -f "$SYSTEMD_DIR/$unit" ] && legacy_present=${legacy_present:+$legacy_present }$unit
+done
+if [ -n "$legacy_present" ]; then
+  failv "superseded unit files" \
+    "$legacy_present still in $SYSTEMD_DIR — disable and remove them; seo-runner-tick.timer is the only scheduling authority"
+else
+  pass "no superseded (multi-timer) unit files present"
+fi
 
 if command -v systemd-analyze >/dev/null 2>&1 && [ -z "$DESTDIR" ]; then
-  if systemd-analyze verify "$SYSTEMD_DIR"/seo-audit-runner.service \
-       "$SYSTEMD_DIR"/seo-runner-retry.service "$SYSTEMD_DIR"/seo-runner-tick.service >/dev/null 2>&1; then
+  if systemd-analyze verify "$SYSTEMD_DIR"/seo-runner-tick.service \
+       "$SYSTEMD_DIR"/seo-runner-tick.timer >/dev/null 2>&1; then
     pass "systemd-analyze verify"
   else
     failv "systemd-analyze verify" "unit verification reported problems"
@@ -148,12 +184,21 @@ else
 fi
 
 if command -v systemctl >/dev/null 2>&1 && [ -z "$DESTDIR" ]; then
-  for timer in seo-audit-runner.timer seo-runner-retry.timer seo-runner-tick.timer; do
+  tick_state=$(systemctl is-enabled seo-runner-tick.timer 2>/dev/null || true)
+  if [ "$tick_state" = "enabled" ]; then
+    printf 'NOTE  seo-runner-tick.timer is ENABLED (fine only if intentional and the production gates passed)\n'
+  fi
+  for timer in seo-audit-runner.timer seo-runner-retry.timer; do
     state=$(systemctl is-enabled "$timer" 2>/dev/null || true)
     if [ "$state" = "enabled" ]; then
-      printf 'NOTE  %s is ENABLED (fine only if intentional and the production gates passed)\n' "$timer"
+      failv "superseded timer $timer" "ENABLED — it duplicates seo-runner-tick.timer; 'systemctl disable --now $timer'"
     fi
   done
+  # Cron and systemd are mutually exclusive for this runner.
+  if [ -f /etc/cron.d/seo-audit-runner ] && grep -qv '^[[:space:]]*\(#\|$\)' /etc/cron.d/seo-audit-runner 2>/dev/null; then
+    failv "scheduling authority" \
+      "/etc/cron.d/seo-audit-runner has active entries — cron and seo-runner-tick.timer must never both be scheduled"
+  fi
   pass "timer enablement state readable via systemctl"
 else
   skip "timer status" "systemctl not available"

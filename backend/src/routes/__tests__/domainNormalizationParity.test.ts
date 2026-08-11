@@ -70,7 +70,7 @@ describe('source wiring', () => {
     // runSiteChecks must keep receiving the host the user actually gave us —
     // stripping `www.` here would change audit behaviour.
     expect(auditSource).toMatch(/runSiteChecks\(domain\)/);
-    expect(auditSource).toMatch(/domain = new URL\(body\.homeUrl\)\.hostname/);
+    expect(auditSource).toMatch(/const domain = home\.hostname/);
   });
 
   it('the projects route derives the domain through the shared validator', () => {

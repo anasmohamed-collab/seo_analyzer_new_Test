@@ -23,6 +23,7 @@
 
 import { XMLParser, XMLValidator } from 'fast-xml-parser';
 import { runFetchEngine } from '../fetch/fetchEngine.js';
+import type { OutboundHostResolver } from '../../../../shared/outbound-url-safety.js';
 
 // ── Namespace URIs ────────────────────────────────────────────────
 
@@ -114,23 +115,18 @@ export interface AnalyzeNewsSitemapOptions {
   now?: number;
   /** Injected fetch (testability). */
   fetchFn?: typeof fetch;
+  /** Injected A/AAAA resolver (testability). */
+  resolver?: OutboundHostResolver;
   /** Internal recursion guard for sitemap-index child discovery. */
   _depth?: number;
 }
 
-// ── SSRF guard (self-contained copy — keeps this module isolated) ──
+// Shape validation only; runFetchEngine enforces shared DNS/IP/redirect safety.
 
-const PRIVATE_RANGES = [
-  /^127\./, /^10\./, /^172\.(1[6-9]|2\d|3[01])\./,
-  /^192\.168\./, /^169\.254\./, /^0\./, /^localhost$/i, /^\[::1\]$/, /^::1$/,
-];
-
-function isSafeUrl(raw: string): boolean {
+function isHttpUrl(raw: string): boolean {
   try {
     const u = new URL(raw);
-    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
-    for (const re of PRIVATE_RANGES) if (re.test(u.hostname)) return false;
-    return true;
+    return u.protocol === 'http:' || u.protocol === 'https:';
   } catch {
     return false;
   }
@@ -732,7 +728,7 @@ export async function analyzeNewsSitemap(
   const url = (rawUrl ?? '').trim();
   const result = emptyResult(url);
 
-  if (!url || !isSafeUrl(url)) {
+  if (!url || !isHttpUrl(url)) {
     result.issues.push({
       severity: 'critical', type: 'invalid_or_unsafe_url',
       message: `The News Sitemap URL is missing, invalid, or blocked for safety: "${url}".`,
@@ -749,6 +745,7 @@ export async function analyzeNewsSitemap(
       timeoutMs: options.timeoutMs ?? 20_000,
       maxBytes: options.maxBytes ?? 15 * 1024 * 1024,
       fetchFn: options.fetchFn,
+      resolver: options.resolver,
     });
   } catch (e) {
     result.issues.push({
@@ -802,7 +799,7 @@ export async function analyzeNewsSitemap(
 
   // ── Sitemap-index child discovery (depth-limited, safe) ─────────
   if (analysis.isSitemapIndex && depth < 1) {
-    const firstChild = analysis.childSitemaps.find(c => isSafeUrl(c));
+    const firstChild = analysis.childSitemaps.find(c => isHttpUrl(c));
     if (firstChild) {
       const child = await analyzeNewsSitemap(firstChild, { ...options, _depth: depth + 1 });
       // Surface that an index was supplied, then return the child's analysis.

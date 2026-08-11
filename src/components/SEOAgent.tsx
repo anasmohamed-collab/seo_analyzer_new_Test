@@ -7,32 +7,9 @@ import {
 } from 'lucide-react';
 import AiAssist from './AiAssist';
 import AiDebug from './AiDebug';
+import type { AuditRunData, AuditResultRow, Recommendation } from '../types/audit';
 
 /* ── Types ─────────────────────────────────────────────────────── */
-
-interface Recommendation {
-  priority: string;
-  area: string;
-  message: string;
-  fixHint: string;
-}
-
-interface AuditResultRow {
-  id: string;
-  url: string;
-  status: string | null;
-  data: Record<string, unknown> | null;
-  recommendations: Recommendation[] | null;
-}
-
-interface AuditRunData {
-  id: string;
-  status: string;
-  siteChecks: Record<string, unknown> | null;
-  siteRecommendations: Recommendation[];
-  resultsByType: Record<string, AuditResultRow[]>;
-  results: AuditResultRow[];
-}
 
 /* ── Filter types ──────────────────────────────────────────────── */
 
@@ -1148,10 +1125,10 @@ function SiteChecksSummary({ siteChecks, siteRecs }: { siteChecks: Record<string
           {sitemap && (String(sitemap.status) === 'FOUND' || String(sitemap.status) === 'DISCOVERED') && (
             <div className="text-xs space-y-1 mb-3">
               <p className="text-slate-600"><span className="font-medium">Sitemap type:</span> {String(sitemap.type)}</p>
-              {sitemap.url && <p className="text-slate-600 truncate"><span className="font-medium">URL:</span> <span className="font-mono">{String(sitemap.url)}</span></p>}
+              {Boolean(sitemap.url) && <p className="text-slate-600 truncate"><span className="font-medium">URL:</span> <span className="font-mono">{String(sitemap.url)}</span></p>}
               {(sitemap.urlCount as number) != null && <p className="text-slate-600"><span className="font-medium">URLs:</span> {String(sitemap.urlCount)}</p>}
               {(sitemap.lastmodPct as number) != null && <p className="text-slate-600"><span className="font-medium">lastmod coverage:</span> {String(sitemap.lastmodPct)}%</p>}
-              {(sitemap as Record<string, unknown>).standards && (() => {
+              {Boolean((sitemap as Record<string, unknown>).standards) && (() => {
                 const s = (sitemap as Record<string, unknown>).standards as Record<string, unknown>;
                 return (
                   <p className={`${s.hasNamespace ? 'text-green-600' : 'text-amber-600'}`}>
@@ -1878,8 +1855,8 @@ const POLL_MAX_ERRORS = 5;
 /* ── Project-layer props (all optional — zero impact when not provided) ── */
 
 interface SEOAgentFormValues {
-  homeUrl?: string;
-  articleUrl?: string;
+  homeUrl: string;
+  articleUrl: string;
   sectionUrl?: string;
   tagUrl?: string;
   searchUrl?: string;

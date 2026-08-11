@@ -30,6 +30,10 @@ const MAX_CHILD_SIZE = 5 * 1024 * 1024; // 5 MB
 // Re-use shared UA/header profiles from the fetch engine — single source of truth.
 import { UA_BROWSER, UA_GOOGLEBOT, BROWSER_HEADERS, GOOGLEBOT_HEADERS, isBotProtectionPage } from '../fetch/fetchEngine.js';
 import { gunzipSync } from 'node:zlib';
+import {
+  assertSafeOutboundUrl,
+  fetchWithSafeRedirects,
+} from '../../../../shared/outbound-url-safety.js';
 
 // Scrapling sidecar URL — same env var as fetchEngine; undefined → no fallback.
 const SCRAPLING_SIDECAR_URL = (
@@ -76,32 +80,7 @@ const NEWS_SITEMAP_PATHS = [
   '/rss-news-sitemap.xml',
 ];
 
-// ── SSRF guard ──────────────────────────────────────────────────
-
-const PRIVATE_RANGES = [
-  /^127\./,
-  /^10\./,
-  /^172\.(1[6-9]|2\d|3[01])\./,
-  /^192\.168\./,
-  /^169\.254\./,
-  /^0\./,
-  /^localhost$/i,
-  /^\[::1\]$/,
-];
-
-function isSafeUrl(raw: string): boolean {
-  try {
-    const u = new URL(raw);
-    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
-    const host = u.hostname;
-    for (const re of PRIVATE_RANGES) {
-      if (re.test(host)) return false;
-    }
-    return true;
-  } catch {
-    return false;
-  }
-}
+// Outbound URL safety is enforced by the redirect-aware fetch helper below.
 
 // ── Fetch helpers ───────────────────────────────────────────────
 
@@ -120,7 +99,6 @@ async function safeFetch(
   opts: { maxBytes?: number; userAgent?: string; extraHeaders?: Record<string, string> } = {},
 ): Promise<FetchResult> {
   const empty: FetchResult = { ok: false, status: 0, text: '', contentType: '', finalUrl: url, redirected: false };
-  if (!isSafeUrl(url)) return empty;
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -130,18 +108,19 @@ async function safeFetch(
   const extraHeaders = opts.extraHeaders ?? (ua === UA_GOOGLEBOT ? GOOGLEBOT_HEADERS : BROWSER_HEADERS);
 
   try {
-    const res = await fetch(url, {
-      redirect: 'follow',
-      signal: controller.signal,
-      headers: {
-        'User-Agent': ua,
-        ...extraHeaders,
+    const { response: res, finalUrl, redirectChain } = await fetchWithSafeRedirects(
+      url,
+      {
+        signal: controller.signal,
+        headers: {
+          'User-Agent': ua,
+          ...extraHeaders,
+        },
       },
-    });
+    );
 
     const contentType = res.headers.get('content-type') ?? '';
-    const finalUrl = res.url || url;
-    const redirected = res.redirected || finalUrl !== url;
+    const redirected = redirectChain.length > 0;
     const maxBytes = opts.maxBytes ?? 2 * 1024 * 1024;
 
     // ── Read body with gzip support ──────────────────────────────
@@ -189,10 +168,12 @@ async function tryScraplingForContent(
   timeoutMs = SITEMAP_TIMEOUT,
 ): Promise<FetchResult | null> {
   const empty: FetchResult = { ok: false, status: 0, text: '', contentType: '', finalUrl: url, redirected: false };
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
+    await assertSafeOutboundUrl(url);
     console.log(`[scrapling-sitemap] stealth attempt for ${url}`);
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs + 5_000);
+    timer = setTimeout(() => ctrl.abort(), timeoutMs + 5_000);
 
     const res = await fetch(`${sidecarBase}/fetch`, {
       method: 'POST',
@@ -200,14 +181,12 @@ async function tryScraplingForContent(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url, timeout: Math.floor(timeoutMs / 1000), mode: 'stealth' }),
     });
-    clearTimeout(timer);
-
     if (!res.ok) {
       console.log(`[scrapling-sitemap] sidecar HTTP ${res.status} for ${url}`);
       return null;
     }
 
-    const data = await res.json() as {
+    const data = JSON.parse(await res.text()) as {
       html?: string; status?: number;
       headers?: Record<string, string>; url?: string;
       challenge_detected?: boolean; bypassed?: boolean;
@@ -223,6 +202,7 @@ async function tryScraplingForContent(
     const status = data.status ?? 200;
     const contentType = data.headers?.['content-type'] ?? '';
     const finalUrl = data.url ?? url;
+    await assertSafeOutboundUrl(finalUrl);
 
     console.log(`[scrapling-sitemap] stealth OK — HTTP ${status}, body length ${body.length} for ${url}`);
     return {
@@ -236,6 +216,8 @@ async function tryScraplingForContent(
   } catch (err: unknown) {
     console.log(`[scrapling-sitemap] sidecar call failed: ${err instanceof Error ? err.message : err}`);
     return null;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -802,11 +784,6 @@ async function processSitemapCandidate(
     const checks: ChildCheck[] = [];
 
     for (const childUrl of toCheck) {
-      if (!isSafeUrl(childUrl)) {
-        checks.push({ url: childUrl, httpStatus: 0, validRoot: null, urlCount: 0, lastmodPct: 0, error: 'Blocked by SSRF guard' });
-        continue;
-      }
-
       try {
         const childRes = await safeFetch(childUrl, SITEMAP_TIMEOUT, { maxBytes: MAX_CHILD_SIZE });
 
@@ -1094,8 +1071,6 @@ async function checkNewsSitemapPresence(origin: string): Promise<NewsSitemapResu
   let lastBotProtectionUrl: string | null = null;
 
   for (const url of candidates) {
-    if (!isSafeUrl(url)) continue;
-
     let res: Awaited<ReturnType<typeof safeFetch>>;
     try {
       res = await safeFetch(url, SITEMAP_TIMEOUT, { maxBytes: MAX_CHILD_SIZE });

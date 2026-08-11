@@ -16,8 +16,15 @@
 
 import { fingerprintIssue, sha256Hex } from './fingerprint.js';
 import { normalizeDomainKey } from './normalizeDomain.js';
-import { buildProjectMessages, buildRunSummaryMessage } from './slackFormat.js';
+import {
+  addTechnicalResult,
+  buildProjectMessages,
+  buildRunSummaryMessage,
+  createTechnicalAggregate,
+  criticalMentionToken,
+} from './slackFormat.js';
 import { SlackPermanentError } from './slackClient.js';
+import { evaluateAuditEvidence } from './evidenceGate.js';
 
 export const ALERT_MODES = ['new_or_regressed', 'all_current', 'summary_only', 'disabled'];
 
@@ -36,57 +43,11 @@ export function shouldNotify(mode, counts) {
   return counts.current > 0 || changes > 0;
 }
 
-function isInterpretableRecommendations(value) {
-  if (value == null) return true; // stored as NULL when a row has no recommendations
-  if (Array.isArray(value)) return true;
-  if (typeof value === 'string') {
-    try {
-      return Array.isArray(JSON.parse(value));
-    } catch {
-      return false; // truncated / partially parsed JSON — ambiguous
-    }
-  }
-  return false;
-}
-
 /**
- * Explicit completed-payload validation for GET /api/audit-runs/:id/results.
- *
- * A payload is complete when:
- *  - it is a structurally valid response object (not an error payload)
- *  - status is exactly 'COMPLETED'
- *  - the `results` collection is present as an array — an EMPTY array is
- *    valid: a clean completed audit with zero P0 issues must be able to
- *    resolve previously active issues ("at least one result exists" is NOT
- *    used as proof of completeness)
- *  - every page row and `siteRecommendations` can be safely interpreted
- *  - the payload's run ID matches the expected audit run, where available
- *
- * FAILED / RUNNING / missing-status / malformed / error / ambiguous payloads
- * are all incomplete — they never resolve issues and never replace a valid
- * previous snapshot.
+ * Boolean compatibility wrapper around the evidence evaluator.
  */
-export function isCompleteAuditPayload(payload, { expectedAuditRunId = null } = {}) {
-  if (payload == null || typeof payload !== 'object' || Array.isArray(payload)) return false;
-  if (payload.error != null) return false; // API error payload
-  if (payload.status !== 'COMPLETED') return false; // FAILED / RUNNING / PENDING / missing
-  if (!Array.isArray(payload.results)) return false; // collection must exist (may be empty)
-
-  for (const row of payload.results) {
-    if (row == null || typeof row !== 'object' || Array.isArray(row)) return false;
-    if (!isInterpretableRecommendations(row.recommendations)) return false;
-  }
-  if (!isInterpretableRecommendations(payload.siteRecommendations)) return false;
-
-  // The API includes the run id in the response; verify it where available.
-  if (
-    expectedAuditRunId != null &&
-    payload.id != null &&
-    String(payload.id) !== String(expectedAuditRunId)
-  ) {
-    return false;
-  }
-  return true;
+export function isCompleteAuditPayload(payload, options = {}) {
+  return evaluateAuditEvidence(payload, options).complete;
 }
 
 function retryDelayMs(attemptCount) {
@@ -106,6 +67,10 @@ export function createNotificationPipeline({
   const slackActive = Boolean(slackSender) && !notificationsDisabled && alertMode !== 'disabled';
   const counters = { delivered: 0, failed: 0, permanentFailures: 0, notRequired: 0, alreadyDelivered: 0 };
   const lifecycleTotals = { new: 0, reopened: 0, unchanged: 0, resolved: 0, currentP0: 0, projectsWithCritical: 0 };
+  // Robots / XML sitemap / News sitemap counts, aggregated from SUCCESSFULLY
+  // COMPLETED audits only — a failed, timed-out, skipped, or structurally
+  // incomplete audit is never folded in (and so never counted as "Missing").
+  const technicalTotals = createTechnicalAggregate();
 
   /**
    * Persist the notification identity, then send all messages, then mark the
@@ -166,30 +131,48 @@ export function createNotificationPipeline({
     alertMode,
     counters,
     lifecycleTotals,
+    technicalTotals,
 
     /**
      * Called by the orchestrator after each COMPLETED audit.
      * Updates issue lifecycle state atomically, then dispatches the project
      * notification when the alert mode requires it.
      */
-    async handleProjectCompleted({ project, auditRunId, results, criticalIssues }) {
-      // Beta/Staging projects still complete their audits, but they are outside
-      // the scheduled alerting lifecycle. Skipping before snapshot/notification
-      // persistence also prevents a later retry from sending a suppressed alert.
+    async handleProjectCompleted({
+      project,
+      siteId,
+      auditRunId,
+      results,
+      criticalIssues,
+      submittedUrls,
+    }) {
+      const evidence = evaluateAuditEvidence(results, {
+        expectedAuditRunId: auditRunId,
+        expectedProjectId: project.id,
+        submittedUrls,
+      });
+      if (!evidence.complete || String(siteId) !== String(project.id)) {
+        if (String(siteId) !== String(project.id)) {
+          evidence.reasons.push('trigger site identity does not match the selected project');
+        }
+        logger?.warn?.(
+          `Project ${project.id}: incomplete evidence — snapshot and issue state NOT updated: ` +
+            evidence.reasons.join('; '),
+        );
+        return {
+          evidenceComplete: false,
+          evidenceReasons: [...new Set(evidence.reasons)],
+          notificationStatus: 'skipped-incomplete-evidence',
+        };
+      }
+
+      // Beta/Staging projects still complete their audits and evidence checks,
+      // but they are outside the scheduled alerting lifecycle. Skipping before
+      // snapshot/notification persistence also prevents later retry delivery.
       if (project?.is_beta === true) {
         counters.notRequired++;
         logger?.info?.(`Project ${project.id}: Beta/Staging project — scheduled Slack alert skipped`);
-        return { notificationStatus: 'skipped-beta' };
-      }
-
-      // Guard: only a structurally complete COMPLETED payload may update
-      // lifecycle state. A clean audit with ZERO current P0 issues (and even
-      // zero page rows) is complete and MUST resolve previously active issues.
-      if (!isCompleteAuditPayload(results, { expectedAuditRunId: auditRunId })) {
-        logger?.warn?.(
-          `Project ${project.id}: result payload is incomplete or invalid — snapshot and issue state NOT updated`,
-        );
-        return { notificationStatus: 'skipped-partial-results' };
+        return { evidenceComplete: true, notificationStatus: 'skipped-beta' };
       }
 
       const issues = criticalIssues.map((issue) => ({
@@ -220,17 +203,29 @@ export function createNotificationPipeline({
       lifecycleTotals.currentP0 += counts.current;
       if (counts.current > 0) lifecycleTotals.projectsWithCritical++;
 
+      // Technical checks come from THIS completed audit result only — the
+      // notification layer never re-fetches robots.txt or a sitemap.
+      addTechnicalResult(technicalTotals, results.siteChecks ?? null);
+
       let notificationStatus = 'not-required';
       if (slackActive && shouldNotify(alertMode, counts)) {
+        // A channel-wide mention is for genuinely NEW or REOPENED P0 issues.
+        // Unchanged-only and resolved-only alerts never page the channel.
+        const mention =
+          counts.new + counts.reopened > 0
+            ? criticalMentionToken(config.slackCriticalMention ?? 'channel')
+            : null;
         const messages = buildProjectMessages({
           projectName: project.project_name ?? project.name ?? null,
-          domain: project.domain ?? null,
+          domain: project.domain ?? project.website_url ?? null,
           projectId: project.id,
           auditRunId,
           auditCompletedAt: results.finished_at ?? null,
           dashboardUrl: config.dashboardUrl ?? null,
           lifecycle,
           mode: alertMode,
+          siteChecks: results.siteChecks ?? null,
+          mention,
           maxIssuesPerMessage: config.slackMaxIssuesPerMessage,
           maxMessageCharacters: config.slackMaxMessageCharacters,
         });
@@ -248,7 +243,7 @@ export function createNotificationPipeline({
         }
       }
 
-      return { lifecycleCounts: counts, notificationStatus };
+      return { evidenceComplete: true, lifecycleCounts: counts, notificationStatus };
     },
 
     /** Optional end-of-execution summary (SEO_RUNNER_SEND_RUN_SUMMARY). */
@@ -259,7 +254,9 @@ export function createNotificationPipeline({
         startedAt,
         finishedAt,
         durationMs: Date.parse(finishedAt) - Date.parse(startedAt),
-        totals,
+        // Run summaries never carry a broad mention. The technical aggregate
+        // is the pipeline's own count of successfully completed audits.
+        totals: { ...totals, technical: totals?.technical ?? technicalTotals },
       });
       return persistAndSend({
         type: 'run_summary',

@@ -14,6 +14,7 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { History, ChevronDown, ChevronUp, CheckCircle, XCircle, Loader2, Clock } from 'lucide-react';
+import type { AuditRunData } from '../types/audit';
 
 interface AuditHistorySummary {
   audit_id: string;
@@ -28,15 +29,6 @@ interface AuditHistorySummary {
     failed: number;
     critical: number;
   };
-}
-
-interface AuditRunData {
-  id: string;
-  status: string;
-  siteChecks: Record<string, unknown> | null;
-  siteRecommendations: unknown[];
-  resultsByType: Record<string, unknown[]>;
-  results: unknown[];
 }
 
 interface AuditHistoryPanelProps {

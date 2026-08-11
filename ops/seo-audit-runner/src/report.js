@@ -11,8 +11,10 @@
 
 export const OUTCOME = Object.freeze({
   COMPLETED: 'COMPLETED',
+  INCOMPLETE_EVIDENCE: 'INCOMPLETE_EVIDENCE',
   FAILED: 'FAILED',
   TIMED_OUT: 'TIMED_OUT',
+  INELIGIBLE: 'INELIGIBLE',
   SKIPPED_MISSING_AUDIT_CONFIG: 'SKIPPED_MISSING_AUDIT_CONFIG',
   SKIPPED_ALREADY_RUNNING: 'SKIPPED_ALREADY_RUNNING',
   DEDUPLICATED: 'DEDUPLICATED',
@@ -31,13 +33,18 @@ export const EXIT_CODES = Object.freeze({
   ALREADY_LOCKED: 4,
 });
 
-const FAILURE_OUTCOMES = new Set([
+export const FAILED_OUTCOMES = new Set([
   OUTCOME.FAILED,
-  OUTCOME.TIMED_OUT,
+  OUTCOME.INCOMPLETE_EVIDENCE,
   OUTCOME.TRIGGER_FAILED,
-  OUTCOME.TRIGGER_OUTCOME_UNKNOWN,
   OUTCOME.RUNNER_ERROR,
   OUTCOME.ABORTED,
+]);
+
+export const FAILURE_OUTCOMES = new Set([
+  ...FAILED_OUTCOMES,
+  OUTCOME.TIMED_OUT,
+  OUTCOME.TRIGGER_OUTCOME_UNKNOWN,
 ]);
 
 export function summarize(report) {
@@ -47,12 +54,20 @@ export function summarize(report) {
   }
   return {
     total: (report?.entries ?? []).length,
+    discovered: report?.discoveredProjects ?? 0,
+    eligible: report?.eligibleProjects ?? 0,
+    attempted: report?.attemptedProjects ?? 0,
     completed: counts[OUTCOME.COMPLETED] ?? 0,
     dryRunReady: counts[OUTCOME.DRY_RUN_READY] ?? 0,
     deduplicated: counts[OUTCOME.DEDUPLICATED] ?? 0,
+    deferred: counts[OUTCOME.SKIPPED_ALREADY_RUNNING] ?? 0,
     skipped:
+      (counts[OUTCOME.INELIGIBLE] ?? 0) +
       (counts[OUTCOME.SKIPPED_MISSING_AUDIT_CONFIG] ?? 0) +
-      (counts[OUTCOME.SKIPPED_ALREADY_RUNNING] ?? 0),
+      (counts[OUTCOME.DEDUPLICATED] ?? 0),
+    failed: [...FAILED_OUTCOMES].reduce((sum, outcome) => sum + (counts[outcome] ?? 0), 0),
+    timedOut: counts[OUTCOME.TIMED_OUT] ?? 0,
+    triggerUnknown: counts[OUTCOME.TRIGGER_OUTCOME_UNKNOWN] ?? 0,
     failures: [...FAILURE_OUTCOMES].reduce((sum, o) => sum + (counts[o] ?? 0), 0),
     criticalIssues: (report?.criticalIssues ?? []).length,
     notificationFailures: report?.notificationFailures ?? 0,
@@ -71,6 +86,14 @@ export function computeExitCode(report, { failOnCritical = false } = {}) {
   return EXIT_CODES.OK;
 }
 
+export function executionFinalStatus(report) {
+  if (report?.aborted) return 'ABORTED';
+  const summary = summarize(report);
+  if (summary.failures > 0) return 'FAILED';
+  if (summary.completed === 0 && summary.deferred > 0) return 'DEFERRED';
+  return 'COMPLETED';
+}
+
 export function formatTextReport(report) {
   const s = summarize(report);
   const lines = [];
@@ -80,8 +103,12 @@ export function formatTextReport(report) {
   lines.push(` Finished: ${report.finishedAt ?? '(incomplete)'}${report.aborted ? '  [ABORTED]' : ''}`);
   lines.push('════════════════════════════════════════════════════════');
   lines.push(
-    ` Projects: ${s.total} | completed: ${s.completed} | dry-run ready: ${s.dryRunReady}` +
-      ` | skipped: ${s.skipped} | deduplicated: ${s.deduplicated} | failures: ${s.failures}`,
+    ` Projects: discovered: ${s.discovered} | eligible: ${s.eligible} | attempted: ${s.attempted}`,
+  );
+  lines.push(
+    ` Outcomes: completed: ${s.completed} | deferred: ${s.deferred} | skipped: ${s.skipped}` +
+      ` | failed: ${s.failed} | timed out: ${s.timedOut} | trigger unknown: ${s.triggerUnknown}` +
+      `${s.dryRunReady > 0 ? ` | dry-run ready: ${s.dryRunReady}` : ''}`,
   );
   lines.push(` Critical (P0) issues: ${s.criticalIssues}`);
   if (s.notificationFailures > 0) {

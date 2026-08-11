@@ -32,6 +32,19 @@ let nextId = 1;
 function fakeQuery(sql: string, params: unknown[] = []) {
   executedSql.push(sql);
 
+  if (/SELECT id, domain FROM sites WHERE id/i.test(sql)) {
+    const row = sites.find((s) => s.id === String(params[0]));
+    return Promise.resolve({ rows: row ? [{ id: row.id, domain: row.domain }] : [] });
+  }
+
+  if (/UPDATE sites[\s\S]*SET last_form_values/i.test(sql)) {
+    const [formValues, id] = params as [string, string];
+    const row = sites.find((s) => s.id === id);
+    if (!row) return Promise.resolve({ rows: [] });
+    row.last_form_values = JSON.parse(formValues);
+    return Promise.resolve({ rows: [{ ...row }] });
+  }
+
   if (/INSERT INTO sites/i.test(sql)) {
     const [domain, projectName, websiteUrl, formValues, isBeta] = params as [
       string,
@@ -126,6 +139,14 @@ function postProject(body: unknown) {
 
 function patchProject(id: string, body: unknown) {
   return fetch(`${base}/api/projects/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+function patchFormValues(id: string, body: unknown) {
+  return fetch(`${base}/api/projects/${id}/form-values`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -318,6 +339,57 @@ describe('project list ordering', () => {
     const body = await json<ListResponse>(await fetch(`${base}/api/projects`));
 
     expect(body.projects.map((p) => p.domain)).toContain('brand-new.test');
+  });
+});
+
+describe('PATCH /api/projects/:id/form-values', () => {
+  it('requires a complete homeUrl + articleUrl pair', async () => {
+    const created = await createProject({ website_url: 'https://example.com' });
+    const res = await patchFormValues(created.project.id, { homeUrl: 'https://example.com/' });
+
+    expect(res.status).toBe(400);
+    expect((await json<ErrorResponse>(res)).error).toContain('articleUrl');
+    expect(sites[0].last_form_values).toBeNull();
+  });
+
+  it('rejects cross-domain configuration', async () => {
+    const created = await createProject({ website_url: 'https://example.com' });
+    const res = await patchFormValues(created.project.id, {
+      homeUrl: 'https://example.com/',
+      articleUrl: 'https://other.test/story',
+    });
+
+    expect(res.status).toBe(400);
+    expect((await json<ErrorResponse>(res)).error).toContain('must belong to example.com');
+  });
+
+  it('replaces configuration and returns automation readiness', async () => {
+    const created = await createProject({
+      website_url: 'https://example.com',
+      homeUrl: 'https://example.com/',
+      articleUrl: 'https://example.com/old',
+      sectionUrl: 'https://example.com/section',
+    });
+    const res = await patchFormValues(created.project.id, {
+      homeUrl: 'https://www.example.com/',
+      articleUrl: 'https://example.com/new',
+    });
+
+    expect(res.status).toBe(200);
+    const body = await json<CreateResponse>(res);
+    expect(body.automation_ready).toBe(true);
+    expect(body.project.last_form_values).toEqual({
+      homeUrl: 'https://www.example.com/',
+      articleUrl: 'https://example.com/new',
+    });
+  });
+
+  it('returns 404 for a missing project', async () => {
+    const res = await patchFormValues('missing', {
+      homeUrl: 'https://example.com/',
+      articleUrl: 'https://example.com/story',
+    });
+    expect(res.status).toBe(404);
   });
 });
 

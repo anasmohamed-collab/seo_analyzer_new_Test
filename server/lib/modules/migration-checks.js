@@ -13,6 +13,8 @@
  *    Query-param URLs should canonicalize back to a clean URL.
  */
 
+import { safeFetch as fetch } from '../../../shared/outbound-url-safety.js';
+
 const FETCH_TIMEOUT = 12000;
 const UA = 'Mozilla/5.0 (compatible; SEO-Analyzer/1.0)';
 

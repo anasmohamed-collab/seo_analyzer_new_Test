@@ -19,7 +19,11 @@
 import { Router, Request, Response } from 'express';
 import { getDb } from '../lib/db.js';
 import { compareAudits, AuditSnapshot, AuditPage } from '../lib/compareAudits.js';
-import { parseCreateProjectBody, isAutomationReady } from '../lib/projectInput.js';
+import {
+  parseCreateProjectBody,
+  parseProjectFormValues,
+  isAutomationReady,
+} from '../lib/projectInput.js';
 
 export const projectsRouter = Router();
 
@@ -34,6 +38,10 @@ function requireDb(res: Response): ReturnType<typeof getDb> | null {
     return null;
   }
   return db;
+}
+
+function withAutomationReady<T extends { last_form_values?: unknown }>(project: T) {
+  return { ...project, automation_ready: isAutomationReady(project.last_form_values) };
 }
 
 // ── GET /api/projects ─────────────────────────────────────────────
@@ -64,7 +72,7 @@ projectsRouter.get('/projects', async (_req: Request, res: Response) => {
                ) DESC,
                s.created_at DESC
     `);
-    res.json({ projects: rows });
+    res.json({ projects: rows.map(withAutomationReady) });
   } catch (err) {
     console.error('GET /api/projects error:', err);
     res.status(500).json({ error: 'Failed to fetch projects' });
@@ -109,7 +117,7 @@ projectsRouter.post('/projects', async (req: Request, res: Response) => {
 
     const { created, ...project } = rows[0];
     res.status(created ? 201 : 200).json({
-      project,
+      project: withAutomationReady(project),
       created,
       automation_ready: isAutomationReady(project.last_form_values),
     });
@@ -142,7 +150,7 @@ projectsRouter.get('/projects/:id', async (req: Request, res: Response) => {
       res.status(404).json({ error: 'Project not found' });
       return;
     }
-    res.json({ project: rows[0] });
+    res.json({ project: withAutomationReady(rows[0]) });
   } catch (err) {
     console.error('GET /api/projects/:id error:', err);
     res.status(500).json({ error: 'Failed to fetch project' });
@@ -401,35 +409,39 @@ projectsRouter.patch('/projects/:id/form-values', async (req: Request, res: Resp
   const db = requireDb(res);
   if (!db) return;
 
-  const allowed = ['homeUrl', 'articleUrl', 'sectionUrl', 'tagUrl', 'searchUrl', 'authorUrl', 'videoArticleUrl', 'xmlSitemapUrl', 'newsSitemapUrl', 'robotsTxtUrl'];
-  const body = req.body ?? {};
-
-  // Accept only known keys; discard everything else
-  const formValues: Record<string, string> = {};
-  for (const key of allowed) {
-    if (typeof body[key] === 'string' && body[key].trim()) {
-      formValues[key] = body[key].trim();
-    }
-  }
-
-  if (!formValues.homeUrl) {
-    res.status(400).json({ error: 'homeUrl is required' });
-    return;
-  }
-
   try {
+    const existing = await db.query<{ id: string; domain: string }>(
+      'SELECT id, domain FROM sites WHERE id = $1',
+      [req.params.id],
+    );
+    if (!existing.rows.length) {
+      res.status(404).json({ error: 'Project not found' });
+      return;
+    }
+
+    const parsed = parseProjectFormValues(req.body, existing.rows[0].domain, {
+      requireConfiguration: true,
+    });
+    if (!parsed.ok || parsed.formValues === null) {
+      res.status(400).json({ error: parsed.ok ? 'homeUrl and articleUrl are required' : parsed.error });
+      return;
+    }
+
+    // Replacement is intentional: callers must submit the complete desired
+    // configuration, including any optional values they want to preserve.
     const { rows } = await db.query(
       `UPDATE sites
        SET last_form_values = $1, updated_at = NOW()
        WHERE id = $2
        RETURNING id, project_name, domain, last_form_values`,
-      [JSON.stringify(formValues), req.params.id],
+      [JSON.stringify(parsed.formValues), req.params.id],
     );
     if (!rows.length) {
       res.status(404).json({ error: 'Project not found' });
       return;
     }
-    res.json({ project: rows[0] });
+    const project = withAutomationReady(rows[0]);
+    res.json({ project, automation_ready: project.automation_ready });
   } catch (err) {
     console.error('PATCH /api/projects/:id/form-values error:', err);
     res.status(500).json({ error: 'Failed to save form values' });

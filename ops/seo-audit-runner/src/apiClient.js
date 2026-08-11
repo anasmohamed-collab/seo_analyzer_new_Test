@@ -168,7 +168,7 @@ export class ApiClient {
 
   /**
    * POST /api/technical-analyzer/run — SINGLE attempt, never retried here.
-   * @returns {Promise<{siteId: string|null, auditRunId: string}>}
+   * @returns {Promise<{siteId: string, auditRunId: string}>}
    * @throws {AmbiguousTriggerError} no definitive response — audit may have started
    * @throws {TriggerFailedError} server returned an HTTP error response
    */
@@ -200,8 +200,14 @@ export class ApiClient {
       );
     }
 
-    if (json && typeof json.auditRunId === 'string' && json.auditRunId) {
-      return { siteId: json.siteId ?? null, auditRunId: json.auditRunId };
+    if (
+      json &&
+      typeof json.siteId === 'string' &&
+      json.siteId &&
+      typeof json.auditRunId === 'string' &&
+      json.auditRunId
+    ) {
+      return { siteId: json.siteId, auditRunId: json.auditRunId };
     }
 
     if (json?.mode === 'in-memory') {
@@ -214,7 +220,7 @@ export class ApiClient {
     }
 
     throw new AmbiguousTriggerError(
-      'audit trigger response did not include an auditRunId — cannot safely identify the run',
+      'audit trigger response did not include both siteId and auditRunId — cannot safely identify the run',
     );
   }
 }

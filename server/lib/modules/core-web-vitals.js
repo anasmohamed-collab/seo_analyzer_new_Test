@@ -10,6 +10,7 @@
  *   - Optional Lighthouse/PageSpeed API integration
  */
 import process from 'node:process';
+import { safeFetch as fetch } from '../../../shared/outbound-url-safety.js';
 
 const PAGESPEED_API_KEY = process.env.PAGESPEED_API_KEY || '';
 const PAGESPEED_TIMEOUT = 30000;

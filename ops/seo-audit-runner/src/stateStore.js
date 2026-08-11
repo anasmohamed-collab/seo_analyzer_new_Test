@@ -29,6 +29,32 @@ export class StateStore {
       .run(id, startedAt);
   }
 
+  /**
+   * Mark unfinished execution rows abandoned. Call only while holding the
+   * runner process lock: at that point no earlier execution can still own
+   * this state database.
+   */
+  recoverAbandonedRuns({ completedAt = new Date().toISOString() } = {}) {
+    const rows = this.db
+      .prepare('SELECT id FROM automation_runs WHERE completed_at IS NULL ORDER BY started_at')
+      .all();
+    if (rows.length === 0) return [];
+    const details = JSON.stringify({ recovered: true, reason: 'runner exited before recording a final result' });
+    const update = this.db.prepare(`
+      UPDATE automation_runs SET completed_at = ?, final_status = 'FAILED',
+        notification_status = ? WHERE id = ? AND completed_at IS NULL
+    `);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const row of rows) update.run(completedAt, details, row.id);
+      this.db.exec('COMMIT');
+    } catch (err) {
+      try { this.db.exec('ROLLBACK'); } catch { /* nothing to roll back */ }
+      throw err;
+    }
+    return rows.map((row) => row.id);
+  }
+
   finishRun(id, {
     completedAt,
     finalStatus,
@@ -256,6 +282,37 @@ export class StateStore {
         SELECT * FROM notifications
         WHERE ${filters.join(' AND ')}
         ORDER BY created_at ASC
+        LIMIT ?
+      `)
+      .all(...params);
+  }
+
+  /**
+   * Notifications in any state, newest first — the read model behind
+   * `seo-audit-runner notifications list|show`.
+   *
+   * Unlike listRetryableNotifications this deliberately includes DELIVERED
+   * and PERMANENT_FAILURE rows: the operator question it answers is "what
+   * did the runner actually send (or try to send) to Slack?", which is
+   * exactly the history the retry query filters out.
+   */
+  listNotifications({ limit = 50, status = null, projectId = null } = {}) {
+    const filters = [];
+    const params = [];
+    if (status != null) {
+      filters.push('status = ?');
+      params.push(status);
+    }
+    if (projectId != null) {
+      filters.push('project_id = ?');
+      params.push(String(projectId));
+    }
+    params.push(limit);
+    return this.db
+      .prepare(`
+        SELECT * FROM notifications
+        ${filters.length ? `WHERE ${filters.join(' AND ')}` : ''}
+        ORDER BY created_at DESC
         LIMIT ?
       `)
       .all(...params);

@@ -14,6 +14,11 @@
  */
 
 import { gunzipSync } from 'node:zlib';
+import {
+  OutboundUrlSafetyError,
+  assertSafeOutboundUrl,
+} from '../../../../shared/outbound-url-safety.js';
+import type { OutboundHostResolver } from '../../../../shared/outbound-url-safety.js';
 
 // ── UA / Header profiles ─────────────────────────────────────────
 
@@ -132,6 +137,8 @@ export interface FetchEngineOptions {
   scraplingUrl?: string;
   /** Inject a custom fetch for unit tests */
   fetchFn?: typeof fetch;
+  /** Inject A/AAAA resolution for deterministic security tests. */
+  resolver?: OutboundHostResolver;
 }
 
 // ── Bot-protection / challenge-page detection ────────────────────
@@ -190,7 +197,7 @@ export function isBotProtectionPage(html: string): boolean {
   const titleMatch = /<title[^>]*>([\s\S]{0,200}?)<\/title>/i.exec(html);
   if (titleMatch) {
     const title = titleMatch[1].trim();
-    if (/^(verify you are human|human verification|bot check|ddos protection(?: by \w+)?|please verify you are( a)? human|you have been blocked|browser integrity check|security check required|checking your browser\.\.\.|please wait\.\.\.|one more step)$/i.test(title)) return true;
+    if (/^(verify you are human|human verification|bot check|ddos protection(?: by [\w][\w .&-]{0,60})?|please verify you are( a)? human|you have been blocked|browser integrity check|security check required|checking your browser\.\.\.|please wait\.\.\.|one more step)$/i.test(title)) return true;
   }
 
   return false;
@@ -207,6 +214,7 @@ export function isCloudflareChallengePage(html: string): boolean {
 // ── Network-error classifier ─────────────────────────────────────
 
 function classifyNetworkError(err: unknown): FailureKind {
+  if (err instanceof OutboundUrlSafetyError) return 'dns_error';
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
   if (msg.includes('abort') || msg.includes('timeout'))                    return 'timeout';
   if (msg.includes('cert') || msg.includes('ssl') ||
@@ -269,6 +277,7 @@ async function fetchTrackingRedirects(
   maxBytes: number,
   signal: AbortSignal,
   fetchFn: typeof fetch,
+  resolver?: OutboundHostResolver,
 ): Promise<RedirectFetchResult> {
   let currentUrl = startUrl;
   const redirectChain: string[] = [];
@@ -282,6 +291,7 @@ async function fetchTrackingRedirects(
       };
     }
 
+    await assertSafeOutboundUrl(currentUrl, { resolver });
     const res = await fetchFn(currentUrl, {
       redirect: 'manual',
       signal,
@@ -378,6 +388,7 @@ async function tryScrapling(
   fetchFn: typeof fetch,
   maxBytes: number,
   lastFailureKind?: FailureKind,
+  resolver?: OutboundHostResolver,
 ): Promise<{ attempt: ProfileAttempt; html: string }> {
   const startMs = Date.now();
 
@@ -394,6 +405,9 @@ async function tryScrapling(
   };
 
   try {
+    // Never hand an unsafe destination to the sidecar. The sidecar repeats this
+    // validation and host/container egress remains the final anti-rebinding layer.
+    await assertSafeOutboundUrl(url, { resolver });
     const sidecarRes = await fetchFn(`${sidecarBase}/fetch`, {
       method: 'POST', signal,
       headers: { 'Content-Type': 'application/json' },
@@ -408,7 +422,7 @@ async function tryScrapling(
       return { attempt, html: '' };
     }
 
-    const data = await sidecarRes.json() as {
+    const data = JSON.parse(await sidecarRes.text()) as {
       html?: string;
       status?: number;
       headers?: Record<string, string>;
@@ -433,8 +447,11 @@ async function tryScrapling(
     const html     = rawHtml.length > maxBytes ? rawHtml.slice(0, maxBytes) : rawHtml;
     const status   = data.status ?? 0;
 
+    const returnedUrl = data.url ?? data.final_url ?? url;
+    await assertSafeOutboundUrl(returnedUrl, { resolver });
+
     attempt.status       = status;
-    attempt.final_url    = data.url ?? data.final_url ?? url;
+    attempt.final_url    = returnedUrl;
     attempt.content_type = data.headers?.['content-type'] ?? '';
     attempt.x_robots_tag = data.headers?.['x-robots-tag'] ?? '';
     attempt.html_length  = html.length;
@@ -500,6 +517,7 @@ export async function runFetchEngine(
     timeoutMs = 30_000,
     maxBytes  = 4 * 1024 * 1024,
     fetchFn   = fetch,
+    resolver,
   } = options;
 
   const scraplingBase = (
@@ -552,10 +570,9 @@ export async function runFetchEngine(
       ...profile.headers,
     };
 
-    // Profile 1 (chrome) manually tracks redirects; others follow for speed.
-    const isFirstProfile = profile.name === 'chrome-win10';
-    // For non-first profiles, use the final URL we discovered so we skip redirect hops.
-    const targetUrl = !isFirstProfile && finalUrl ? finalUrl : url;
+    // Every profile uses manual redirect handling so no destination can bypass
+    // A/AAAA and public-address validation.
+    const targetUrl = profile.name === 'chrome-win10' ? url : (finalUrl || url);
 
     try {
       let text = '', parseError: string | undefined;
@@ -565,28 +582,17 @@ export async function runFetchEngine(
       let resFinalUrl = targetUrl;
       let loopDetected = false;
 
-      if (isFirstProfile) {
-        const r = await fetchTrackingRedirects(
-          url, reqHeaders, 6, maxBytes, signal, fetchFn,
-        );
-        text             = r.text;
-        parseError       = r.parseError;
-        resStatus        = r.status;
-        resOk            = r.ok;
-        resHeaders       = r.resHeaders;
-        resRedirectChain = r.redirectChain;
-        resFinalUrl      = r.finalUrl;
-        loopDetected     = r.loopDetected;
-      } else {
-        const res = await fetchFn(targetUrl, {
-          redirect: 'follow', signal, headers: reqHeaders,
-        });
-        resStatus  = res.status;
-        resOk      = res.ok;
-        resHeaders = res.headers;
-        resFinalUrl = res.url || targetUrl;
-        ({ text, parseError } = await readBody(res, maxBytes, targetUrl));
-      }
+      const r = await fetchTrackingRedirects(
+        targetUrl, reqHeaders, 6, maxBytes, signal, fetchFn, resolver,
+      );
+      text             = r.text;
+      parseError       = r.parseError;
+      resStatus        = r.status;
+      resOk            = r.ok;
+      resHeaders       = r.resHeaders;
+      resRedirectChain = r.redirectChain;
+      resFinalUrl      = r.finalUrl;
+      loopDetected     = r.loopDetected;
 
       if (loopDetected) {
         attempt.failure_kind = 'redirect_loop';
@@ -667,7 +673,7 @@ export async function runFetchEngine(
     if (tryIt) {
       console.log(`[fetch] Scrapling sidecar (mode=${lastKind === 'waf_challenge' ? 'stealth' : 'auto'}) for ${url}`);
       const { attempt: sa, html: saHtml } = await tryScrapling(
-        finalUrl || url, scraplingBase, signal, fetchFn, maxBytes, lastKind,
+        finalUrl || url, scraplingBase, signal, fetchFn, maxBytes, lastKind, resolver,
       );
       profilesTried.push(sa);
 
@@ -701,7 +707,7 @@ export async function runFetchEngine(
   // ── Body-based challenge signal ──────────────────────────────────
   // True when ANY profile found a challenge page (regardless of HTTP status).
   // This is the primary signal for BOT_PROTECTION_CHALLENGE classification.
-  const challengeDetected = profilesTried.some(
+  const challengeDetected = !fetchOk && profilesTried.some(
     a => a.cf_challenge || a.failure_kind === 'waf_challenge',
   );
 

@@ -11,6 +11,7 @@
  */
 
 import { normalizeUrl } from '../url-utils.js';
+import { safeFetch as fetch } from '../../../shared/outbound-url-safety.js';
 
 const FETCH_TIMEOUT = 10000;
 

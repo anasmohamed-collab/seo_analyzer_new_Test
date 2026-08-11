@@ -9,6 +9,8 @@
  *   - Informational-only if AMP not found
  */
 
+import { safeFetch as fetch } from '../../../shared/outbound-url-safety.js';
+
 const FETCH_TIMEOUT = 10000;
 
 async function fetchWithTimeout(url, timeoutMs = FETCH_TIMEOUT) {

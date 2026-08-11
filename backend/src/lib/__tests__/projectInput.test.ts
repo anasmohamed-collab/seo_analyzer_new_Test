@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { parseCreateProjectBody, isAutomationReady } from '../projectInput.js';
+import {
+  parseCreateProjectBody,
+  parseProjectFormValues,
+  isAutomationReady,
+} from '../projectInput.js';
 
 describe('parseCreateProjectBody — website_url', () => {
   it('requires website_url', () => {
@@ -189,6 +193,49 @@ describe('parseCreateProjectBody — audit configuration', () => {
     });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toContain('sectionUrl');
+  });
+});
+
+describe('parseProjectFormValues', () => {
+  it('requires homeUrl and articleUrl together when configuration is required', () => {
+    expect(parseProjectFormValues({}, 'example.com', { requireConfiguration: true })).toEqual({
+      ok: false,
+      error: 'homeUrl and articleUrl are required',
+    });
+    const partial = parseProjectFormValues(
+      { homeUrl: 'https://example.com/' },
+      'example.com',
+      { requireConfiguration: true },
+    );
+    expect(partial.ok).toBe(false);
+    if (!partial.ok) expect(partial.error).toContain('articleUrl');
+  });
+
+  it('rejects cross-domain home and article URLs', () => {
+    for (const body of [
+      { homeUrl: 'https://other.test/', articleUrl: 'https://example.com/story' },
+      { homeUrl: 'https://example.com/', articleUrl: 'https://other.test/story' },
+    ]) {
+      const result = parseProjectFormValues(body, 'example.com', { requireConfiguration: true });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toContain('must belong to example.com');
+    }
+  });
+
+  it('accepts a complete replacement and discards unknown keys', () => {
+    expect(parseProjectFormValues({
+      homeUrl: 'https://www.example.com/',
+      articleUrl: 'https://example.com/story',
+      sectionUrl: 'https://example.com/news',
+      injected: 'not-stored',
+    }, 'example.com', { requireConfiguration: true })).toEqual({
+      ok: true,
+      formValues: {
+        homeUrl: 'https://www.example.com/',
+        articleUrl: 'https://example.com/story',
+        sectionUrl: 'https://example.com/news',
+      },
+    });
   });
 });
 
