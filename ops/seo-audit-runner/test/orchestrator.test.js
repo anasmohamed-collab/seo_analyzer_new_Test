@@ -80,7 +80,7 @@ test('completed audit: polls until COMPLETED and extracts P0 issues', async () =
   assert.ok(apiClient.calls.getRunResults.length >= 3);
 });
 
-test('Beta projects remain included in scheduled audit processing', async () => {
+test('Beta projects remain included and pass only exposure P1 findings to alerting', async () => {
   const projects = [
     project({ is_beta: false }),
     project({
@@ -98,24 +98,40 @@ test('Beta projects remain included in scheduled audit processing', async () => 
   const completedProjects = [];
   const apiClient = stubClient({
     projects,
-    getRunResults: () => ({ status: 'COMPLETED', results: [] }),
+    getRunResults: () => ({
+      status: 'COMPLETED',
+      siteRecommendations: [
+        {
+          priority: 'P1',
+          area: 'robots',
+          message: 'Beta/Staging site is crawlable by Googlebot and Googlebot-News',
+        },
+        { priority: 'P1', area: 'sitemap', message: 'Unrelated warning' },
+      ],
+      results: [],
+    }),
   });
 
   const report = await runAudits({
     config: fastConfig,
     apiClient,
     options: {
-      onProjectCompleted: async ({ project: completedProject }) => {
-        completedProjects.push(completedProject);
-        return { notificationStatus: completedProject.is_beta ? 'skipped-beta' : 'not-required' };
+      onProjectCompleted: async ({ project: completedProject, criticalIssues }) => {
+        completedProjects.push({ project: completedProject, criticalIssues });
+        return { notificationStatus: 'not-required' };
       },
     },
   });
 
   assert.equal(apiClient.calls.startAudit.length, 2);
   assert.equal(report.entries.filter((entry) => entry.outcome === OUTCOME.COMPLETED).length, 2);
-  assert.deepEqual(completedProjects.map((item) => item.id), ['p1', 'p2']);
-  assert.equal(report.entries.find((entry) => entry.projectId === 'p2').notification, 'skipped-beta');
+  assert.deepEqual(completedProjects.map((item) => item.project.id), ['p1', 'p2']);
+  assert.equal(completedProjects[0].criticalIssues.length, 0, 'Production remains P0-only');
+  assert.deepEqual(
+    completedProjects[1].criticalIssues.map((issue) => [issue.priority, issue.message]),
+    [['P1', 'Beta/Staging site is crawlable by Googlebot and Googlebot-News']],
+  );
+  assert.equal(report.criticalIssues.length, 0, 'P1 Beta exposure does not become a report P0');
 });
 
 test('failed audit: FAILED status is terminal', async () => {

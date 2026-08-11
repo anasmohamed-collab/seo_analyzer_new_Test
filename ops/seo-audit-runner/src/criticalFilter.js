@@ -8,6 +8,10 @@
  */
 
 const CRITICAL_PRIORITY = 'P0';
+const BETA_EXPOSURE_MESSAGES = new Set([
+  'Beta/Staging site is crawlable by Googlebot and Googlebot-News',
+  'Beta/Staging seed URL is indexable (no noindex directive detected)',
+]);
 
 function toRecommendationArray(value) {
   if (Array.isArray(value)) return value;
@@ -24,7 +28,7 @@ function toRecommendationArray(value) {
 
 function toIssue(rec, { source, pageUrl, pageType, projectId, auditRunId }) {
   return {
-    priority: CRITICAL_PRIORITY,
+    priority: rec.priority,
     area: rec.area ?? null,
     message: rec.message ?? null,
     fixHint: rec.fixHint ?? null,
@@ -36,18 +40,13 @@ function toIssue(rec, { source, pageUrl, pageType, projectId, auditRunId }) {
   };
 }
 
-/**
- * @param runResults response of GET /api/audit-runs/:id/results
- * @returns array of critical (P0) issues from page-level `recommendations`
- *          and top-level `siteRecommendations`.
- */
-export function extractCriticalIssues(runResults, { projectId = null, auditRunId = null } = {}) {
+function collectIssues(runResults, predicate, { projectId = null, auditRunId = null } = {}) {
   const issues = [];
 
   const rows = Array.isArray(runResults?.results) ? runResults.results : [];
   for (const row of rows) {
     for (const rec of toRecommendationArray(row?.recommendations)) {
-      if (rec?.priority === CRITICAL_PRIORITY) {
+      if (predicate(rec)) {
         issues.push(
           toIssue(rec, {
             source: 'page',
@@ -62,7 +61,7 @@ export function extractCriticalIssues(runResults, { projectId = null, auditRunId
   }
 
   for (const rec of toRecommendationArray(runResults?.siteRecommendations)) {
-    if (rec?.priority === CRITICAL_PRIORITY) {
+    if (predicate(rec)) {
       issues.push(
         toIssue(rec, { source: 'site', pageUrl: null, pageType: null, projectId, auditRunId }),
       );
@@ -70,4 +69,36 @@ export function extractCriticalIssues(runResults, { projectId = null, auditRunId
   }
 
   return issues;
+}
+
+/**
+ * @param runResults response of GET /api/audit-runs/:id/results
+ * @returns array of critical (P0) issues from page-level `recommendations`
+ *          and top-level `siteRecommendations`.
+ */
+export function extractCriticalIssues(runResults, { projectId = null, auditRunId = null } = {}) {
+  return collectIssues(
+    runResults,
+    (rec) => rec?.priority === CRITICAL_PRIORITY,
+    { projectId, auditRunId },
+  );
+}
+
+/**
+ * Scheduled alert findings. Production remains strictly P0-only. Explicit
+ * Beta projects additionally surface only the two P1 exposure findings that
+ * the backend emits when the environment becomes crawlable or indexable.
+ * No priority is promoted or rewritten.
+ */
+export function extractAutomationAlertIssues(
+  runResults,
+  { projectId = null, auditRunId = null, isBeta = false } = {},
+) {
+  return collectIssues(
+    runResults,
+    (rec) =>
+      rec?.priority === CRITICAL_PRIORITY ||
+      (isBeta === true && rec?.priority === 'P1' && BETA_EXPOSURE_MESSAGES.has(rec?.message)),
+    { projectId, auditRunId },
+  );
 }

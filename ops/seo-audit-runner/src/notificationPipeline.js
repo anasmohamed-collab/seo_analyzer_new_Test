@@ -166,15 +166,6 @@ export function createNotificationPipeline({
         };
       }
 
-      // Beta/Staging projects still complete their audits and evidence checks,
-      // but they are outside the scheduled alerting lifecycle. Skipping before
-      // snapshot/notification persistence also prevents later retry delivery.
-      if (project?.is_beta === true) {
-        counters.notRequired++;
-        logger?.info?.(`Project ${project.id}: Beta/Staging project — scheduled Slack alert skipped`);
-        return { evidenceComplete: true, notificationStatus: 'skipped-beta' };
-      }
-
       const issues = criticalIssues.map((issue) => ({
         ...issue,
         fingerprint: fingerprintIssue(project.id, issue),
@@ -196,12 +187,14 @@ export function createNotificationPipeline({
         resolved: lifecycle.resolved.length,
         current: issues.length,
       };
-      lifecycleTotals.new += counts.new;
-      lifecycleTotals.reopened += counts.reopened;
-      lifecycleTotals.unchanged += counts.unchanged;
-      lifecycleTotals.resolved += counts.resolved;
-      lifecycleTotals.currentP0 += counts.current;
-      if (counts.current > 0) lifecycleTotals.projectsWithCritical++;
+      const p0Count = (items) => items.filter((issue) => issue.priority === 'P0').length;
+      const currentP0 = p0Count(issues);
+      lifecycleTotals.new += p0Count(lifecycle.new);
+      lifecycleTotals.reopened += p0Count(lifecycle.reopened);
+      lifecycleTotals.unchanged += p0Count(lifecycle.unchanged);
+      lifecycleTotals.resolved += p0Count(lifecycle.resolved);
+      lifecycleTotals.currentP0 += currentP0;
+      if (currentP0 > 0) lifecycleTotals.projectsWithCritical++;
 
       // Technical checks come from THIS completed audit result only — the
       // notification layer never re-fetches robots.txt or a sitemap.
@@ -212,7 +205,7 @@ export function createNotificationPipeline({
         // A channel-wide mention is for genuinely NEW or REOPENED P0 issues.
         // Unchanged-only and resolved-only alerts never page the channel.
         const mention =
-          counts.new + counts.reopened > 0
+          p0Count([...lifecycle.new, ...lifecycle.reopened]) > 0
             ? criticalMentionToken(config.slackCriticalMention ?? 'channel')
             : null;
         const messages = buildProjectMessages({
@@ -225,6 +218,7 @@ export function createNotificationPipeline({
           lifecycle,
           mode: alertMode,
           siteChecks: results.siteChecks ?? null,
+          isBeta: project.is_beta === true,
           mention,
           maxIssuesPerMessage: config.slackMaxIssuesPerMessage,
           maxMessageCharacters: config.slackMaxMessageCharacters,

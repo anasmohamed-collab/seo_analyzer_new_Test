@@ -119,6 +119,22 @@ test('unchanged-only and resolved-only alerts carry no broad mention', () => {
   assert.match(resolved.text, /\*P0:\* none currently open \| \*Resolved:\* 1/);
 });
 
+test('Beta exposure alerts are distinct, preserve P1, and never carry a broad mention', () => {
+  const exposure = mkIssue(1, {
+    priority: 'P1',
+    message: 'Beta/Staging seed URL is indexable (no noindex directive detected)',
+  });
+  const [message] = buildProjectMessages(
+    baseArgs(lc({ new: [exposure] }), { isBeta: true, mention: null }),
+  );
+
+  assert.match(message.text, /^:warning: \*Beta SEO Exposure Alert\*/);
+  assert.match(message.text, /\*Exposure findings:\* 1 new/);
+  assert.match(message.text, /Beta\/Staging seed URL is indexable/);
+  assert.ok(!/<!(channel|here|everyone)>/.test(message.text));
+  assert.ok(!/\*P0:\*/.test(message.text));
+});
+
 // ── Compact critical format ─────────────────────────────────────────
 
 test('the critical alert is compact, scannable, and free of ID noise', () => {

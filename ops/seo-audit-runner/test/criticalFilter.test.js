@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { extractCriticalIssues } from '../src/criticalFilter.js';
+import { extractAutomationAlertIssues, extractCriticalIssues } from '../src/criticalFilter.js';
 
 const runResults = {
   id: 'run-1',
@@ -95,4 +95,59 @@ test('empty or malformed payloads produce no issues', () => {
   assert.equal(extractCriticalIssues(null).length, 0);
   assert.equal(extractCriticalIssues({}).length, 0);
   assert.equal(extractCriticalIssues({ results: 'nope', siteRecommendations: 42 }).length, 0);
+});
+
+test('Production scheduled alerts remain P0-only', () => {
+  const issues = extractAutomationAlertIssues(runResults, {
+    projectId: 'p1',
+    auditRunId: 'run-1',
+    isBeta: false,
+  });
+  assert.equal(issues.length, 3);
+  assert.ok(issues.every((issue) => issue.priority === 'P0'));
+});
+
+test('Beta scheduled alerts add only the two explicit P1 exposure findings', () => {
+  const betaResults = {
+    siteRecommendations: [
+      {
+        priority: 'P1',
+        area: 'robots',
+        message: 'Beta/Staging site is crawlable by Googlebot and Googlebot-News',
+        fixHint: 'Block crawlers before launch.',
+      },
+      { priority: 'P1', area: 'sitemap', message: 'sitemap stale', fixHint: 'Refresh it.' },
+    ],
+    results: [
+      {
+        url: 'https://beta.example.com/',
+        data: { pageType: 'home' },
+        recommendations: [
+          {
+            priority: 'P1',
+            area: 'indexability',
+            message: 'Beta/Staging seed URL is indexable (no noindex directive detected)',
+            fixHint: 'Add a noindex directive before launch.',
+          },
+          { priority: 'P0', area: 'meta', message: 'Production critical', fixHint: 'Fix it.' },
+          { priority: 'P1', area: 'meta', message: 'Unrelated warning', fixHint: 'Review it.' },
+        ],
+      },
+    ],
+  };
+
+  const issues = extractAutomationAlertIssues(betaResults, {
+    projectId: 'beta-1',
+    auditRunId: 'run-beta',
+    isBeta: true,
+  });
+
+  assert.deepEqual(issues.map((issue) => issue.message), [
+    'Beta/Staging seed URL is indexable (no noindex directive detected)',
+    'Production critical',
+    'Beta/Staging site is crawlable by Googlebot and Googlebot-News',
+  ]);
+  assert.deepEqual(issues.map((issue) => issue.priority), ['P1', 'P0', 'P1']);
+  assert.ok(!issues.some((issue) => issue.message === 'Unrelated warning'));
+  assert.ok(!issues.some((issue) => issue.message === 'sitemap stale'));
 });

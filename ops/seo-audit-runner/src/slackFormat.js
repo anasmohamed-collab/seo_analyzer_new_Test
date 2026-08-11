@@ -327,16 +327,17 @@ function displayDomain(domain) {
  * When nothing is listed the line states the current state explicitly, so a
  * resolved-only alert can never be read as "N open critical issues".
  */
-function countsLine(counts, mode) {
+function countsLine(counts, mode, { isBeta = false } = {}) {
   const parts = [];
   if (counts.new > 0) parts.push(`${counts.new} new`);
   if (counts.reopened > 0) parts.push(`${counts.reopened} reopened`);
   if (mode === 'all_current' && counts.unchanged > 0) parts.push(`${counts.unchanged} unchanged`);
 
   let line;
-  if (parts.length > 0) line = `*P0:* ${parts.join(', ')}`;
-  else if (counts.current > 0) line = `*P0:* ${counts.current} current`;
-  else line = '*P0:* none currently open';
+  const label = isBeta ? 'Exposure findings' : 'P0';
+  if (parts.length > 0) line = `*${label}:* ${parts.join(', ')}`;
+  else if (counts.current > 0) line = `*${label}:* ${counts.current} current`;
+  else line = `*${label}:* none currently open`;
 
   if (counts.resolved > 0) line += ` | *Resolved:* ${counts.resolved}`;
   return line;
@@ -396,6 +397,7 @@ export function buildProjectMessages({
   lifecycle,
   mode,
   siteChecks = null,
+  isBeta = false,
   mention = null,
   maxIssuesPerMessage = MAX_VISIBLE_CRITICAL_ISSUES,
   maxMessageCharacters = 30_000,
@@ -426,10 +428,10 @@ export function buildProjectMessages({
   const shownDomain = displayDomain(domain);
 
   const lines = [
-    `:rotating_light: ${mention ? `${mention} ` : ''}*Critical SEO Alert*`,
+    `${isBeta ? ':warning:' : ':rotating_light:'} ${mention ? `${mention} ` : ''}*${isBeta ? 'Beta SEO Exposure Alert' : 'Critical SEO Alert'}*`,
     '',
     `*${escapeSlack(label)}*${shownDomain && shownDomain !== label ? ` — \`${escapeSlack(shownDomain)}\`` : ''}`,
-    countsLine(counts, mode),
+    countsLine(counts, mode, { isBeta }),
   ];
 
   if (visible.length > 0) {
