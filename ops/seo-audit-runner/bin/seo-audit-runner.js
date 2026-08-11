@@ -41,6 +41,7 @@ import {
   formatTextReport,
   summarize,
   EXIT_CODES,
+  OUTCOME,
 } from '../src/report.js';
 import { dedupeProjects } from '../src/dedupe.js';
 import { evaluateProjectEligibility } from '../src/eligibility.js';
@@ -538,6 +539,12 @@ async function runCommand(config, logger, values, out) {
     // ── Run summary notification + automation-run record ─────────
     if (!dryRun && pipeline && stateStore) {
       const s = summarize(report);
+      const triggerFailureEntries = report.entries.filter(
+        (entry) => entry.outcome === OUTCOME.TRIGGER_FAILED,
+      );
+      const triggerFailureReasons = Array.from(
+        new Set(triggerFailureEntries.map((entry) => String(entry.detail ?? '').trim()).filter(Boolean)),
+      );
       const totals = {
         discovered: s.discovered,
         eligible: s.eligible,
@@ -548,6 +555,9 @@ async function runCommand(config, logger, values, out) {
         deferred: s.deferred,
         skipped: s.skipped,
         failed: s.failed,
+        triggerFailed: s.counts[OUTCOME.TRIGGER_FAILED] ?? 0,
+        commonFailureReason: triggerFailureReasons.length === 1 ? triggerFailureReasons[0] : null,
+        failedDomains: triggerFailureEntries.map((entry) => entry.domain).filter(Boolean),
         timedOut: s.timedOut,
         triggerOutcomeUnknown: s.triggerUnknown,
         projectsWithCritical: pipeline.lifecycleTotals.projectsWithCritical,

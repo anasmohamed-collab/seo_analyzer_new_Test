@@ -504,34 +504,74 @@ export function buildRunSummaryMessage({
   const completed = num(t.completed);
   const deferred = num(t.deferred ?? t.skippedAlreadyRunning);
   const skipped = num(t.skipped ?? t.skippedMissingConfig);
+  const failed = num(t.failed);
+  const triggerFailed = num(t.triggerFailed);
+  const timedOut = num(t.timedOut);
   const triggerUnknown = num(t.triggerOutcomeUnknown);
   const eligible = num(t.eligible ?? t.selected);
   const attempted = num(
-    t.attempted ?? (completed + num(t.failed) + num(t.timedOut) + triggerUnknown),
+    t.attempted ?? (completed + failed + timedOut + triggerUnknown),
   );
+  const totalTriggerFailure =
+    attempted > 0 &&
+    completed === 0 &&
+    triggerFailed === attempted &&
+    failed === attempted &&
+    timedOut === 0 &&
+    triggerUnknown === 0;
+
+  if (totalTriggerFailure) {
+    const lines = [
+      ':rotating_light: *SEO Audit Runner Failure*',
+      '',
+      `${triggerFailed}/${attempted} audit triggers failed.`,
+      'No SEO audits completed.',
+    ];
+
+    const reason = String(t.commonFailureReason ?? '').trim();
+    if (reason) lines.push('', `*Reason:* ${escapeSlack(reason)}`);
+
+    const domains = Array.from(
+      new Set(
+        (Array.isArray(t.failedDomains) ? t.failedDomains : [])
+          .map((domain) => displayDomain(domain))
+          .filter(Boolean),
+      ),
+    );
+    if (domains.length > 0) {
+      const visible = domains.slice(0, MAX_VISIBLE_CRITICAL_ISSUES);
+      let affected = visible.map((domain) => `\`${escapeSlack(domain)}\``).join(', ');
+      if (domains.length > visible.length) affected += `, + ${domains.length - visible.length} more`;
+      lines.push(`*Affected:* ${affected}`);
+    }
+
+    if (deferred + skipped > 0) lines.push(`Deferred/Skipped: ${deferred + skipped}`);
+    if (num(t.notificationFailures) > 0) {
+      lines.push(`Failed Slack notifications: ${num(t.notificationFailures)}`);
+    }
+    lines.push('', `Duration: ${formatDuration(durationMs)} | Execution: \`${escapeSlack(shortId(runnerExecutionId))}\``);
+
+    const text = lines.join('\n');
+    return { text, blocks: textToBlocks(text) };
+  }
 
   const lines = [':clipboard: *SEO Audit Summary*', ''];
 
-  lines.push(
-    `Discovered: ${num(t.discovered)} | Eligible: ${eligible} | Attempted: ${attempted}`,
-  );
-  lines.push(
-    `Completed: ${completed} | Deferred: ${deferred} | Skipped: ${skipped} | ` +
-      `Failed: ${num(t.failed)} | Timed out: ${num(t.timedOut)} | ` +
-      `Trigger unknown: ${triggerUnknown}`,
-  );
+  lines.push(`Discovered: ${num(t.discovered)} | Eligible: ${eligible} | Attempted: ${attempted}`);
 
   if (completed === 0) {
     // No completed audit means no current critical-state conclusion exists —
     // the critical and technical sections are omitted, not printed as zeros.
-    lines.push('', 'No audits completed in this cycle.');
+    lines.push('', attempted === 0 && eligible === 0
+      ? 'No eligible projects were audited.'
+      : 'No audits completed in this cycle.');
   } else {
-    lines.push('');
-    let critical =
-      `Critical projects: ${num(t.projectsWithCritical)} | P0: ${num(t.currentP0)} | ` +
-      `New: ${num(t.newIssues)}`;
-    if (num(t.reopenedIssues) > 0) critical += ` | Reopened: ${num(t.reopenedIssues)}`;
-    critical += ` | Resolved: ${num(t.resolvedIssues)}`;
+    lines.push(`Audited: ${completed}/${attempted} completed`);
+    let critical = `Critical projects: ${num(t.projectsWithCritical)}`;
+    if (num(t.currentP0) > 0) critical += ` | Current P0: ${num(t.currentP0)}`;
+    if (num(t.newIssues) > 0) critical += ` | New P0: ${num(t.newIssues)}`;
+    if (num(t.reopenedIssues) > 0) critical += ` | Reopened P0: ${num(t.reopenedIssues)}`;
+    if (num(t.resolvedIssues) > 0) critical += ` | Resolved P0: ${num(t.resolvedIssues)}`;
     lines.push(critical);
 
     const technical = technicalSummaryLines(t.technical, completed);
@@ -539,6 +579,10 @@ export function buildRunSummaryMessage({
   }
 
   const extras = [];
+  if (deferred + skipped > 0) extras.push(`Deferred/Skipped: ${deferred + skipped}`);
+  if (failed > 0) extras.push(`Failed: ${failed}`);
+  if (timedOut > 0) extras.push(`Timed out: ${timedOut}`);
+  if (triggerUnknown > 0) extras.push(`Trigger unknown: ${triggerUnknown}`);
   if (num(t.deduplicated) > 0) extras.push(`Duplicates skipped: ${num(t.deduplicated)}`);
   if (num(t.notificationFailures) > 0) extras.push(`Failed Slack notifications: ${num(t.notificationFailures)}`);
   if (extras.length > 0) lines.push('', ...extras);
