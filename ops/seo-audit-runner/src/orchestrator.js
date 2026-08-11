@@ -13,6 +13,7 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import { dedupeProjects } from './dedupe.js';
 import { buildRunRequest } from './buildRunRequest.js';
+import { evaluateProjectEligibility } from './eligibility.js';
 import { extractCriticalIssues } from './criticalFilter.js';
 import { AmbiguousTriggerError, TriggerFailedError } from './apiClient.js';
 import { OUTCOME } from './report.js';
@@ -49,7 +50,9 @@ export async function runAudits({ config, apiClient, logger = null, options = {}
     finishedAt: null,
     aborted: false,
     discoveredProjects: 0,
+    eligibleProjects: 0,
     selectedProjects: 0,
+    attemptedProjects: 0,
     notificationFailures: 0,
     entries: [],
     criticalIssues: [],
@@ -67,7 +70,26 @@ export async function runAudits({ config, apiClient, logger = null, options = {}
   report.discoveredProjects = projects.length;
 
   // ── Deduplicate ───────────────────────────────────────────────
-  const { winners, duplicates } = dedupeProjects(projects);
+  // Historical evidence can only be selected by an explicit manual
+  // single-project run. Scheduled and --all calls cannot opt into it.
+  const allowHistoricalFallback = Boolean(
+    options.allowHistoricalFallback && options.projectId != null,
+  );
+  const eligible = [];
+  for (const project of projects) {
+    const decision = evaluateProjectEligibility(project, config, { allowHistoricalFallback });
+    if (decision.eligible) {
+      eligible.push(project);
+    } else {
+      report.entries.push(makeEntry(project, OUTCOME.INELIGIBLE, decision.reason));
+      logger?.info?.(
+        `Project ${project.id} (${project.domain ?? 'no-domain'}): INELIGIBLE — ${decision.reason}`,
+      );
+    }
+  }
+  report.eligibleProjects = eligible.length;
+
+  const { winners, duplicates } = dedupeProjects(eligible);
   report.selectedProjects = winners.length;
   for (const dup of duplicates) {
     report.entries.push(
@@ -110,7 +132,11 @@ export async function runAudits({ config, apiClient, logger = null, options = {}
     const label = `${project.id} (${project.domain ?? 'no-domain'})`;
 
     // 1. Build the audit request from existing data only.
-    const built = await buildRunRequest(project, apiClient, { signal, logger });
+    const built = await buildRunRequest(project, apiClient, {
+      signal,
+      logger,
+      allowHistoricalFallback,
+    });
     if (!built.ok) {
       logger?.warn?.(`Project ${label}: SKIPPED_MISSING_AUDIT_CONFIG — ${built.detail}`);
       report.entries.push(makeEntry(project, OUTCOME.SKIPPED_MISSING_AUDIT_CONFIG, built.detail));
@@ -131,9 +157,9 @@ export async function runAudits({ config, apiClient, logger = null, options = {}
     // 3. Dry run stops before any write operation.
     if (dryRun) {
       report.entries.push(
-        makeEntry(project, OUTCOME.DRY_RUN_READY, `would start audit (source: ${built.source})`, {
+        makeEntry(project, OUTCOME.DRY_RUN_READY, `ELIGIBLE — would start audit (source: ${built.source})`, {
           requestSource: built.source,
-          proposedRequest: built.body,
+          proposedRequest: { ...built.body, expectedProjectId: String(project.id) },
         }),
       );
       return;
@@ -143,7 +169,11 @@ export async function runAudits({ config, apiClient, logger = null, options = {}
     let trigger;
     try {
       logger?.info?.(`Project ${label}: starting audit (request source: ${built.source})`);
-      trigger = await apiClient.startAudit(built.body, { signal });
+      report.attemptedProjects += 1;
+      trigger = await apiClient.startAudit(
+        { ...built.body, expectedProjectId: String(project.id) },
+        { signal },
+      );
     } catch (err) {
       if (err instanceof AmbiguousTriggerError) {
         await handleAmbiguousTrigger(project, err);
@@ -155,6 +185,21 @@ export async function runAudits({ config, apiClient, logger = null, options = {}
         return;
       }
       throw err;
+    }
+
+    if (String(trigger.siteId) !== String(project.id)) {
+      const detail =
+        `SAFETY FAILURE: trigger returned siteId=${trigger.siteId}; ` +
+        `expected selected project ${project.id}. The run will not be polled or recorded in lifecycle state.`;
+      logger?.error?.(`Project ${label}: ${detail}`);
+      report.entries.push(
+        makeEntry(project, OUTCOME.RUNNER_ERROR, detail, {
+          siteId: trigger.siteId,
+          auditRunId: trigger.auditRunId,
+          requestSource: built.source,
+        }),
+      );
+      return;
     }
 
     logger?.info?.(`Project ${label}: audit started (auditRunId=${trigger.auditRunId})`);
@@ -192,7 +237,18 @@ export async function runAudits({ config, apiClient, logger = null, options = {}
             auditRunId: trigger.auditRunId,
             results: polled.results,
             criticalIssues: criticals,
+            submittedUrls: built.body,
           });
+          if (outcome?.evidenceComplete === false) {
+            completedEntry.outcome = OUTCOME.INCOMPLETE_EVIDENCE;
+            completedEntry.detail = `lifecycle state preserved: ${outcome.evidenceReasons.join('; ')}`;
+            completedEntry.evidence = {
+              complete: false,
+              reasons: outcome.evidenceReasons,
+            };
+          } else if (outcome?.evidenceComplete === true) {
+            completedEntry.evidence = { complete: true, reasons: [] };
+          }
           if (outcome?.lifecycleCounts) completedEntry.lifecycle = outcome.lifecycleCounts;
           if (outcome?.notificationStatus) completedEntry.notification = outcome.notificationStatus;
           if (['failed-will-retry', 'permanent-failure'].includes(outcome?.notificationStatus)) {

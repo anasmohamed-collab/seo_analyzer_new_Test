@@ -10,6 +10,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { SLACK_CRITICAL_MENTION_MODES } from './slackFormat.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const PACKAGE_ROOT = path.resolve(__dirname, '..');
@@ -28,10 +29,15 @@ const LOG_LEVELS = ['error', 'warn', 'info', 'debug'];
 const DEFAULTS = {
   SEO_API_BASE_URL: 'http://localhost:3000',
   RUNNER_CONCURRENCY: '1',
+  RUNNER_MAX_JOBS_PER_TICK: '6',
   POLL_INTERVAL_MS: '5000',
   POLL_TIMEOUT_MS: '900000',
   HTTP_REQUEST_TIMEOUT_MS: '30000',
   RUNNER_LOG_LEVEL: 'info',
+  RUNNER_INCLUDE_PROJECT_IDS: '',
+  RUNNER_EXCLUDE_PROJECT_IDS: '',
+  RUNNER_EXCLUDE_NONPRODUCTION: 'true',
+  RUNNER_REQUIRE_STORED_CONFIG: 'true',
   NOTIFICATIONS_ENABLED: 'false',
   ALLOW_INSECURE_PUBLIC_API: 'false',
   SEO_RUNNER_ALERT_MODE: 'new_or_regressed',
@@ -40,9 +46,11 @@ const DEFAULTS = {
   SLACK_MAX_RETRIES: '4',
   SLACK_MAX_ISSUES_PER_MESSAGE: '20',
   SLACK_MAX_MESSAGE_CHARACTERS: '30000',
+  SLACK_CRITICAL_MENTION: 'channel',
 };
 
 export const ALERT_MODES = ['new_or_regressed', 'all_current', 'summary_only', 'disabled'];
+export { SLACK_CRITICAL_MENTION_MODES };
 
 // Hostnames considered private/trusted for plain-http transport.
 const PRIVATE_HOST_PATTERNS = [
@@ -81,6 +89,28 @@ export function redactUrl(raw) {
 
 function parseBool(value) {
   return ['true', '1', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+}
+
+function parseStrictBool(key, value, problems) {
+  const normalized = String(value).trim().toLowerCase();
+  if (['true', '1', 'yes', 'on'].includes(normalized)) return true;
+  if (['false', '0', 'no', 'off'].includes(normalized)) return false;
+  problems.push(`${key} must be true or false, got: ${value || '(empty)'}`);
+  return null;
+}
+
+function parseProjectIds(key, value, problems) {
+  const ids = new Set();
+  for (const rawId of String(value ?? '').split(',')) {
+    const id = rawId.trim();
+    if (!id) continue;
+    if (!/^[A-Za-z0-9._:-]{1,128}$/.test(id)) {
+      problems.push(`${key} contains an invalid project ID: ${id}`);
+      continue;
+    }
+    ids.add(id);
+  }
+  return ids;
 }
 
 /**
@@ -154,9 +184,33 @@ export function loadConfig(env = process.env) {
     return value;
   };
   const runnerConcurrency = parsePositiveInt('RUNNER_CONCURRENCY');
+  const runnerMaxJobsPerTick = parsePositiveInt('RUNNER_MAX_JOBS_PER_TICK');
   const pollIntervalMs = parsePositiveInt('POLL_INTERVAL_MS', { min: 100 });
   const pollTimeoutMs = parsePositiveInt('POLL_TIMEOUT_MS', { min: 1000 });
   const httpRequestTimeoutMs = parsePositiveInt('HTTP_REQUEST_TIMEOUT_MS', { min: 1000 });
+
+  // Project-selection safety policy. Exclusions are applied after includes,
+  // so an ID present in both sets is always excluded.
+  const includeProjectIds = parseProjectIds(
+    'RUNNER_INCLUDE_PROJECT_IDS',
+    raw('RUNNER_INCLUDE_PROJECT_IDS'),
+    problems,
+  );
+  const excludeProjectIds = parseProjectIds(
+    'RUNNER_EXCLUDE_PROJECT_IDS',
+    raw('RUNNER_EXCLUDE_PROJECT_IDS'),
+    problems,
+  );
+  const excludeNonproduction = parseStrictBool(
+    'RUNNER_EXCLUDE_NONPRODUCTION',
+    raw('RUNNER_EXCLUDE_NONPRODUCTION'),
+    problems,
+  );
+  const requireStoredConfig = parseStrictBool(
+    'RUNNER_REQUIRE_STORED_CONFIG',
+    raw('RUNNER_REQUIRE_STORED_CONFIG'),
+    problems,
+  );
 
   // ── Logging ─────────────────────────────────────────────────────
   const logLevel = raw('RUNNER_LOG_LEVEL').toLowerCase();
@@ -205,6 +259,17 @@ export function loadConfig(env = process.env) {
     );
   }
 
+  // Channel-wide mention for NEW / REOPENED P0 alerts only. An unknown or
+  // empty value is a hard error — silently falling back to another mention
+  // type would either spam a channel or quietly stop paging it.
+  const slackCriticalMention = raw('SLACK_CRITICAL_MENTION').toLowerCase();
+  if (!SLACK_CRITICAL_MENTION_MODES.includes(slackCriticalMention)) {
+    problems.push(
+      `SLACK_CRITICAL_MENTION must be one of ${SLACK_CRITICAL_MENTION_MODES.join(', ')}, ` +
+        `got: ${raw('SLACK_CRITICAL_MENTION') || '(empty)'}`,
+    );
+  }
+
   const slackRequestTimeoutMs = parsePositiveInt('SLACK_REQUEST_TIMEOUT_MS', { min: 1000 });
   const slackMaxRetries = parsePositiveInt('SLACK_MAX_RETRIES', { min: 0 });
   const slackMaxIssuesPerMessage = parsePositiveInt('SLACK_MAX_ISSUES_PER_MESSAGE', { min: 1 });
@@ -225,9 +290,14 @@ export function loadConfig(env = process.env) {
     apiBaseUrl,
     apiBaseUrlRedacted: redactUrl(apiBaseUrl).replace(/\/+$/, ''),
     runnerConcurrency,
+    runnerMaxJobsPerTick,
     pollIntervalMs,
     pollTimeoutMs,
     httpRequestTimeoutMs,
+    includeProjectIds,
+    excludeProjectIds,
+    excludeNonproduction,
+    requireStoredConfig,
     stateDir,
     stateDbPath,
     logLevel,
@@ -242,6 +312,7 @@ export function loadConfig(env = process.env) {
     slackMaxRetries,
     slackMaxIssuesPerMessage,
     slackMaxMessageCharacters,
+    slackCriticalMention,
     dashboardUrl,
     allowInsecurePublicApi,
   };

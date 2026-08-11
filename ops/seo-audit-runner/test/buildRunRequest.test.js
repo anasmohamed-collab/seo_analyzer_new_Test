@@ -97,7 +97,7 @@ test('buildRunRequest prefers form values and does not call the API', async () =
   assert.equal(called, 0);
 });
 
-test('buildRunRequest falls back to the latest audit', async () => {
+test('buildRunRequest falls back to the latest audit only when explicitly enabled', async () => {
   const apiClient = {
     getLatestAudit: async () => ({
       results: {
@@ -108,22 +108,24 @@ test('buildRunRequest falls back to the latest audit', async () => {
       },
     }),
   };
-  const result = await buildRunRequest(project(null), apiClient);
+  const result = await buildRunRequest(project(null), apiClient, { allowHistoricalFallback: true });
   assert.equal(result.ok, true);
   assert.equal(result.source, 'latest_audit');
   assert.equal(result.body.homeUrl, 'https://x/');
 });
 
 test('buildRunRequest reports SKIPPED_MISSING_AUDIT_CONFIG when nothing usable exists', async () => {
-  const apiClient = { getLatestAudit: async () => null };
+  let called = 0;
+  const apiClient = { getLatestAudit: async () => { called++; return null; } };
   const result = await buildRunRequest(project(null), apiClient);
   assert.equal(result.ok, false);
   assert.equal(result.reason, 'SKIPPED_MISSING_AUDIT_CONFIG');
+  assert.equal(called, 0, 'historical endpoint must not be read by default');
 });
 
 test('buildRunRequest treats a failing fallback endpoint as missing config', async () => {
   const apiClient = { getLatestAudit: async () => { throw new Error('boom'); } };
-  const result = await buildRunRequest(project(null), apiClient);
+  const result = await buildRunRequest(project(null), apiClient, { allowHistoricalFallback: true });
   assert.equal(result.ok, false);
   assert.equal(result.reason, 'SKIPPED_MISSING_AUDIT_CONFIG');
 });

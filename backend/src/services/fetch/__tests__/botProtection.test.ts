@@ -16,7 +16,15 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { isBotProtectionPage, runFetchEngine } from '../fetchEngine.js';
+import {
+  isBotProtectionPage,
+  runFetchEngine as runFetchEngineRaw,
+  type FetchEngineOptions,
+} from '../fetchEngine.js';
+
+const TEST_RESOLVER = async () => [{ address: '93.184.216.34', family: 4 }];
+const runFetchEngine = (url: string, options: FetchEngineOptions = {}) =>
+  runFetchEngineRaw(url, { resolver: TEST_RESOLVER, ...options });
 
 // ── HTML fixtures ────────────────────────────────────────────────
 

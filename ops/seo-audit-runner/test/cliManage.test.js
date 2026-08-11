@@ -5,6 +5,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { openStateDb } from '../src/db.js';
+import { JobStore } from '../src/jobs.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BIN = path.resolve(__dirname, '..', 'bin', 'seo-audit-runner.js');
@@ -23,6 +25,20 @@ function cli(args) {
   return { status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '', output: (r.stdout ?? '') + (r.stderr ?? '') };
 }
 
+/**
+ * Parse stdout as the versioned envelope and return its `data`.
+ * Asserts the envelope frame itself, so every caller below also proves the
+ * JSON contract holds for the command it exercises.
+ */
+function data(result) {
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.schemaVersion, 1, 'envelope must carry schemaVersion 1');
+  assert.equal(typeof parsed.command, 'string');
+  assert.match(parsed.generatedAt, /^\d{4}-\d{2}-\d{2}T.*Z$/);
+  assert.equal(parsed.ok, result.status === 0, 'ok must mirror exit code 0');
+  return parsed.data;
+}
+
 test('job create requires an explicit target', () => {
   const r = cli(['job', 'create']);
   assert.equal(r.status, 1);
@@ -32,21 +48,22 @@ test('job create requires an explicit target', () => {
 test('job create/list/show/cancel round trip with JSON output', () => {
   const created = cli(['job', 'create', '--project', 'p-e2e', '--output', 'json']);
   assert.equal(created.status, 0, created.output);
-  const job = JSON.parse(created.stdout);
+  const job = data(created);
   assert.equal(job.status, 'QUEUED');
   assert.equal(job.project_id, 'p-e2e');
 
-  const listed = JSON.parse(cli(['job', 'list', '--output', 'json']).stdout);
-  assert.ok(listed.some((j) => j.id === job.id));
+  const listed = data(cli(['job', 'list', '--output', 'json']));
+  assert.ok(listed.jobs.some((j) => j.id === job.id));
+  assert.equal(listed.limit, 50, 'job list must report the applied bound');
 
-  const shown = JSON.parse(cli(['job', 'show', job.id, '--output', 'json']).stdout);
+  const shown = data(cli(['job', 'show', job.id, '--output', 'json']));
   assert.equal(shown.id, job.id);
 
   const retry = cli(['job', 'retry', job.id]);
   assert.equal(retry.status, 1, 'retrying a QUEUED job must fail');
   assert.match(retry.stderr, /only FAILED jobs/);
 
-  const cancelled = JSON.parse(cli(['job', 'cancel', job.id, '--output', 'json']).stdout);
+  const cancelled = data(cli(['job', 'cancel', job.id, '--output', 'json']));
   assert.equal(cancelled.status, 'CANCELLED');
 });
 
@@ -61,18 +78,18 @@ test('schedule create validates input and stores schedules disabled', () => {
 
   const created = cli(['schedule', 'create', '--frequency', 'weekly', '--at', '04:30', '--day-of-week', '1', '--output', 'json']);
   assert.equal(created.status, 0, created.output);
-  const schedule = JSON.parse(created.stdout);
+  const schedule = data(created);
   assert.equal(schedule.enabled, 0);
   assert.equal(schedule.day_of_week, 1);
   assert.equal(schedule.timezone, 'Africa/Cairo');
 
-  const enabled = JSON.parse(cli(['schedule', 'enable', schedule.id, '--output', 'json']).stdout);
+  const enabled = data(cli(['schedule', 'enable', schedule.id, '--output', 'json']));
   assert.equal(enabled.enabled, 1);
   const listed = cli(['schedule', 'list']);
   assert.match(listed.stdout, /ENABLED/);
   assert.match(listed.stdout, /next=/);
 
-  const disabled = JSON.parse(cli(['schedule', 'disable', schedule.id, '--output', 'json']).stdout);
+  const disabled = data(cli(['schedule', 'disable', schedule.id, '--output', 'json']));
   assert.equal(disabled.enabled, 0);
   const deleted = cli(['schedule', 'delete', schedule.id]);
   assert.equal(deleted.status, 0);
@@ -93,10 +110,64 @@ test('health and doctor return contract exit codes and print no env values', () 
   const doctor = cli(['doctor', '--output', 'json']);
   assert.ok([0, 2].includes(doctor.status), doctor.output);
   const parsed = JSON.parse(doctor.stdout);
-  assert.ok(Array.isArray(parsed.checks));
+  assert.equal(parsed.schemaVersion, 1);
+  assert.ok(Array.isArray(parsed.data.checks));
+  assert.equal(parsed.data.exitCode, doctor.status);
 });
 
 test('unknown job/schedule actions are rejected', () => {
   assert.equal(cli(['job', 'frobnicate']).status, 1);
   assert.equal(cli(['schedule', 'frobnicate']).status, 1);
+});
+
+test('job create refuses to queue work that overlaps an active job', () => {
+  const first = data(cli(['job', 'create', '--project', 'p-conflict', '--output', 'json']));
+
+  const duplicate = cli(['job', 'create', '--project', 'p-conflict']);
+  assert.equal(duplicate.status, 1);
+  assert.match(duplicate.stderr, /already QUEUED/);
+  assert.match(duplicate.stderr, new RegExp(first.id), 'the message must name the blocking job');
+
+  const allProjects = cli(['job', 'create', '--all']);
+  assert.equal(allProjects.status, 1, 'an all-project job overlaps the queued project job');
+  assert.match(allProjects.stderr, /already QUEUED/);
+
+  // Clearing the queue makes both creatable again.
+  assert.equal(cli(['job', 'cancel', first.id]).status, 0);
+  const after = data(cli(['job', 'create', '--all', '--output', 'json']));
+  assert.equal(after.project_id, null);
+  assert.equal(cli(['job', 'cancel', after.id]).status, 0);
+});
+
+test('schedule delete refuses to strand queued jobs unless --force is given', () => {
+  const schedule = data(
+    cli(['schedule', 'create', '--frequency', 'daily', '--at', '03:00', '--all', '--output', 'json']),
+  );
+
+  // Enqueue the occurrence the way a worker tick would, writing directly to
+  // the same state DB the CLI uses — no audit is spawned by this test.
+  const db = openStateDb(path.join(stateDir, 'runner-state.sqlite'));
+  const job = new JobStore(db).createForOccurrence({ schedule, occurrenceKey: '2026-07-21' });
+  db.close();
+  assert.ok(job, 'the scheduled occurrence must enqueue');
+
+  const refused = cli(['schedule', 'delete', schedule.id]);
+  assert.equal(refused.status, 1);
+  assert.match(refused.stderr, /QUEUED job/);
+  assert.match(refused.stderr, /--force/);
+  assert.equal(
+    data(cli(['job', 'show', job.id, '--output', 'json'])).status,
+    'QUEUED',
+    'a refused delete changes nothing',
+  );
+
+  const forced = cli(['schedule', 'delete', schedule.id, '--force']);
+  assert.equal(forced.status, 0, forced.output);
+  assert.match(forced.stdout, new RegExp(`cancelled queued job ${job.id}`));
+  assert.equal(
+    data(cli(['job', 'show', job.id, '--output', 'json'])).status,
+    'CANCELLED',
+    'the queued job is cancelled, not deleted',
+  );
+  assert.equal(cli(['schedule', 'list']).stdout.includes(schedule.id), false);
 });

@@ -15,11 +15,14 @@ cron.example      text eol=lf
 logrotate.example text eol=lf
 *.env.example     text eol=lf
 
-# The CLI entrypoint carries a `#!/usr/bin/env node` shebang and is executed
-# directly on Linux — a CRLF first line breaks it, so it gets an explicit
+# The CLI entrypoint and the deploy-time state DB tool both carry a
+# `#!/usr/bin/env node` shebang and ship to the Linux host — a CRLF first line
+# breaks direct execution, and the deploy hygiene suite additionally asserts
+# state-db-tool.js is LF-only on every checkout — so each gets an explicit
 # forced-LF rule. Broader `*.js` / `*.json` / `*.md` eol rules are
 # deliberately NOT used: releases are installed from a git checkout on the
 # Linux host (which materializes LF from the normalized repository content),
 # and Node parses CRLF in ordinary source files anyway — only the shebang
 # line is execution-critical.
-bin/seo-audit-runner.js text eol=lf
+bin/seo-audit-runner.js  text eol=lf
+deploy/state-db-tool.js  text eol=lf

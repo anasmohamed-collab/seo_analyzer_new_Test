@@ -139,17 +139,32 @@ export function checkDatabase(config, { integrity = false, logger = null } = {})
   return checks;
 }
 
-/** systemd status, best effort — absent systemctl is not a failure. */
+/**
+ * systemd status, best effort — absent systemctl is not a failure.
+ *
+ * seo-runner-tick.timer is the single scheduling authority; any superseded
+ * timer from an earlier multi-timer install that is still ENABLED would
+ * duplicate it, so it is reported as a failure rather than as information.
+ */
+const SUPERSEDED_TIMERS = ['seo-audit-runner.timer', 'seo-runner-retry.timer'];
+
 export function checkSystemdUnits() {
   const probe = spawnSync('systemctl', ['--version'], { encoding: 'utf8', shell: false });
   if (probe.error || probe.status !== 0) {
     return [warn('systemd', 'systemctl not available (skipped — expected outside Linux/systemd hosts)')];
   }
-  const checks = [];
-  for (const unit of ['seo-audit-runner.timer', 'seo-runner-retry.timer', 'seo-runner-tick.timer']) {
+  const unitState = (unit) => {
     const r = spawnSync('systemctl', ['is-enabled', unit], { encoding: 'utf8', shell: false });
-    const state = (r.stdout || r.stderr || '').trim() || 'unknown';
-    checks.push(ok('systemd', `${unit}: ${state}`));
+    return (r.stdout || r.stderr || '').trim() || 'unknown';
+  };
+
+  const checks = [ok('systemd', `seo-runner-tick.timer: ${unitState('seo-runner-tick.timer')}`)];
+  for (const unit of SUPERSEDED_TIMERS) {
+    if (unitState(unit) === 'enabled') {
+      checks.push(
+        fail('systemd', `${unit} is enabled — it duplicates seo-runner-tick.timer, the only scheduling authority`),
+      );
+    }
   }
   return checks;
 }

@@ -37,10 +37,13 @@ Environment variables
 
 import os
 import re
+import ipaddress
+import socket
 import time
 import logging
 import threading
 import traceback
+from urllib.parse import urlsplit
 
 from flask import Flask, jsonify, request
 
@@ -50,6 +53,85 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("scrapling-sidecar")
+
+_METADATA_HOSTS = {
+    "metadata",
+    "metadata.google.internal",
+    "instance-data",
+    "instance-data.ec2.internal",
+}
+_RESERVED_HOST_SUFFIXES = (".localhost", ".local", ".internal", ".home.arpa")
+_EXPLICIT_BLOCKS = tuple(
+    ipaddress.ip_network(network)
+    for network in (
+        "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+        "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24",
+        "192.0.2.0/24", "192.88.99.0/24", "192.168.0.0/16",
+        "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24",
+        "224.0.0.0/4", "240.0.0.0/4",
+        "::/96", "100::/64", "2001::/23", "2001:db8::/32",
+        "2002::/16", "3fff::/20", "5f00::/16", "fc00::/7",
+        "fe80::/10", "ff00::/8", "64:ff9b:1::/48",
+    )
+)
+
+
+class UnsafeOutboundUrl(ValueError):
+    """Raised when a sidecar target violates the outbound network policy."""
+
+
+def _is_public_address(raw_address: str) -> bool:
+    try:
+        address = ipaddress.ip_address(raw_address.split("%", 1)[0])
+    except ValueError:
+        return False
+    if any(address in network for network in _EXPLICIT_BLOCKS if address.version == network.version):
+        return False
+    if isinstance(address, ipaddress.IPv6Address):
+        mapped = address.ipv4_mapped
+        if mapped is not None and not _is_public_address(str(mapped)):
+            return False
+        nat64 = ipaddress.ip_network("64:ff9b::/96")
+        if address in nat64:
+            embedded = ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
+            if not _is_public_address(str(embedded)):
+                return False
+    return address.is_global
+
+
+def validate_outbound_url(raw_url: str) -> str:
+    """Resolve A/AAAA records and reject every non-public destination."""
+    try:
+        parsed = urlsplit(raw_url)
+        hostname = (parsed.hostname or "").rstrip(".").lower()
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except (TypeError, ValueError) as exc:
+        raise UnsafeOutboundUrl("invalid outbound URL") from exc
+
+    if parsed.scheme not in ("http", "https") or not hostname:
+        raise UnsafeOutboundUrl("outbound URL must use HTTP or HTTPS")
+    if (
+        hostname == "localhost"
+        or hostname in _METADATA_HOSTS
+        or hostname.endswith(_RESERVED_HOST_SUFFIXES)
+    ):
+        raise UnsafeOutboundUrl(f"reserved outbound hostname: {hostname}")
+
+    try:
+        literal = ipaddress.ip_address(hostname)
+        addresses = {str(literal)}
+    except ValueError:
+        try:
+            answers = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise UnsafeOutboundUrl(f"outbound hostname did not resolve: {hostname}") from exc
+        addresses = {answer[4][0] for answer in answers}
+
+    if not addresses:
+        raise UnsafeOutboundUrl(f"outbound hostname has no A or AAAA records: {hostname}")
+    if any(not _is_public_address(address) for address in addresses):
+        raise UnsafeOutboundUrl(f"outbound hostname resolves to a non-public address: {hostname}")
+    return raw_url
 
 # ── Stealth concurrency limiter ──────────────────────────────────────────────
 # Headless browsers consume ~300-500 MB RAM each; limit parallel instances.
@@ -84,7 +166,7 @@ _CHALLENGE_TITLES_RE = re.compile(
     r"verify you are human"
     r"|human verification"
     r"|bot check"
-    r"|ddos protection(?: by \w+)?"
+    r"|ddos protection(?: by [\w][\w .&-]{0,60})?"
     r"|please verify you are(?: a)? human"
     r"|you have been blocked"
     r"|browser integrity check"
@@ -148,6 +230,7 @@ def _do_fetch(
     Perform one fetch attempt.  Raises on network/browser failure.
     Returns a plain dict with html, status, headers, url, elapsed_ms.
     """
+    validate_outbound_url(url)
     start = time.time()
 
     if use_stealth:
@@ -165,6 +248,10 @@ def _do_fetch(
     status = int(page.status) if hasattr(page, "status") else 200
     headers = dict(page.headers) if hasattr(page, "headers") else {}
     final_url = str(page.url) if hasattr(page, "url") else url
+    # Headless libraries may perform redirects internally. Reject an unsafe
+    # reported destination and rely on mandatory container egress controls to
+    # close the browser-level DNS-rebinding window.
+    validate_outbound_url(final_url)
     elapsed_ms = round((time.time() - start) * 1000)
 
     return {
@@ -193,6 +280,10 @@ def fetch_url():
     url = (body.get("url") or "").strip()
     if not url:
         return jsonify({"error": "url is required"}), 400
+    try:
+        validate_outbound_url(url)
+    except UnsafeOutboundUrl as exc:
+        return jsonify({"error": str(exc)}), 400
 
     timeout = min(max(int(body.get("timeout", 25)), 1), 60)
     user_agent: str | None = body.get("user_agent")

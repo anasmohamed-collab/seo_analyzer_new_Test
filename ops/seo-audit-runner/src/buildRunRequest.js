@@ -2,9 +2,9 @@
  * Build the POST /api/technical-analyzer/run request body for a project.
  *
  * Source 1: the project's stored last_form_values.
- * Source 2 (read-only fallback): the previous COMPLETED audit's page types
- *           from GET /api/projects/:id/audits/latest — used only when it
- *           clearly contains an existing homepage AND article URL.
+ * Source 2 (manual opt-in only): the previous COMPLETED audit's page types
+ *           from GET /api/projects/:id/audits/latest — used only when an
+ *           operator explicitly requests it for a single-project run.
  *
  * We never guess, generate, crawl, or derive a new article URL.
  */
@@ -91,9 +91,21 @@ export function buildFromLatestAudit(latest) {
 /**
  * @returns {Promise<{ok: true, body, source} | {ok: false, reason: 'SKIPPED_MISSING_AUDIT_CONFIG', detail: string}>}
  */
-export async function buildRunRequest(project, apiClient, { signal, logger } = {}) {
+export async function buildRunRequest(
+  project,
+  apiClient,
+  { signal, logger, allowHistoricalFallback = false } = {},
+) {
   const fromForm = buildFromFormValues(project);
   if (fromForm) return { ok: true, ...fromForm };
+
+  if (!allowHistoricalFallback) {
+    return {
+      ok: false,
+      reason: 'SKIPPED_MISSING_AUDIT_CONFIG',
+      detail: 'no usable stored homeUrl + articleUrl pair; historical audit fallback is disabled',
+    };
+  }
 
   let latest = null;
   try {
@@ -110,6 +122,6 @@ export async function buildRunRequest(project, apiClient, { signal, logger } = {
     reason: 'SKIPPED_MISSING_AUDIT_CONFIG',
     detail:
       'no usable homeUrl + articleUrl pair in last_form_values, and the latest completed audit ' +
-      'does not clearly contain both a home and an article page',
+      'does not clearly contain both a home and an article page for the explicit manual fallback',
   };
 }

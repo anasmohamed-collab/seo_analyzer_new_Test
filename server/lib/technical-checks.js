@@ -7,6 +7,8 @@
  * are resolved via the async `runRemoteChecks`).
  */
 
+import { safeFetch as fetch } from '../../shared/outbound-url-safety.js';
+
 // ── HTML helpers ────────────────────────────────────────────────
 
 export function extractTextContent(html) {

@@ -10,6 +10,8 @@ node_modules
 dist
 dist-ssr
 backend/dist
+__pycache__/
+*.py[cod]
 *.local
 
 .vscode/*
@@ -21,5 +23,11 @@ backend/dist
 *.njsproj
 *.sln
 *.sw?
+.env
 .env.local
 !.env.example
+
+# CLI run artifacts written by --json (audit-config:discover, smacient:gsc-sync)
+/*-apply-summary.json
+/*-dry-run-summary.json
+/*-sync-summary.json

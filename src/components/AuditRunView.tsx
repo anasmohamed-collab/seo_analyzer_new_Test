@@ -4,32 +4,9 @@ import {
   Copy, Check, Shield, Map, Loader2, AlertCircle,
 } from 'lucide-react';
 import AiAssist from './AiAssist';
+import type { AuditRunData, AuditResultRow, Recommendation } from '../types/audit';
 
 /* ── Types ────────────────────────────────────────────────────── */
-
-interface Recommendation {
-  priority: string;
-  area: string;
-  message: string;
-  fixHint: string;
-}
-
-interface AuditResultRow {
-  id: string;
-  url: string;
-  status: string | null;
-  data: Record<string, unknown> | null;
-  recommendations: Recommendation[] | null;
-}
-
-interface AuditRunData {
-  id: string;
-  status: string;
-  siteChecks: Record<string, unknown> | null;
-  siteRecommendations: Recommendation[];
-  resultsByType: Record<string, AuditResultRow[]>;
-  results: AuditResultRow[];
-}
 
 /* ── Small UI helpers ─────────────────────────────────────────── */
 

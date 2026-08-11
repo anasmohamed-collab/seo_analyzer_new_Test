@@ -19,7 +19,29 @@
 # Staged-test overrides: --destdir (systemctl is skipped when unavailable).
 set -Eeuo pipefail
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# Guarantee core system utilities (sed, realpath, id, mktemp, cat, …)
+# resolve even when invoked with a minimal or reset PATH. The caller's PATH
+# is kept FIRST so operator overrides and the rootless deployment tests'
+# mocked commands still take precedence; standard system directories are
+# only appended as a fallback.
+# Drop Windows system directories (their find.exe/sort.exe/tar.exe shadow
+# the GNU tools) before appending the standard system directories.
+seo_path=; seo_ifs=$IFS; IFS=:
+for seo_d in ${PATH:-}; do
+  case $seo_d in ''|/[A-Za-z]/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]|/[A-Za-z]/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]/*|[A-Za-z]:/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]|[A-Za-z]:/[Ww][Ii][Nn][Dd][Oo][Ww][Ss]/*) continue ;; esac
+  seo_path=${seo_path:+$seo_path:}$seo_d
+done
+IFS=$seo_ifs
+export PATH="${seo_path:+$seo_path:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+unset seo_path seo_ifs seo_d
+
+# Resolve this script's own directory with shell builtins only, so the
+# bootstrap never depends on `dirname` being on PATH.
+SCRIPT_SOURCE=${BASH_SOURCE[0]:-$0}
+case $SCRIPT_SOURCE in
+  */*) SCRIPT_DIR=$(CDPATH= cd -- "${SCRIPT_SOURCE%/*}" && pwd) ;;
+  *)   SCRIPT_DIR=$(CDPATH= cd -- . && pwd) ;;
+esac
 # shellcheck source=path-safety.sh
 . "$SCRIPT_DIR/path-safety.sh"
 
@@ -65,7 +87,10 @@ else
   WRAPPER=$DESTDIR_CANON/usr/local/bin/seo-audit-runner
   SYSTEMD_DIR=$DESTDIR_CANON/etc/systemd/system
 fi
-UNITS='seo-audit-runner.timer seo-audit-runner.service seo-runner-retry.timer seo-runner-retry.service seo-runner-tick.timer seo-runner-tick.service'
+# The tick timer/service is the only unit installed today; the other four
+# are superseded units from earlier multi-timer installs and stay on this
+# list so an uninstall cleans a host that still carries them.
+UNITS='seo-runner-tick.timer seo-runner-tick.service seo-audit-runner.timer seo-audit-runner.service seo-runner-retry.timer seo-runner-retry.service'
 
 # ── Validate the one recursive deletion target BEFORE any change ───
 OPT_CANON=

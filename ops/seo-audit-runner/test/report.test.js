@@ -1,6 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { computeExitCode, summarize, formatTextReport, OUTCOME, EXIT_CODES } from '../src/report.js';
+import {
+  computeExitCode,
+  executionFinalStatus,
+  summarize,
+  formatTextReport,
+  OUTCOME,
+  EXIT_CODES,
+} from '../src/report.js';
 import { formatSlackText } from '../src/notifier.js';
 
 const reportWith = (entries, criticalIssues = [], over = {}) => ({
@@ -55,6 +62,7 @@ test('exit 2 when an audit failed, timed out, or trigger outcome is unknown', ()
     OUTCOME.TRIGGER_FAILED,
     OUTCOME.TRIGGER_OUTCOME_UNKNOWN,
     OUTCOME.RUNNER_ERROR,
+    OUTCOME.INCOMPLETE_EVIDENCE,
   ]) {
     const report = reportWith([entry(OUTCOME.COMPLETED), entry(outcome, { projectId: 'p2' })]);
     assert.equal(computeExitCode(report), EXIT_CODES.AUDIT_FAILURES, outcome);
@@ -84,6 +92,43 @@ test('skips and dedups alone are not failures', () => {
   assert.equal(computeExitCode(report), EXIT_CODES.OK);
 });
 
+test('canonical summary distinguishes failure, timeout, unknown, deferred, and skipped', () => {
+  const report = reportWith(
+    [
+      entry(OUTCOME.TRIGGER_FAILED),
+      entry(OUTCOME.RUNNER_ERROR, { projectId: 'p2' }),
+      entry(OUTCOME.TIMED_OUT, { projectId: 'p3' }),
+      entry(OUTCOME.TRIGGER_OUTCOME_UNKNOWN, { projectId: 'p4' }),
+      entry(OUTCOME.SKIPPED_ALREADY_RUNNING, { projectId: 'p5' }),
+      entry(OUTCOME.INELIGIBLE, { projectId: 'p6' }),
+    ],
+    [],
+    { discoveredProjects: 7, eligibleProjects: 5, attemptedProjects: 4 },
+  );
+  const summary = summarize(report);
+  assert.equal(summary.discovered, 7);
+  assert.equal(summary.eligible, 5);
+  assert.equal(summary.attempted, 4);
+  assert.equal(summary.completed, 0);
+  assert.equal(summary.deferred, 1);
+  assert.equal(summary.skipped, 1);
+  assert.equal(summary.failed, 2, 'TRIGGER_FAILED and RUNNER_ERROR are canonical failures');
+  assert.equal(summary.timedOut, 1);
+  assert.equal(summary.triggerUnknown, 1);
+  assert.equal(summary.failures, 4);
+  assert.equal(executionFinalStatus(report), 'FAILED');
+  assert.match(formatTextReport(report), /failed: 2/);
+});
+
+test('a defer-only execution is persisted distinctly from success or failure', () => {
+  const report = reportWith(
+    [entry(OUTCOME.SKIPPED_ALREADY_RUNNING)],
+    [],
+    { discoveredProjects: 1, eligibleProjects: 1, attemptedProjects: 0 },
+  );
+  assert.equal(executionFinalStatus(report), 'DEFERRED');
+});
+
 test('summarize counts outcomes', () => {
   const s = summarize(
     reportWith(
@@ -99,7 +144,8 @@ test('summarize counts outcomes', () => {
   assert.equal(s.total, 4);
   assert.equal(s.completed, 1);
   assert.equal(s.deduplicated, 1);
-  assert.equal(s.skipped, 1);
+  assert.equal(s.deferred, 1);
+  assert.equal(s.skipped, 1, 'the deduplicated project is a skipped target');
   assert.equal(s.failures, 1);
   assert.equal(s.criticalIssues, 1);
 });

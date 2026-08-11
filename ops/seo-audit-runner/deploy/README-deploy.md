@@ -1,12 +1,17 @@
 # Deployment Contracts — SEO Audit Runner
 
-Status: **approved contract** (Phase 4A, paths corrected). This file defines
-the target layout and the behavioral contracts that the Phase 4B–4E scripts
-must implement. No script referenced here exists yet; nothing in this
-document is executable.
+Status: **approved contract, and now implemented.** This file defines the
+target layout and the behavioral contracts; every script referenced here
+exists under `deploy/` and is covered by tests. Read this to understand *what
+the scripts guarantee*; for the commands to run, use
+`deploy/SERVER-HANDOVER.md` (installation) and
+`../docs/OPERATIONS_RUNBOOK.md` (backup, restore, upgrade, rollback,
+emergency disable).
 
 Architecture decision and isolation rules: `../docs/DEPLOYMENT_ARCHITECTURE.md`.
 Safety gates: `../docs/PRODUCTION_GATES.md`.
+CLI/exit-code specification: `../docs/CLI_CONTRACT.md`.
+Readiness status: `../docs/READINESS_MATRIX.md`.
 
 ## 1. Production installation layout
 
@@ -22,7 +27,7 @@ Safety gates: `../docs/PRODUCTION_GATES.md`.
 | `/var/lib/seo-audit-runner/backups/`        | operational state backups        | `seo-runner:seo-runner` | 0700 |
 | `/var/log/seo-audit-runner/`                | OPTIONAL file-log dir (cron mode / redirected output) | `seo-runner:seo-runner` | 0750 |
 | `/run/seo-audit-runner/`                    | ephemeral runtime dir (PID/lock TARGET — see §2a) | `seo-runner:seo-runner` | 0750 |
-| systemd units in `/etc/systemd/system/`     | service + timers (Phase 4C)      | `root:root`        | 0644  |
+| systemd units in `/etc/systemd/system/`     | `seo-runner-tick.{timer,service}` — the only two | `root:root`        | 0644  |
 
 Notes:
 - Releases are immutable: an upgrade installs a new `releases/<stamp>/` and
@@ -37,9 +42,10 @@ Notes:
   logs to stdout/stderr and must never REQUIRE file logging when run through
   systemd. `/var/log/seo-audit-runner/` exists only for cron mode, redirected
   output, or operator-managed file logging; whoever redirects output there
-  owns rotation (a `logrotate.example` may ship in a later phase).
+  owns rotation — install `deploy/logrotate.example` as
+  `/etc/logrotate.d/seo-audit-runner`.
 - `/run/seo-audit-runner/` is tmpfs-backed and recreated at boot (via systemd
-  `RuntimeDirectory=seo-audit-runner` in Phase 4C). See §2a for the lock-file
+  `RuntimeDirectory=seo-audit-runner` in the tick service). See §2a for the lock-file
   transition caveat.
 - A non-root "user mode" install (everything under `~/seo-audit-runner/`,
   cron instead of system units) is a documented degraded option for hosts
@@ -68,7 +74,7 @@ Notes:
   `RUNNER_LOCK_DIR=/run/seo-audit-runner`) — which is a **Phase 4F
   implementation item** with its own tests.
 - **Until that code change is implemented and tested, deployment scripts and
-  units MUST NOT pretend the runner supports it**: Phase 4B–4E artifacts
+  units MUST NOT pretend the runner supports it**: the shipped artifacts
   treat the lock as living in `/var/lib/seo-audit-runner/` (the state dir),
   and `/run/seo-audit-runner/` is provisioned but unused. After Phase 4F,
   `runner.env` gains `RUNNER_LOCK_DIR=/run/seo-audit-runner` explicitly.
@@ -90,25 +96,40 @@ Notes:
   `/etc/seo-audit-runner/runner.env` (0640) — never in argv, unit files,
   SQLite, or logs (the runner already redacts them in its logger).
 
-## 4. Scheduling contract
+## 4. Scheduling contract — one authority
 
-- Daily audit: `seo-audit-runner.timer` → `seo-audit-runner.service`
-  (`run --all`), **03:00 Africa/Cairo**, `RandomizedDelaySec` small,
-  `Persistent=true`.
-- Hourly retry: `seo-runner-retry.timer` → `seo-runner-retry.service`
-  (`retry-notifications`).
-- **Both timers ship disabled.** Installation never enables scheduling
-  automatically. If a later phase adds an explicit administrator opt-in flag
-  (e.g. `--enable-timers`), it must still refuse to act unless the Gate 6/7
-  production validation in `docs/PRODUCTION_GATES.md` has been completed.
-- Timezone: either set the host to `Africa/Cairo`, or use
-  `OnCalendar=*-*-* 03:00:00 Africa/Cairo` (systemd ≥ 235). Exactly one
-  scheduling mechanism per command per host — cron and systemd must never be
-  enabled for the same runner command simultaneously.
-- Cron fallback (documented, not installed): the two crontab lines shipped as
-  `deploy/cron.example` in Phase 4C.
+**There is exactly ONE production scheduling authority:**
 
-## 5. Installation contract (Phase 4B script `install.sh`)
+    seo-runner-tick.timer → seo-runner-tick.service → seo-audit-runner worker --once
+
+- `deploy/systemd/` ships those two unit files and nothing else. There is no
+  daily `run --all` timer and no separate notification-retry timer; a host
+  that still carries `seo-audit-runner.timer`/`.service` or
+  `seo-runner-retry.timer`/`.service` from an earlier install is
+  **misconfigured** — `install.sh` warns about them, `smoke-test.sh` fails,
+  and `doctor` fails if such a timer is enabled. Remove them.
+- **The tick owns the whole cycle**, in this order, every 5 minutes:
+  crash recovery → stale-execution recovery → due schedules (at most one job
+  per occurrence) → queued jobs (sequential, under the runner's process
+  lock) → retryable Slack notification delivery. That is why one timer is
+  enough. See `docs/JOBS_AND_SCHEDULES.md`.
+- **The timer ships disabled.** Installation never enables scheduling
+  automatically and never invokes `systemctl`. Enabling requires the
+  pre-enable validation in `deploy/SERVER-HANDOVER.md` §7 plus the Gate 5–7
+  production validation in `docs/PRODUCTION_GATES.md`. If a later phase adds
+  an explicit opt-in installer flag, it must still enforce those gates.
+- **Audit times are not in the unit files.** They live in the runner's own
+  schedules (`seo-audit-runner schedule create --frequency daily --at 03:00
+  --all`), each carrying its own IANA timezone (default `Africa/Cairo`), so
+  DST is handled by the runner and the host timezone does not matter.
+  Occurrences missed while the host was down are caught up at most once
+  within 24 h; `Persistent=false` on the timer is deliberate.
+- **Cron is mutually exclusive with systemd**, documentation only, and only
+  for hosts *without* systemd: the single commented tick line in
+  `deploy/cron.example`. No script ever writes `/etc/cron.d` or calls
+  `crontab`. Never schedule the same runner command twice on one host.
+
+## 5. Installation contract (`install.sh` — implemented)
 
 - Idempotent: re-running against the same release is a no-op; against a new
   release it behaves as upgrade §7.
@@ -118,12 +139,14 @@ Notes:
 - Writes `/etc/seo-audit-runner/runner.env` only from a provided template if
   absent; **an existing `runner.env` is always preserved, never overwritten**.
   The template sets `RUNNER_STATE_DIR=/var/lib/seo-audit-runner`.
-- Installs systemd units (Phase 4C) but **never enables or starts timers**.
+- Installs the two tick unit files but **never enables or starts the timer**
+  (and never invokes `systemctl` at all); warns if superseded unit files
+  from an older multi-timer install are still present.
 - Ends by running `seo-audit-runner validate-config` as `seo-runner` and
   reporting the result. Install fails loudly if validation fails.
 - Touches nothing outside the paths in §1.
 
-## 6. Backup and restore contracts (Phase 4D)
+## 6. Backup and restore contracts (implemented)
 
 Backup (`backup.sh`):
 - Source: the state directory `/var/lib/seo-audit-runner/` only — SQLite
@@ -170,7 +193,7 @@ Restore (`restore.sh`):
 - Rollback of a bad restore = swap the `state.pre-restore-<stamp>` directory
   back.
 
-## 7. Upgrade and rollback contracts (Phase 4E)
+## 7. Upgrade and rollback contracts (implemented)
 
 Upgrade (`upgrade.sh`):
 1. `backup.sh` (mandatory pre-upgrade backup; abort on failure),
@@ -191,7 +214,7 @@ Rollback (`rollback.sh`):
   step 1). The script must detect a schema version newer than the rolled-back
   code supports and instruct the operator instead of guessing.
 
-## 8. Uninstall and purge contracts (Phase 4E)
+## 8. Uninstall and purge contracts (implemented)
 
 Uninstall (`uninstall.sh`) — non-destructive:
 - Stops and disables units, removes unit files, removes `/opt/seo-audit-runner`
