@@ -190,8 +190,12 @@ WRAPPER_DST=$BIN_DIR/seo-audit-runner
 
 # ── Failure cleanup: never leave a half-copied release behind ──────
 CLEANUP_RELEASE=
+CLEANUP_TMPFILE=
 on_exit() {
   status=$1
+  if [ -n "$CLEANUP_TMPFILE" ]; then
+    rm -f -- "$CLEANUP_TMPFILE"
+  fi
   if [ "$status" -ne 0 ]; then
     if [ -n "$CLEANUP_RELEASE" ] && [ -e "$CLEANUP_RELEASE" ]; then
       rm -rf -- "$CLEANUP_RELEASE"
@@ -341,30 +345,93 @@ if [ -n "$GIT_SHA" ]; then
   GIT_SHA_SOURCE=explicit
 fi
 
-# Is the runner source inside a git worktree we can interrogate?
+# The exact source paths this installer reads to produce an install. The
+# parity gate below is only as honest as this list, so each entry names the
+# operation that consumes it — keep them in sync when adding a copy site:
+#
+#   bin, src, package.json, README.md, docs  → copied into the release dir
+#   config/seo-audit-runner.env.example      → seeds $ENV_DST when absent
+#   deploy/seo-audit-runner-wrapper.sh       → installed as $WRAPPER_DST
+#   deploy/systemd                           → units installed into $SYSTEMD_DST
+#   deploy/cron.example, logrotate.example   → reference copies into $ETC_DIR
+#   deploy/check-node.sh                     → executed to validate Node
+#
+# Entries may legitimately be absent (README.md, docs and the optional deploy
+# examples are all conditional). Git tolerates a pathspec matching nothing, and
+# passing an absent-but-tracked path is exactly what lets the gate catch a
+# DELETED deployment input. Everything NOT listed here is out of scope by
+# design: test/, tools/, state/, node_modules/ and .env are never installed, so
+# scratch files there must not block a legitimate install.
+DEPLOY_INPUTS="
+bin
+src
+package.json
+README.md
+docs
+config/seo-audit-runner.env.example
+deploy/seo-audit-runner-wrapper.sh
+deploy/check-node.sh
+deploy/systemd
+deploy/cron.example
+deploy/logrotate.example
+"
+
+# Run a git command against SOURCE_DIR, capturing stdout in GIT_PARITY_OUT.
+# Any non-zero exit ABORTS the install: a parity verdict must never be inferred
+# from a git error. `2>/dev/null || true` here would turn "git could not tell
+# us" into "the tree is clean" — the precise fail-open this gate exists to
+# prevent. Callers pass DEPLOY_INPUTS unquoted so it word-splits into separate
+# pathspec arguments; this is intentional and safe (no path contains whitespace).
+GIT_PARITY_OUT=
+git_parity() { # <git args...> — aborts the install on any git failure
+  if ! GIT_PARITY_OUT=$(git -C "$SOURCE_DIR" "$@" 2>"$CLEANUP_TMPFILE"); then
+    printf 'install.sh: ERROR: `git %s` failed in %s:\n' "$*" "$SOURCE_DIR" >&2
+    sed 's/^/install.sh:   /' <"$CLEANUP_TMPFILE" >&2
+    fail "cannot verify that the runner source matches its Git commit, so the commit recorded in .release-sha cannot be trusted — refusing to install. Repair the repository, or install from a clean non-git export with --git-sha <full-sha>."
+  fi
+}
+
+# Is the runner source inside a git worktree we can interrogate? A `.git` that
+# exists but cannot be read is NOT an archive install — falling through to the
+# archive path there would skip every parity check on a repository we simply
+# failed to open, so it is a hard error.
 source_is_git_worktree=0
-if command -v git >/dev/null 2>&1 &&
-   git -C "$SOURCE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
-  source_is_git_worktree=1
+if command -v git >/dev/null 2>&1; then
+  if git -C "$SOURCE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    source_is_git_worktree=1
+  elif [ -e "$SOURCE_DIR/.git" ]; then
+    fail "$SOURCE_DIR contains .git but git cannot open it as a repository. Refusing to guess: repair the repository, or install from a clean export with no .git and an explicit --git-sha <full-sha>."
+  fi
+elif [ -e "$SOURCE_DIR/.git" ]; then
+  fail "$SOURCE_DIR is a git worktree but no git binary is available to verify it matches its commit. Install git, or install from a clean export with no .git and an explicit --git-sha <full-sha>."
 fi
 
 if [ "$source_is_git_worktree" -eq 1 ]; then
   # A git worktree can prove what it contains — so it must. Installing modified
   # files while recording the clean HEAD would make the parity gate assert a
-  # commit whose contents are NOT what is running. This check happens BEFORE any
-  # release directory is created or the `current` symlink is moved, so a
-  # rejected install leaves the active release untouched.
-  head_sha=$(normalize_git_sha "$(git -C "$SOURCE_DIR" rev-parse HEAD 2>/dev/null || true)")
-  [ -n "$head_sha" ] || fail "runner source is a git worktree but HEAD could not be read as a full SHA (unborn branch or corrupt repository). Use --git-sha <full-sha> with a non-git source tree instead."
+  # commit whose contents are NOT what is running. Every check here happens
+  # BEFORE any release directory is created or the `current` symlink is moved,
+  # so a rejected install leaves the active release untouched.
+  CLEANUP_TMPFILE=$(mktemp) || fail "could not create a temporary file for git error capture"
 
-  # Scoped to the runner source directory: staged, unstaged AND untracked.
-  # `--porcelain` reports all three; `-- .` limits it to this subtree so an
-  # unrelated edit elsewhere in a monorepo does not block a runner install.
-  dirty=$(git -C "$SOURCE_DIR" status --porcelain --untracked-files=normal -- . 2>/dev/null || true)
+  git_parity rev-parse HEAD
+  head_sha=$(normalize_git_sha "$GIT_PARITY_OUT")
+  [ -n "$head_sha" ] || fail "runner source is a git worktree but HEAD did not resolve to a full SHA (unborn branch?), got: $GIT_PARITY_OUT. Use --git-sha <full-sha> with a non-git source tree instead."
+
+  # Parity, scoped to the deployment inputs above:
+  #   --untracked-files=all  every untracked file individually, not just its dir
+  #   --ignored=matching     ignored files too — `cp -R` copies them into the
+  #                          release even though plain `git status` hides them,
+  #                          so an ignored build artifact under src/ would
+  #                          otherwise ship inside a release labelled with a
+  #                          commit that never contained it
+  git_parity status --porcelain --untracked-files=all --ignored=matching -- $DEPLOY_INPUTS
+  dirty=$GIT_PARITY_OUT
   if [ -n "$dirty" ]; then
-    printf 'install.sh: ERROR: runner source tree has uncommitted changes:\n' >&2
+    printf 'install.sh: ERROR: runner deployment inputs have uncommitted changes vs commit %s:\n' "$head_sha" >&2
     printf '%s\n' "$dirty" | sed 's/^/install.sh:   /' >&2
-    fail "refusing to install from a dirty git worktree — .release-sha would record $head_sha while installing different files, and the REPO_SHA == APP_SHA == RUNNER_SHA gate would silently pass on a lie. Commit or stash the changes, or install from a clean export with --git-sha <full-sha>."
+    printf 'install.sh: ERROR: (XY codes: M/A/D/R staged, space+M unstaged, ?? untracked, !! ignored-but-copied)\n' >&2
+    fail "refusing to install from a dirty git worktree — .release-sha would record $head_sha while installing different files, and the REPO_SHA == APP_SHA == RUNNER_SHA gate would silently pass on a lie. Commit, stash or remove the listed paths, or install from a clean export with --git-sha <full-sha>."
   fi
 
   if [ -n "$EXPLICIT_GIT_SHA" ] && [ "$EXPLICIT_GIT_SHA" != "$head_sha" ]; then

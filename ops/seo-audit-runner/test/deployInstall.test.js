@@ -578,3 +578,167 @@ test('an unknown SHA is visible in version output rather than hidden', { skip: g
   assert.equal(json.data.gitSha, null);
   assert.equal(json.data.gitShaSource, null);
 });
+
+// ── Source-parity gate: fail-closed, scoped to real deployment inputs ──
+//
+// The gate must answer one question honestly: does the tree we are about to
+// copy match the commit we are about to record in .release-sha? Two ways it
+// used to answer "yes" wrongly are pinned below — an ignored file that
+// `git status` hides but `cp -R` copies, and a git invocation that ERRORS
+// while `2>/dev/null || true` reports clean.
+
+/** Install once from a clean checkout; return the resulting active release. */
+function installedBaseline(fx) {
+  const base = ownGitSource();
+  const r = install(fx, ['--source', toPosix(base.dir)]);
+  assert.equal(r.status, 0, r.output);
+  return {
+    base,
+    release: activeRelease(fx),
+    sha: readReleaseSha(fx),
+    count: fs.readdirSync(fx.releases).length,
+  };
+}
+
+/** Assert a rejected install left the previously active release untouched. */
+function assertBaselineIntact(fx, baseline, r) {
+  assert.notEqual(r.status, 0, r.output);
+  assert.equal(activeRelease(fx), baseline.release, 'active release must not move');
+  assert.equal(readReleaseSha(fx), baseline.sha, '.release-sha must not change');
+  assert.equal(
+    fs.readdirSync(fx.releases).length, baseline.count,
+    'no new release directory may survive a rejected install',
+  );
+}
+
+test('an IGNORED untracked file inside a copied path is rejected', { skip: gitSkip }, () => {
+  const fx = fixture();
+  const baseline = installedBaseline(fx);
+
+  // A .gitignore rule makes the artifact invisible to plain `git status`,
+  // but `cp -R -- "$SOURCE_DIR/src"` copies it into the release regardless.
+  const src = ownGitSource();
+  fs.writeFileSync(path.join(src.dir, '.gitignore'), 'build-artifact.js\n');
+  git(src.dir, ['add', '.gitignore']);
+  git(src.dir, ['commit', '-q', '-m', 'add ignore rule']);
+  const head = git(src.dir, ['rev-parse', 'HEAD']);
+  fs.writeFileSync(path.join(src.dir, 'src', 'build-artifact.js'), 'export const sneaky = 1;\n');
+
+  // Premise: plain `git status` really does hide it — otherwise this test
+  // would pass for the wrong reason.
+  assert.equal(
+    spawnSync('git', ['status', '--porcelain', '--untracked-files=normal', '--', '.'],
+      { cwd: src.dir, encoding: 'utf8' }).stdout.trim(),
+    '', 'fixture premise: the ignored file must be invisible to plain git status',
+  );
+
+  const r = install(fx, ['--source', toPosix(src.dir)]);
+  assertBaselineIntact(fx, baseline, r);
+  assert.match(r.output, /uncommitted changes/);
+  assert.match(r.output, /build-artifact\.js/);
+  assert.doesNotMatch(readReleaseSha(fx), new RegExp(head), 'the tampered HEAD must not be recorded');
+  assert.ok(
+    !fs.existsSync(path.join(fx.opt, 'current', 'src', 'build-artifact.js')),
+    'the ignored artifact must never reach an active release',
+  );
+});
+
+test('an ignored artifact inside docs/ is rejected too', { skip: gitSkip }, () => {
+  const fx = fixture();
+  const src = ownGitSource();
+  fs.writeFileSync(path.join(src.dir, '.gitignore'), '*.tmp.md\n');
+  git(src.dir, ['add', '.gitignore']);
+  git(src.dir, ['commit', '-q', '-m', 'ignore rule']);
+  fs.mkdirSync(path.join(src.dir, 'docs'), { recursive: true });
+  fs.writeFileSync(path.join(src.dir, 'docs', 'scratch.tmp.md'), '# scratch\n');
+
+  const r = install(fx, ['--source', toPosix(src.dir)]);
+  assert.notEqual(r.status, 0, r.output);
+  assert.match(r.output, /scratch\.tmp\.md/);
+});
+
+test('a git inspection FAILURE is rejected, never treated as clean', { skip: gitSkip }, () => {
+  const fx = fixture();
+  const baseline = installedBaseline(fx);
+
+  const src = ownGitSource();
+  // Tracked content the installer must not ship while claiming it is HEAD.
+  fs.appendFileSync(path.join(src.dir, 'src', 'config.js'), '\n// smuggled edit\n');
+  // A corrupt index is the realistic shape of this failure: refs still parse,
+  // so HEAD resolves, but any working-tree comparison errors out.
+  fs.writeFileSync(path.join(src.dir, '.git', 'index'), 'NOT-A-GIT-INDEX');
+
+  // Premise: HEAD still resolves, and `git status` genuinely fails.
+  assert.equal(git(src.dir, ['rev-parse', 'HEAD']), src.head);
+  assert.notEqual(
+    spawnSync('git', ['status', '--porcelain', '--', '.'], { cwd: src.dir, encoding: 'utf8' }).status,
+    0, 'fixture premise: git status must fail on a corrupt index',
+  );
+
+  const r = install(fx, ['--source', toPosix(src.dir)]);
+  assertBaselineIntact(fx, baseline, r);
+  assert.match(r.output, /cannot verify that the runner source matches its Git commit/);
+  // The smuggled edit must not have reached the still-active release.
+  assert.doesNotMatch(
+    fs.readFileSync(path.join(fx.opt, 'current', 'src', 'config.js'), 'utf8'),
+    /smuggled edit/,
+  );
+});
+
+test('a .git that git cannot open is not silently downgraded to an archive install',
+  { skip: gitSkip }, () => {
+    const fx = fixture();
+    const src = makeArchiveSourceFixture();
+    // A .git that is neither a valid repo nor absent: the archive path would
+    // skip every parity check, so this must be a hard error instead.
+    fs.mkdirSync(path.join(src, '.git'), { recursive: true });
+    fs.writeFileSync(path.join(src, '.git', 'HEAD'), 'garbage\n');
+
+    const r = install(fx, ['--source', toPosix(src), '--git-sha', SHA_A]);
+    assert.notEqual(r.status, 0, r.output);
+    assert.match(r.output, /contains \.git but git cannot open it as a repository/);
+    assert.ok(!fs.existsSync(path.join(fx.opt, 'current')), 'no release may be activated');
+  });
+
+test('out-of-scope working files never block a legitimate install', { skip: gitSkip }, () => {
+  const fx = fixture();
+  const src = ownGitSource();
+  // None of these are copied or installed, so none may veto the install.
+  fs.mkdirSync(path.join(src.dir, 'state'), { recursive: true });
+  fs.writeFileSync(path.join(src.dir, 'state', 'runner-state.sqlite'), 'db\n');
+  fs.mkdirSync(path.join(src.dir, 'node_modules', 'left-pad'), { recursive: true });
+  fs.writeFileSync(path.join(src.dir, 'node_modules', 'left-pad', 'index.js'), 'x\n');
+  fs.mkdirSync(path.join(src.dir, 'test'), { recursive: true });
+  fs.writeFileSync(path.join(src.dir, 'test', 'scratch.test.js'), 'x\n');
+  fs.writeFileSync(path.join(src.dir, '.env'), 'SLACK_TOKEN=xoxb-nope\n');
+  fs.writeFileSync(path.join(src.dir, 'notes.txt'), 'scratch\n');
+
+  const r = install(fx, ['--source', toPosix(src.dir)]);
+  assert.equal(r.status, 0, r.output);
+  assert.equal(readReleaseSha(fx), src.head);
+  // ...and none of it was copied into the release either.
+  for (const stray of ['state', 'node_modules', 'test', '.env', 'notes.txt']) {
+    assert.ok(!fs.existsSync(path.join(fx.opt, 'current', stray)), `${stray} must not be installed`);
+  }
+});
+
+test('a modified INSTALLED deploy artifact is rejected', { skip: gitSkip }, () => {
+  const fx = fixture();
+  const src = ownGitSource();
+  // The wrapper is installed to /usr/local/bin, so it is a deployment input
+  // even though it never lands in the release directory.
+  fs.appendFileSync(path.join(src.dir, 'deploy', 'seo-audit-runner-wrapper.sh'), '\n# edit\n');
+
+  const r = install(fx, ['--source', toPosix(src.dir)]);
+  assert.notEqual(r.status, 0, r.output);
+  assert.match(r.output, /seo-audit-runner-wrapper\.sh/);
+});
+
+test('a DELETED tracked deployment input is rejected', { skip: gitSkip }, () => {
+  const fx = fixture();
+  const src = ownGitSource();
+  fs.rmSync(path.join(src.dir, 'config', 'seo-audit-runner.env.example'));
+
+  const r = install(fx, ['--source', toPosix(src.dir)]);
+  assert.notEqual(r.status, 0, r.output);
+});
