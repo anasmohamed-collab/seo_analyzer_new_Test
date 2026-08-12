@@ -21,11 +21,23 @@ commands pass (see the change summary).
 
 Nothing in this part modifies anything.
 
-- [ ] **A1. Inventory the projects.** `GET /api/projects`. Record, per project:
-      `id`, `domain`, `website_url`, `is_beta`, `last_form_values` (the whole
-      JSON object, verbatim), `running_count`, `stale_running_count`,
-      `completed_count`, `last_audit_at`. Keep this as the rollback reference —
-      you cannot restore `last_form_values` you did not capture.
+- [ ] **A1a. Inventory the projects.** `GET /api/projects` — the list endpoint.
+      Record, per project: `id`, `domain`, `project_name`, `website_url`,
+      `is_beta`, `last_form_values` (the whole JSON object, verbatim),
+      `audit_count`, `completed_count`, `last_audit_at`. Keep this as the
+      rollback reference — you cannot restore `last_form_values` you did not
+      capture.
+- [ ] **A1b. Check per-project audit state.** `GET /api/projects/:id`, once per
+      project ID from A1a. **`running_count` and `stale_running_count` come
+      from this per-project endpoint only — the list endpoint does not return
+      them.** Record both, plus `audit_count` and `completed_count`.
+
+      `running_count > 0` means a genuinely active audit; the runner skips the
+      project while that holds. `stale_running_count > 0` means one or more
+      rows are stuck RUNNING past the cutoff — those no longer block the
+      runner, and the next POST recovers them under the domain lock. A project
+      with a persistently non-zero `stale_running_count` across several checks
+      is worth investigating before you widen the rollout.
 - [ ] **A2. Confirm each Beta/Next environment from evidence**, not from the
       hostname. Acceptable evidence: the project's own configuration, Google
       Search Console property ownership/coverage, or an explicit statement from
@@ -60,10 +72,10 @@ Nothing in this part modifies anything.
 - [ ] **B1. Patch confirmed non-production environments** to `is_beta=true`
       using the existing project API. Only projects that passed A2/A3.
 - [ ] **B2. `PATCH /api/projects/:id/form-values` REPLACES the JSON object.**
-      Read the existing object first (A1) and use the existing
+      Read the existing object first (A1a) and use the existing
       `buildFormValuesPayload` merge behavior so every optional field survives.
       A partial payload silently drops the fields you omitted.
-- [ ] **B3. Re-read each project after patching** and diff against the A1
+- [ ] **B3. Re-read each project after patching** and diff against the A1a
       capture. The only differences must be the ones you intended.
 
 ## Part C — Deployment parity gate

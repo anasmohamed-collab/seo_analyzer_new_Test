@@ -175,7 +175,97 @@ export function listTree(root) {
   return out.sort();
 }
 
-/** Standard arguments for a staged (rootless) install into destdir. */
+// ── Install source fixtures ─────────────────────────────────────────
+//
+// The installer now refuses to install from a DIRTY git worktree, because a
+// derived `.release-sha` would otherwise name a commit whose files are not
+// what is being installed. That makes the live checkout unusable as a test
+// source: whether it is clean depends on whatever the developer is editing.
+//
+// So the deployment tests install from pristine fixtures instead — a real git
+// repository with a real HEAD, or a plain archive with no repository at all.
+// Both are built once per test process and reused.
+
+/** Runner content that install.sh reads out of --source. */
+const SOURCE_ENTRIES = ['bin', 'src', 'package.json', 'README.md', 'docs', 'config', 'deploy'];
+
+let cachedGit;
+/** Is a usable `git` available? */
+export function gitMissing() {
+  if (cachedGit === undefined) {
+    cachedGit = spawnSync('git', ['--version'], { encoding: 'utf8' }).status !== 0;
+  }
+  return cachedGit;
+}
+
+/** Run git in `cwd`, throwing with stderr on failure. */
+export function git(cwd, args) {
+  const r = spawnSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: 'Runner Test', GIT_AUTHOR_EMAIL: 'runner@test.invalid',
+      GIT_COMMITTER_NAME: 'Runner Test', GIT_COMMITTER_EMAIL: 'runner@test.invalid',
+      GIT_CONFIG_GLOBAL: path.join(cwd, '.gitconfig-none'),
+      GIT_CONFIG_SYSTEM: path.join(cwd, '.gitconfig-none'),
+    },
+  });
+  if (r.status !== 0) {
+    throw new Error(`git ${args.join(' ')} failed in ${cwd}: ${r.stderr || r.stdout}`);
+  }
+  return (r.stdout ?? '').trim();
+}
+
+/** Copy the runner sources into `dest` (no .git, no test/tools/state). */
+function copySources(dest) {
+  fs.mkdirSync(dest, { recursive: true });
+  for (const entry of SOURCE_ENTRIES) {
+    const from = path.join(RUNNER_ROOT, entry);
+    if (fs.existsSync(from)) fs.cpSync(from, path.join(dest, entry), { recursive: true });
+  }
+}
+
+/**
+ * A pristine runner source tree that is NOT a git repository — the
+ * archive/tarball install path, where an explicit --git-sha is required.
+ */
+export function makeArchiveSourceFixture() {
+  const dir = path.join(makeWorkspace(), 'archive-source');
+  copySources(dir);
+  return dir;
+}
+
+/**
+ * A pristine runner source tree inside a real, CLEAN git repository.
+ * @returns {{ dir: string, head: string }}
+ */
+export function makeGitSourceFixture() {
+  const dir = path.join(makeWorkspace(), 'git-source');
+  copySources(dir);
+  git(dir, ['init', '-q']);
+  git(dir, ['add', '-A']);
+  git(dir, ['commit', '-q', '-m', 'runner source fixture']);
+  const head = git(dir, ['rev-parse', 'HEAD']);
+  return { dir, head };
+}
+
+let cachedCleanSource;
+/** Shared clean git source fixture — built once, reused by every install. */
+export function cleanGitSource() {
+  if (!cachedCleanSource) cachedCleanSource = makeGitSourceFixture();
+  return cachedCleanSource;
+}
+
+/**
+ * Standard arguments for a staged (rootless) install into destdir.
+ *
+ * Defaults --source to the shared CLEAN git fixture so tests never depend on
+ * the developer's working-tree state. `extra` is appended, so a caller passing
+ * its own `--source` still wins.
+ */
 export function stagedInstallArgs(destdir, extra = []) {
-  return ['--destdir', toPosix(destdir), '--node', toPosix(process.execPath), ...extra];
+  const args = ['--destdir', toPosix(destdir), '--node', toPosix(process.execPath)];
+  if (!gitMissing()) args.push('--source', toPosix(cleanGitSource().dir));
+  return [...args, ...extra];
 }

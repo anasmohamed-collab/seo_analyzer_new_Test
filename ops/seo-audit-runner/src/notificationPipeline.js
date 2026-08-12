@@ -204,12 +204,21 @@ export function createNotificationPipeline({
         resolved: notificationLifecycle.resolved.length,
         current: notificationIssues.length,
       };
-      const p0Count = (items) => items.filter((issue) => issue.priority === 'P0').length;
-      const currentP0 = p0Count(notificationIssues);
-      lifecycleTotals.new += p0Count(notificationLifecycle.new);
-      lifecycleTotals.reopened += p0Count(notificationLifecycle.reopened);
-      lifecycleTotals.unchanged += p0Count(notificationLifecycle.unchanged);
-      lifecycleTotals.resolved += p0Count(notificationLifecycle.resolved);
+      // Count the already-filtered notification buckets DIRECTLY. Re-filtering
+      // them on `issue.priority` used to silently zero the resolved total:
+      // resolved issues are reconstructed from `issue_states`, which stores no
+      // priority column, so every resolved item failed a `priority === 'P0'`
+      // test no matter what it actually was.
+      //
+      // Re-filtering is unnecessary anyway — these buckets are P0 by
+      // construction. The snapshot is built from `extractCriticalIssues()`
+      // (strictly P0), and the notification filter only ever narrows it
+      // further. So the bucket length IS the P0 count, for every bucket.
+      const currentP0 = notificationIssues.length;
+      lifecycleTotals.new += notificationLifecycle.new.length;
+      lifecycleTotals.reopened += notificationLifecycle.reopened.length;
+      lifecycleTotals.unchanged += notificationLifecycle.unchanged.length;
+      lifecycleTotals.resolved += notificationLifecycle.resolved.length;
       lifecycleTotals.currentP0 += currentP0;
       if (currentP0 > 0) lifecycleTotals.projectsWithCritical++;
 

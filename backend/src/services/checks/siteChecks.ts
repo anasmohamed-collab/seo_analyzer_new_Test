@@ -537,8 +537,12 @@ async function checkRobots(origin: string): Promise<RobotsResult> {
     flushRule();
 
     result.status = 'FOUND';
-    console.log(`[robots] Parsed: ${result.rules.length} rule(s), ${result.sitemapsFound.length} sitemap(s): ${result.sitemapsFound.join(', ') || '(none)'}`);
-    if (result.sitemapsFound.length === 0) {
+    console.log(`[robots] Parsed: ${result.rules.length} rule(s), ${result.sitemapDirectives.length} sitemap directive(s): ${result.sitemapDirectives.join(', ') || '(none)'}`);
+    // Declaration presence is judged on the RAW directives, not on the
+    // absolute-only list: a robots.txt whose only directive is root-relative
+    // (`Sitemap: /news_sitemap.xml`) has declared a sitemap, and claiming
+    // otherwise produces a false "no Sitemap directive" finding.
+    if (result.sitemapDirectives.length === 0) {
       result.notes.push('robots.txt exists but contains no Sitemap: directives');
     }
 
@@ -1092,6 +1096,81 @@ function isNewsNamedSitemapUrl(url: string): boolean {
   }
 }
 
+/** Google News signals present in a sitemap body. */
+interface NewsSignals {
+  hasNewsNamespace: boolean;
+  hasPublicationDate: boolean;
+  hasNewsTitle: boolean;
+  hasPublicationTag: boolean;
+  urlCount: number;
+  /** Any News marker at all — the "is this a News Sitemap?" test. */
+  hasAnyNewsSignal: boolean;
+}
+
+function readNewsSignals(body: string): NewsSignals {
+  const hasNewsNamespace   = body.includes('xmlns:news=') || body.includes('<news:');
+  const hasPublicationDate = /<news:publication_date[\s>]/i.test(body);
+  const hasNewsTitle       = /<news:title[\s>]/i.test(body);
+  const hasPublicationTag  = /<news:publication[\s>]/i.test(body);
+  return {
+    hasNewsNamespace,
+    hasPublicationDate,
+    hasNewsTitle,
+    hasPublicationTag,
+    urlCount: countUrlEntries(body),
+    hasAnyNewsSignal: hasNewsNamespace || hasPublicationDate || hasNewsTitle || hasPublicationTag,
+  };
+}
+
+/**
+ * Is this valid sitemap XML merely a GENERAL sitemap rather than a News one?
+ *
+ * A news-NAMED candidate is always reported (FOUND + missing-tags) so a
+ * genuinely malformed News Sitemap is still surfaced. Only an unnamed
+ * candidate — which is exactly what a robots.txt-declared `/sitemap.xml`
+ * is — can be classified as general-only and skipped.
+ *
+ * Used by BOTH the normal fetch path and the Scrapling fallback, so a
+ * challenged candidate cannot be classified more loosely just because the
+ * headless browser was what finally retrieved it.
+ */
+function isGeneralSitemapOnly(signals: NewsSignals, newsNamed: boolean): boolean {
+  return !signals.hasAnyNewsSignal && !newsNamed;
+}
+
+/** Populate a FOUND News Sitemap result, including the missing-tag notes. */
+function applyNewsSitemapFindings(
+  result: NewsSitemapResult,
+  url: string,
+  httpStatus: number | null,
+  signals: NewsSignals,
+): void {
+  result.status             = 'FOUND';
+  result.url                = url;
+  result.httpStatus         = httpStatus;
+  result.hasNewsNamespace   = signals.hasNewsNamespace;
+  result.hasPublicationDate = signals.hasPublicationDate;
+  result.hasNewsTitle       = signals.hasNewsTitle;
+  result.hasPublicationTag  = signals.hasPublicationTag;
+  result.urlCount           = signals.urlCount;
+
+  if (!signals.hasNewsNamespace) {
+    result.notes.push('Sitemap found but missing Google News namespace (xmlns:news=). Add the news namespace for Google News indexing.');
+  }
+  if (!signals.hasPublicationDate) {
+    result.notes.push('Missing <news:publication_date> — required for Google News freshness signals.');
+  }
+  if (!signals.hasNewsTitle) {
+    result.notes.push('Missing <news:title> — required in every news sitemap entry.');
+  }
+  if (!signals.hasPublicationTag) {
+    result.notes.push('Missing <news:publication> block — required for Google News publisher identification.');
+  }
+  if (signals.urlCount === 0) {
+    result.notes.push('News sitemap contains 0 <url> entries.');
+  }
+}
+
 export async function checkNewsSitemapPresence(
   origin: string,
   declaredSitemaps: string[] = [],
@@ -1153,12 +1232,16 @@ export async function checkNewsSitemapPresence(
 
   let lastBlockedUrl: string | null = null;
   let lastBlockedStatus: number | null = null;
-  let lastBotProtectionUrl: string | null = null;
+  // The whole candidate, not just its URL: the Scrapling fallback must apply
+  // the SAME general-vs-News classification as the normal path, which needs
+  // this candidate's `newsNamed` flag.
+  let lastBotProtectionCandidate: NewsCandidate | null = null;
   // An ordinary (non-news-named) sitemap with no news signals must not mask a
   // News Sitemap declared later in robots.txt — remember it and keep probing.
   let skippedGeneralSitemapUrl: string | null = null;
 
-  for (const { url, newsNamed } of candidates) {
+  for (const candidate of candidates) {
+    const { url, newsNamed } = candidate;
     let res: Awaited<ReturnType<typeof safeFetch>>;
     try {
       res = await safeFetch(url, SITEMAP_TIMEOUT, { maxBytes: MAX_CHILD_SIZE });
@@ -1207,7 +1290,7 @@ export async function checkNewsSitemapPresence(
     const body = res.text;
     if (isBotProtectionPage(body)) {
       console.log(`[news-sitemap] BOT_PROTECTION: ${url} → HTTP 200 with challenge body`);
-      lastBotProtectionUrl = url;
+      lastBotProtectionCandidate = candidate;
       lastBlockedStatus = res.status;
       continue; // treat like an access denial — keep trying other paths
     }
@@ -1218,83 +1301,62 @@ export async function checkNewsSitemapPresence(
       continue;
     }
 
-    const hasNewsNS = body.includes('xmlns:news=') || body.includes('<news:');
-    const hasPubDate = /<news:publication_date[\s>]/i.test(body);
-    const hasTitle   = /<news:title[\s>]/i.test(body);
-    const hasPubTag  = /<news:publication[\s>]/i.test(body);
-    const urlCount   = countUrlEntries(body);
+    const signals = readNewsSignals(body);
 
     // A general sitemap declared in robots.txt is valid XML with no news
     // signals at all. Accepting it here would report "News sitemap found but
     // missing everything" and hide a real News Sitemap declared further down.
-    // News-NAMED candidates (every guessed path, plus declared *news* URLs)
-    // keep the existing FOUND + missing-tags reporting so genuinely malformed
-    // News Sitemaps are still surfaced.
-    if (!hasNewsNS && !hasPubDate && !hasTitle && !hasPubTag && !newsNamed) {
+    if (isGeneralSitemapOnly(signals, newsNamed)) {
       if (!skippedGeneralSitemapUrl) skippedGeneralSitemapUrl = url;
       console.log(`[news-sitemap] SKIP: ${url} is a general ${root} with no news signals — continuing`);
       continue;
     }
 
-    result.status           = 'FOUND';
-    result.url              = url;
-    result.httpStatus       = res.status;
-    result.hasNewsNamespace = hasNewsNS;
-    result.hasPublicationDate = hasPubDate;
-    result.hasNewsTitle     = hasTitle;
-    result.hasPublicationTag = hasPubTag;
-    result.urlCount         = urlCount;
-
-    if (!hasNewsNS) {
-      result.notes.push('Sitemap found but missing Google News namespace (xmlns:news=). Add the news namespace for Google News indexing.');
-    }
-    if (!hasPubDate) {
-      result.notes.push('Missing <news:publication_date> — required for Google News freshness signals.');
-    }
-    if (!hasTitle) {
-      result.notes.push('Missing <news:title> — required in every news sitemap entry.');
-    }
-    if (!hasPubTag) {
-      result.notes.push('Missing <news:publication> block — required for Google News publisher identification.');
-    }
-    if (urlCount === 0) {
-      result.notes.push('News sitemap contains 0 <url> entries.');
-    }
-
-    console.log(`[news-sitemap] FOUND: ${url} — news_ns=${hasNewsNS}, pub_date=${hasPubDate}, title=${hasTitle}, urls=${urlCount}`);
+    applyNewsSitemapFindings(result, url, res.status, signals);
+    console.log(
+      `[news-sitemap] FOUND: ${url} — news_ns=${signals.hasNewsNamespace}, ` +
+        `pub_date=${signals.hasPublicationDate}, title=${signals.hasNewsTitle}, urls=${signals.urlCount}`,
+    );
     return result;
   }
 
   // ── Scrapling sidecar fallback for news sitemap ──────────────────────────
   // When all paths were bot-protected, try the sidecar once on the most
   // promising URL (the one that returned BOT_PROTECTION rather than a hard block).
-  if (lastBotProtectionUrl && SCRAPLING_SIDECAR_URL) {
-    console.log(`[news-sitemap] All paths challenged — trying Scrapling stealth for ${lastBotProtectionUrl}`);
-    const scrapling = await tryScraplingForContent(lastBotProtectionUrl, SCRAPLING_SIDECAR_URL, SITEMAP_TIMEOUT);
+  // The sidecar is a LAST resort for retrieval only — it never relaxes the
+  // classification, so the candidate's `newsNamed` flag and the shared
+  // general-vs-News test apply exactly as they do on the normal path.
+  if (lastBotProtectionCandidate && SCRAPLING_SIDECAR_URL) {
+    const challenged = lastBotProtectionCandidate;
+    console.log(`[news-sitemap] All paths challenged — trying Scrapling stealth for ${challenged.url}`);
+    const scrapling = await tryScraplingForContent(challenged.url, SCRAPLING_SIDECAR_URL, SITEMAP_TIMEOUT);
     if (scrapling?.ok && scrapling.text) {
       const body = scrapling.text;
       const root = xmlRoot(body);
       if (root) {
-        const hasNewsNS  = body.includes('xmlns:news=') || body.includes('<news:');
-        const hasPubDate = /<news:publication_date[\s>]/i.test(body);
-        const hasTitle   = /<news:title[\s>]/i.test(body);
-        const hasPubTag  = /<news:publication[\s>]/i.test(body);
-        const urlCount   = countUrlEntries(body);
-
-        result.status             = 'FOUND';
-        result.url                = lastBotProtectionUrl;
-        result.httpStatus         = scrapling.status;
-        result.hasNewsNamespace   = hasNewsNS;
-        result.hasPublicationDate = hasPubDate;
-        result.hasNewsTitle       = hasTitle;
-        result.hasPublicationTag  = hasPubTag;
-        result.urlCount           = urlCount;
-        result.notes.push('News sitemap content was retrieved via headless browser bypass (Scrapling sidecar).');
-        console.log(`[news-sitemap] FOUND via Scrapling stealth: ${lastBotProtectionUrl}`);
-        return result;
+        const signals = readNewsSignals(body);
+        if (isGeneralSitemapOnly(signals, challenged.newsNamed)) {
+          // The bypass PROVED this URL serves an ordinary general sitemap. It
+          // is therefore neither a News Sitemap nor an unresolved WAF block:
+          // reporting BOT_PROTECTION here would describe a challenge we
+          // already saw through.
+          if (!skippedGeneralSitemapUrl) skippedGeneralSitemapUrl = challenged.url;
+          lastBotProtectionCandidate = null;
+          console.log(
+            `[news-sitemap] SKIP (via Scrapling): ${challenged.url} is a general ${root} with no news signals`,
+          );
+        } else {
+          applyNewsSitemapFindings(result, challenged.url, scrapling.status, signals);
+          result.notes.push('News sitemap content was retrieved via headless browser bypass (Scrapling sidecar).');
+          console.log(`[news-sitemap] FOUND via Scrapling stealth: ${challenged.url}`);
+          return result;
+        }
+      } else {
+        console.log(`[news-sitemap] Scrapling stealth did not yield valid XML for ${challenged.url}`);
       }
+    } else {
+      console.log(`[news-sitemap] Scrapling stealth did not yield valid XML for ${challenged.url}`);
     }
-    console.log(`[news-sitemap] Scrapling stealth did not yield valid XML for ${lastBotProtectionUrl}`);
   }
 
   // Nothing found — differentiate hard access-denial from challenge-page blocks
@@ -1304,12 +1366,12 @@ export async function checkNewsSitemapPresence(
     result.httpStatus = lastBlockedStatus;
     result.notes.push(`News sitemap access blocked (HTTP ${lastBlockedStatus}). Ensure sitemap URLs are publicly accessible without authentication.`);
     console.log(`[news-sitemap] Final status: BLOCKED at ${lastBlockedUrl}`);
-  } else if (lastBotProtectionUrl) {
+  } else if (lastBotProtectionCandidate) {
     result.status     = 'BOT_PROTECTION';
-    result.url        = lastBotProtectionUrl;
+    result.url        = lastBotProtectionCandidate.url;
     result.httpStatus = lastBlockedStatus;
     result.notes.push('News sitemap URL returned a bot-protection challenge page — and the headless-browser bypass did not succeed. Consider configuring Scrapling sidecar for improved WAF bypass.');
-    console.log(`[news-sitemap] Final status: BOT_PROTECTION at ${lastBotProtectionUrl}`);
+    console.log(`[news-sitemap] Final status: BOT_PROTECTION at ${lastBotProtectionCandidate.url}`);
   } else {
     result.notes.push(`No news sitemap found at any of ${NEWS_SITEMAP_PATHS.length} standard paths. For Google News publishers, add a /news-sitemap.xml with the news namespace.`);
     console.log('[news-sitemap] Final status: NOT_FOUND');

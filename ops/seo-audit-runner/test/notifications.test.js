@@ -341,6 +341,128 @@ test('Production notification behavior is unchanged: every P0 alerts', async () 
   db.close();
 });
 
+// ── Run-summary lifecycle totals ────────────────────────────────────
+//
+// Resolved issues are rebuilt from `issue_states`, which stores no priority
+// column. Counting them with a `priority === 'P0'` filter silently reported
+// zero resolutions forever.
+
+test('a resolved Production P0 increments the resolved run-summary total', async () => {
+  const { db, store } = freshStore();
+  const sender = mockSender();
+  const pipeline = pipelineWith(store, sender);
+
+  await pipeline.handleProjectCompleted({
+    project, auditRunId: 'r1', results: results(), criticalIssues: [critical(1)],
+  });
+  assert.equal(pipeline.lifecycleTotals.resolved, 0, 'nothing resolved yet');
+
+  const second = await pipeline.handleProjectCompleted({
+    project, auditRunId: 'r2', results: results(), criticalIssues: [],
+  });
+
+  assert.equal(second.notificationCounts.resolved, 1);
+  assert.equal(pipeline.lifecycleTotals.resolved, 1, 'the resolved P0 must be counted');
+  assert.equal(pipeline.lifecycleTotals.currentP0, 1, 'one project-audit had a current P0');
+  db.close();
+});
+
+test('a resolved Beta Exposure increments the resolved run-summary total', async () => {
+  const { db, store } = freshStore();
+  const sender = mockSender();
+  const pipeline = pipelineWith(store, sender);
+  const betaProject = { ...project, is_beta: true };
+
+  await pipeline.handleProjectCompleted({
+    project: betaProject, auditRunId: 'r1', results: results(), criticalIssues: [betaExposure(1)],
+  });
+  const second = await pipeline.handleProjectCompleted({
+    project: betaProject, auditRunId: 'r2', results: results(), criticalIssues: [],
+  });
+
+  assert.equal(second.notificationCounts.resolved, 1);
+  assert.equal(pipeline.lifecycleTotals.resolved, 1);
+  db.close();
+});
+
+test('a resolved ORDINARY Beta P0 stays out of the resolved run-summary total', async () => {
+  const { db, store } = freshStore();
+  const sender = mockSender();
+  const pipeline = pipelineWith(store, sender);
+  const betaProject = { ...project, is_beta: true };
+
+  await pipeline.handleProjectCompleted({
+    project: betaProject, auditRunId: 'r1', results: results(), criticalIssues: [critical(1)],
+  });
+  const second = await pipeline.handleProjectCompleted({
+    project: betaProject, auditRunId: 'r2', results: results(), criticalIssues: [],
+  });
+
+  assert.equal(second.lifecycleCounts.resolved, 1, 'the state store resolved it internally');
+  assert.deepEqual(pipeline.lifecycleTotals, {
+    new: 0, reopened: 0, unchanged: 0, resolved: 0, currentP0: 0, projectsWithCritical: 0,
+  }, 'ordinary Beta P0 never enters the Slack run-summary totals');
+  assert.equal(sender.sent.length, 0);
+  db.close();
+});
+
+test('the run summary displays the correct Resolved P0 count', async () => {
+  const { db, store } = freshStore();
+  const sender = mockSender();
+  const pipeline = pipelineWith(store, sender);
+
+  await pipeline.handleProjectCompleted({
+    project, auditRunId: 'r1', results: results(), criticalIssues: [critical(1), critical(2)],
+  });
+  await pipeline.handleProjectCompleted({
+    project, auditRunId: 'r2', results: results(), criticalIssues: [],
+  });
+
+  assert.equal(pipeline.lifecycleTotals.resolved, 2);
+
+  // Exactly how bin/seo-audit-runner.js builds the summary totals.
+  await pipeline.sendRunSummary({
+    startedAt: '2026-08-12T06:00:00.000Z',
+    finishedAt: '2026-08-12T06:02:00.000Z',
+    totals: {
+      discovered: 1, selected: 1, deduplicated: 0, completed: 2, failed: 0, timedOut: 0,
+      skippedAlreadyRunning: 0, skippedMissingConfig: 0, triggerOutcomeUnknown: 0,
+      projectsWithCritical: pipeline.lifecycleTotals.projectsWithCritical,
+      currentP0: pipeline.lifecycleTotals.currentP0,
+      newIssues: pipeline.lifecycleTotals.new,
+      reopenedIssues: pipeline.lifecycleTotals.reopened,
+      unchangedIssues: pipeline.lifecycleTotals.unchanged,
+      resolvedIssues: pipeline.lifecycleTotals.resolved,
+      notificationFailures: 0,
+    },
+  });
+
+  const summary = sender.sent.at(-1).text;
+  assert.match(summary, /Resolved P0: 2/, 'the summary must report the real resolution count');
+  assert.ok(!/<!(channel|here|everyone)>/.test(summary));
+  db.close();
+});
+
+test('UNCHANGED stays suppressed in new_or_regressed and does not inflate totals', async () => {
+  const { db, store } = freshStore();
+  const sender = mockSender();
+  const pipeline = pipelineWith(store, sender);
+
+  await pipeline.handleProjectCompleted({
+    project, auditRunId: 'r1', results: results(), criticalIssues: [critical(1)],
+  });
+  const second = await pipeline.handleProjectCompleted({
+    project, auditRunId: 'r2', results: results(), criticalIssues: [critical(1)],
+  });
+
+  assert.equal(second.notificationStatus, 'not-required', 'unchanged-only must not alert');
+  assert.equal(sender.sent.length, 1, 'only the first audit alerted');
+  assert.equal(pipeline.lifecycleTotals.new, 1);
+  assert.equal(pipeline.lifecycleTotals.unchanged, 1);
+  assert.equal(pipeline.lifecycleTotals.resolved, 0, 'nothing was resolved');
+  db.close();
+});
+
 test('Beta exposure and Production P0 alerts are both delivered in the same scheduled pipeline', async () => {
   const { db, store } = freshStore();
   const sender = mockSender();

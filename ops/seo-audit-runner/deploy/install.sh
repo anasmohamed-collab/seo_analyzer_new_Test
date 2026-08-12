@@ -329,17 +329,53 @@ normalize_git_sha() { # <raw> -> prints the normalized SHA, or nothing
   esac
 }
 
+# Validate any explicitly supplied SHA first — a malformed value is always a
+# hard error, whatever kind of source tree this is.
 GIT_SHA_SOURCE=
+EXPLICIT_GIT_SHA=
 if [ -n "$GIT_SHA" ]; then
   raw_git_sha=$GIT_SHA
   GIT_SHA=$(normalize_git_sha "$raw_git_sha")
   [ -n "$GIT_SHA" ] || fail "--git-sha/SEO_RUNNER_GIT_SHA must be a full 40- or 64-character hex Git SHA, got: $raw_git_sha"
+  EXPLICIT_GIT_SHA=$GIT_SHA
   GIT_SHA_SOURCE=explicit
-else
-  if command -v git >/dev/null 2>&1 && [ -d "$SOURCE_DIR/.git" ] || \
-     { command -v git >/dev/null 2>&1 && git -C "$SOURCE_DIR" rev-parse --git-dir >/dev/null 2>&1; }; then
-    GIT_SHA=$(normalize_git_sha "$(git -C "$SOURCE_DIR" rev-parse HEAD 2>/dev/null || true)")
-    [ -n "$GIT_SHA" ] && GIT_SHA_SOURCE=git-checkout
+fi
+
+# Is the runner source inside a git worktree we can interrogate?
+source_is_git_worktree=0
+if command -v git >/dev/null 2>&1 &&
+   git -C "$SOURCE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+  source_is_git_worktree=1
+fi
+
+if [ "$source_is_git_worktree" -eq 1 ]; then
+  # A git worktree can prove what it contains — so it must. Installing modified
+  # files while recording the clean HEAD would make the parity gate assert a
+  # commit whose contents are NOT what is running. This check happens BEFORE any
+  # release directory is created or the `current` symlink is moved, so a
+  # rejected install leaves the active release untouched.
+  head_sha=$(normalize_git_sha "$(git -C "$SOURCE_DIR" rev-parse HEAD 2>/dev/null || true)")
+  [ -n "$head_sha" ] || fail "runner source is a git worktree but HEAD could not be read as a full SHA (unborn branch or corrupt repository). Use --git-sha <full-sha> with a non-git source tree instead."
+
+  # Scoped to the runner source directory: staged, unstaged AND untracked.
+  # `--porcelain` reports all three; `-- .` limits it to this subtree so an
+  # unrelated edit elsewhere in a monorepo does not block a runner install.
+  dirty=$(git -C "$SOURCE_DIR" status --porcelain --untracked-files=normal -- . 2>/dev/null || true)
+  if [ -n "$dirty" ]; then
+    printf 'install.sh: ERROR: runner source tree has uncommitted changes:\n' >&2
+    printf '%s\n' "$dirty" | sed 's/^/install.sh:   /' >&2
+    fail "refusing to install from a dirty git worktree — .release-sha would record $head_sha while installing different files, and the REPO_SHA == APP_SHA == RUNNER_SHA gate would silently pass on a lie. Commit or stash the changes, or install from a clean export with --git-sha <full-sha>."
+  fi
+
+  if [ -n "$EXPLICIT_GIT_SHA" ] && [ "$EXPLICIT_GIT_SHA" != "$head_sha" ]; then
+    fail "--git-sha/SEO_RUNNER_GIT_SHA ($EXPLICIT_GIT_SHA) does not match the source checkout HEAD ($head_sha). Check out the intended commit, or drop the flag and let the clean checkout speak for itself."
+  fi
+
+  GIT_SHA=$head_sha
+  # A plain `[ … ] && …` here would leave the if-body with a non-zero status
+  # under `set -e` whenever the test is false.
+  if [ -z "$GIT_SHA_SOURCE" ]; then
+    GIT_SHA_SOURCE=git-checkout
   fi
 fi
 
