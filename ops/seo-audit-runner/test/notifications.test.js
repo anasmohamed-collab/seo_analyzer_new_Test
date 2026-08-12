@@ -86,7 +86,7 @@ const critical = (n) => ({
 });
 
 const betaExposure = (n, over = {}) => ({
-  priority: 'P1',
+  priority: 'P0',
   area: 'indexability',
   message: 'Beta/Staging seed URL is indexable (no noindex directive detected)',
   fixHint: `Block Beta exposure ${n}`,
@@ -149,7 +149,7 @@ test('delivered project notification is persisted and issues marked alerted', as
   db.close();
 });
 
-test('Beta exposure findings enter the lifecycle without inflating P0 totals or paging the channel', async () => {
+test('Beta exposure findings alert, count in the Slack totals, and never page the channel', async () => {
   const { db, store } = freshStore();
   const sender = mockSender();
   const pipeline = pipelineWith(store, sender);
@@ -167,7 +167,7 @@ test('Beta exposure findings enter the lifecycle without inflating P0 totals or 
   assert.ok(!/<!(channel|here|everyone)>/.test(sender.sent[0].text));
   assert.equal(store.listActiveIssues('p1').length, 1);
   assert.deepEqual(pipeline.lifecycleTotals, {
-    new: 0, reopened: 0, unchanged: 0, resolved: 0, currentP0: 0, projectsWithCritical: 0,
+    new: 1, reopened: 0, unchanged: 0, resolved: 0, currentP0: 1, projectsWithCritical: 1,
   });
   db.close();
 });
@@ -187,6 +187,157 @@ test('Production filtering remains false-by-default when is_beta is absent', asy
 
   assert.equal(outcome.notificationStatus, 'delivered');
   assert.equal(sender.sent.length, 1);
+  db.close();
+});
+
+// ── Beta: snapshot keeps every P0, Slack sees only Critical Exposure ─
+
+test('an ordinary Beta P0 is tracked in the snapshot but produces NO project Slack alert', async () => {
+  const { db, store } = freshStore();
+  const sender = mockSender();
+  const pipeline = pipelineWith(store, sender);
+  const betaProject = { ...project, is_beta: true };
+
+  const outcome = await pipeline.handleProjectCompleted({
+    project: betaProject, auditRunId: 'r1', results: results(), criticalIssues: [critical(1)],
+  });
+
+  assert.equal(outcome.notificationStatus, 'not-required', 'no scheduled Slack alert for Beta SEO debt');
+  assert.equal(sender.sent.length, 0);
+  // …but the issue IS recorded, so the next audit cannot call it RESOLVED.
+  assert.equal(outcome.lifecycleCounts.new, 1, 'the snapshot lifecycle still saw it');
+  assert.equal(outcome.notificationCounts.new, 0, 'Slack saw nothing');
+  assert.equal(store.listActiveIssues('p1').length, 1, 'the issue is tracked in issue_states');
+  assert.deepEqual(pipeline.lifecycleTotals, {
+    new: 0, reopened: 0, unchanged: 0, resolved: 0, currentP0: 0, projectsWithCritical: 0,
+  }, 'ordinary Beta P0 changes never enter the Slack run-summary totals');
+  db.close();
+});
+
+test('an ordinary Beta P0 disappearing produces NO Slack RESOLVED event', async () => {
+  const { db, store } = freshStore();
+  const sender = mockSender();
+  const pipeline = pipelineWith(store, sender);
+  const betaProject = { ...project, is_beta: true };
+
+  await pipeline.handleProjectCompleted({
+    project: betaProject, auditRunId: 'r1', results: results(), criticalIssues: [critical(1)],
+  });
+  const second = await pipeline.handleProjectCompleted({
+    project: betaProject, auditRunId: 'r2', results: results(), criticalIssues: [],
+  });
+
+  assert.equal(second.lifecycleCounts.resolved, 1, 'the state store resolved it internally');
+  assert.equal(second.notificationCounts.resolved, 0, 'Slack is not told');
+  assert.equal(second.notificationStatus, 'not-required');
+  assert.equal(sender.sent.length, 0, 'no RESOLVED message for ordinary Beta SEO debt');
+  db.close();
+});
+
+test('a Beta P0 that is never alerted is never falsely RESOLVED while it persists', async () => {
+  const { db, store } = freshStore();
+  const sender = mockSender();
+  const pipeline = pipelineWith(store, sender);
+  const betaProject = { ...project, is_beta: true };
+
+  for (const auditRunId of ['r1', 'r2', 'r3']) {
+    await pipeline.handleProjectCompleted({
+      project: betaProject, auditRunId, results: results(), criticalIssues: [critical(1)],
+    });
+  }
+
+  const active = store.listActiveIssues('p1');
+  assert.equal(active.length, 1, 'the untouched Beta P0 stays ACTIVE across audits');
+  assert.equal(active[0].state, 'ACTIVE');
+  assert.equal(sender.sent.length, 0);
+  db.close();
+});
+
+test('Beta exposure NEW alerts, REOPENED alerts, RESOLVED updates, and UNCHANGED does not repeat', async () => {
+  const { db, store } = freshStore();
+  const sender = mockSender();
+  const pipeline = pipelineWith(store, sender);
+  const betaProject = { ...project, is_beta: true };
+  // An ordinary Beta P0 is present the whole time and must stay invisible.
+  const noise = critical(9);
+
+  const first = await pipeline.handleProjectCompleted({
+    project: betaProject, auditRunId: 'r1', results: results(),
+    criticalIssues: [betaExposure(1), noise],
+  });
+  const second = await pipeline.handleProjectCompleted({
+    project: betaProject, auditRunId: 'r2', results: results(),
+    criticalIssues: [betaExposure(1, { auditRunId: 'r2' }), noise],
+  });
+  const third = await pipeline.handleProjectCompleted({
+    project: betaProject, auditRunId: 'r3', results: results(), criticalIssues: [noise],
+  });
+  const fourth = await pipeline.handleProjectCompleted({
+    project: betaProject, auditRunId: 'r4', results: results(),
+    criticalIssues: [betaExposure(1, { auditRunId: 'r4' }), noise],
+  });
+
+  assert.equal(first.notificationStatus, 'delivered', 'NEW exposure alerts');
+  assert.equal(first.notificationCounts.new, 1);
+
+  assert.equal(second.notificationStatus, 'not-required', 'UNCHANGED exposure does not repeat');
+  assert.equal(second.notificationCounts.unchanged, 1);
+
+  assert.equal(third.notificationStatus, 'delivered', 'RESOLVED exposure updates');
+  assert.equal(third.notificationCounts.resolved, 1);
+
+  assert.equal(fourth.notificationStatus, 'delivered', 'REOPENED exposure alerts');
+  assert.equal(fourth.notificationCounts.reopened, 1);
+
+  assert.equal(sender.sent.length, 3, 'NEW + RESOLVED + REOPENED only');
+  for (const message of sender.sent) {
+    assert.match(message.text, /Beta SEO Exposure Alert/);
+    assert.ok(!/<!(channel|here|everyone)>/.test(message.text), 'Beta Exposure alerts never page a channel');
+    assert.ok(!message.text.includes('Critical issue 9'), 'ordinary Beta P0 never appears in Slack');
+  }
+  db.close();
+});
+
+test('promoting Beta exposure from P1 to P0 does not churn the stored issue identity', async () => {
+  const { db, store } = freshStore();
+  const sender = mockSender();
+  const pipeline = pipelineWith(store, sender);
+  const betaProject = { ...project, is_beta: true };
+
+  // Pre-change audit: identical finding, recorded while it was still P1.
+  const legacy = { ...betaExposure(1), priority: 'P1' };
+  const first = await pipeline.handleProjectCompleted({
+    project: betaProject, auditRunId: 'r1', results: results(), criticalIssues: [legacy],
+  });
+  // Post-change audit: same wording, now emitted at P0.
+  const second = await pipeline.handleProjectCompleted({
+    project: betaProject, auditRunId: 'r2', results: results(),
+    criticalIssues: [betaExposure(1, { auditRunId: 'r2' })],
+  });
+
+  assert.equal(first.notificationCounts.new, 1);
+  assert.equal(second.notificationCounts.unchanged, 1, 'the promotion is UNCHANGED, not NEW');
+  assert.equal(second.notificationCounts.new, 0);
+  assert.equal(second.notificationCounts.resolved, 0, 'no false RESOLVED for the old P1 identity');
+  assert.equal(store.listActiveIssues('p1').length, 1, 'one identity, not two');
+  db.close();
+});
+
+test('Production notification behavior is unchanged: every P0 alerts', async () => {
+  const { db, store } = freshStore();
+  const sender = mockSender();
+  const pipeline = pipelineWith(store, sender);
+
+  const outcome = await pipeline.handleProjectCompleted({
+    project, auditRunId: 'r1', results: results(), criticalIssues: [critical(1), critical(2)],
+  });
+
+  assert.equal(outcome.notificationStatus, 'delivered');
+  assert.deepEqual(outcome.notificationCounts, outcome.lifecycleCounts, 'Production filtering is a no-op');
+  assert.equal(outcome.notificationCounts.new, 2);
+  assert.match(sender.sent[0].text, /Critical issue 1/);
+  assert.match(sender.sent[0].text, /Critical issue 2/);
+  assert.ok(!/<!(channel|here|everyone)>/.test(sender.sent[0].text));
   db.close();
 });
 
@@ -481,9 +632,9 @@ test('shouldNotify matrix', () => {
   assert.equal(shouldNotify('summary_only', { new: 0, reopened: 0, resolved: 0, unchanged: 0, current: 0 }), false);
 });
 
-// ── Channel-wide mention: only for NEW or REOPENED P0 issues ────────
+// ── Broad mentions: never emitted by any alert ──────────────────────
 
-test('a new P0 alert mentions the channel exactly once', async () => {
+test('a new P0 alert carries no broad mention', async () => {
   const { db, store } = freshStore();
   const sender = mockSender();
   const pipeline = pipelineWith(store, sender);
@@ -493,12 +644,13 @@ test('a new P0 alert mentions the channel exactly once', async () => {
   });
 
   const text = sender.sent[0].text;
-  assert.equal(text.split('<!channel>').length - 1, 1);
+  assert.ok(!/<!(channel|here|everyone)>/.test(text), 'a Production P0 alert never pages the channel');
   assert.ok(!text.includes('@all'), 'never a literal @all');
+  assert.match(text, /\*P0:\* 1 new/, 'the alert itself is unchanged');
   db.close();
 });
 
-test('a reopened P0 alert mentions the channel exactly once', async () => {
+test('a reopened P0 alert carries no broad mention', async () => {
   const { db, store } = freshStore();
   const sender = mockSender();
   const pipeline = pipelineWith(store, sender);
@@ -512,13 +664,23 @@ test('a reopened P0 alert mentions the channel exactly once', async () => {
 
   assert.equal(third.lifecycleCounts.reopened, 1);
   assert.equal(sender.sent.length, 3);
-  const text = sender.sent[2].text;
-  assert.equal(text.split('<!channel>').length - 1, 1);
-  assert.match(text, /\*P0:\* 1 reopened/);
-
-  // The middle message was resolved-only — no broad mention on it.
-  assert.ok(!/<!(channel|here|everyone)>/.test(sender.sent[1].text), 'resolved-only must not page the channel');
+  assert.match(sender.sent[2].text, /\*P0:\* 1 reopened/);
+  assert.ok(sender.sent.every((m) => !/<!(channel|here|everyone)>/.test(m.text)));
   db.close();
+});
+
+test('no configured SLACK_CRITICAL_MENTION value can reintroduce a mention', async () => {
+  for (const mode of ['channel', 'here', 'everyone', 'none', undefined]) {
+    const { db, store } = freshStore();
+    const sender = mockSender();
+    const pipeline = pipelineWith(store, sender, { slackCriticalMention: mode });
+    await pipeline.handleProjectCompleted({ project, auditRunId: 'r1', results: results(), criticalIssues: [critical(1)] });
+    assert.ok(
+      !/<!(channel|here|everyone)>/.test(sender.sent[0].text),
+      `slackCriticalMention=${mode} must not render a mention`,
+    );
+    db.close();
+  }
 });
 
 test('an unchanged-only alert carries no broad mention (all_current mode)', async () => {
@@ -533,26 +695,7 @@ test('an unchanged-only alert carries no broad mention (all_current mode)', asyn
 
   assert.equal(second.lifecycleCounts.unchanged, 1);
   assert.equal(sender.sent.length, 2);
-  assert.equal(sender.sent[0].text.split('<!channel>').length - 1, 1, 'the first (new) alert mentions');
-  assert.ok(!/<!(channel|here|everyone)>/.test(sender.sent[1].text), 'the unchanged-only alert does not');
-  db.close();
-});
-
-test('SLACK_CRITICAL_MENTION selects the token, and none disables it', async () => {
-  for (const [mode, token] of [['channel', '<!channel>'], ['here', '<!here>'], ['everyone', '<!everyone>']]) {
-    const { db, store } = freshStore();
-    const sender = mockSender();
-    const pipeline = pipelineWith(store, sender, { slackCriticalMention: mode });
-    await pipeline.handleProjectCompleted({ project, auditRunId: 'r1', results: results(), criticalIssues: [critical(1)] });
-    assert.equal(sender.sent[0].text.split(token).length - 1, 1, `${mode} must render ${token}`);
-    db.close();
-  }
-
-  const { db, store } = freshStore();
-  const sender = mockSender();
-  const pipeline = pipelineWith(store, sender, { slackCriticalMention: 'none' });
-  await pipeline.handleProjectCompleted({ project, auditRunId: 'r1', results: results(), criticalIssues: [critical(1)] });
-  assert.ok(!/<!(channel|here|everyone)>/.test(sender.sent[0].text), 'none disables the mention entirely');
+  assert.ok(sender.sent.every((m) => !/<!(channel|here|everyone)>/.test(m.text)));
   db.close();
 });
 
@@ -706,7 +849,7 @@ test('a retry resends the persisted body verbatim rather than rebuilding it', as
 
   const [row] = store.listRetryableNotifications({ now: new Date(Date.now() + 7 * 3600_000).toISOString() });
   const storedText = JSON.parse(row.payload_json)[0].text;
-  assert.equal(storedText.split('<!channel>').length - 1, 1, 'the stored body keeps the single mention');
+  assert.ok(!/<!(channel|here|everyone)>/.test(storedText), 'nothing stores a broad mention any more');
 
   const sender = mockSender();
   const summary = await retryPendingNotifications({

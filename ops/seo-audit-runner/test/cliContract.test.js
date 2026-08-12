@@ -125,6 +125,7 @@ test('every JSON-mode command emits exactly one envelope on stdout', () => {
   const commands = [
     ['init'],
     ['validate-config'],
+    ['version'],
     ['status'],
     ['health'],
     ['doctor'],
@@ -244,6 +245,7 @@ test('management and diagnostic commands have stable, documented exit codes', ()
   const cases = [
     { args: ['init'], expect: [0] },
     { args: ['validate-config'], expect: [0] },
+    { args: ['version'], expect: [0] },
     { args: ['status'], expect: [0] },
     { args: ['worker', '--once'], expect: [0] },
     { args: ['job', 'list'], expect: [0] },
@@ -370,6 +372,7 @@ test('read-only diagnostics mutate no runner state', () => {
   const before = stateCounts(stateDbPath);
   const readOnly = [
     ['validate-config'],
+    ['version'],
     ['health'],
     ['doctor'],
     ['status'],
@@ -392,7 +395,7 @@ test('read-only diagnostics mutate no runner state', () => {
 test('read-only diagnostics leave no lock file behind', () => {
   const stateDir = tmpDir();
   const lockPath = path.join(stateDir, 'seo-audit-runner.lock');
-  for (const args of [['health'], ['doctor'], ['status'], ['job', 'list'], ['schedule', 'list']]) {
+  for (const args of [['version'], ['health'], ['doctor'], ['status'], ['job', 'list'], ['schedule', 'list']]) {
     cli(args, { stateDir });
     assert.equal(fs.existsSync(lockPath), false, `${args.join(' ')} left a lock file`);
   }
@@ -734,4 +737,43 @@ test('no command prints a configured Slack secret in either mode', () => {
     assert.ok(!r.output.includes(secret), `${args.join(' ')} leaked the Slack token`);
     assert.ok(!r.output.includes('C0CONTRACT'), `${args.join(' ')} leaked the channel id`);
   }
+});
+
+// ── version: release identity, read-only and secret-free ────────────
+
+test('version reports release identity without touching config, state, or secrets', () => {
+  const stateDir = tmpDir();
+  const stateDbPath = path.join(stateDir, 'runner-state.sqlite');
+  const r = cli(['version'], { stateDir });
+
+  assert.equal(r.status, 0, r.output);
+  assert.match(r.stdout, /Package version\s+= /);
+  assert.match(r.stdout, /Git SHA\s+= /);
+  assert.match(r.stdout, /Release stamp\s+= /);
+  assert.match(r.stdout, /Release checksum\s+= /);
+  assert.match(r.stdout, /Node version\s+= v\d+\./);
+  // No state database is created just to answer a version query.
+  assert.equal(fs.existsSync(stateDbPath), false, 'version must not create runner state');
+});
+
+test('version emits the standard JSON envelope with every identity field', () => {
+  const stateDir = tmpDir();
+  const parsed = envelope(cli(['version', '--output', 'json'], { stateDir }));
+
+  assert.equal(parsed.command, 'version');
+  assert.equal(parsed.ok, true);
+  for (const key of [
+    'packageVersion', 'gitSha', 'gitShaShort', 'gitShaSource',
+    'releaseStamp', 'releaseChecksum', 'nodeVersion',
+  ]) {
+    assert.ok(key in parsed.data, `missing field: ${key}`);
+  }
+  assert.match(parsed.data.nodeVersion, /^v\d+\./);
+});
+
+test('version works even when the configuration is invalid', () => {
+  // Deployment parity must be checkable on a half-configured host.
+  const r = cli(['version'], { stateDir: tmpDir(), env: { SEO_API_BASE_URL: 'not-a-url' } });
+  assert.equal(r.status, 0, r.output);
+  assert.match(r.stdout, /Git SHA\s+= /);
 });

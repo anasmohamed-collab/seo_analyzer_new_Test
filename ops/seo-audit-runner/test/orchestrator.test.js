@@ -80,7 +80,7 @@ test('completed audit: polls until COMPLETED and extracts P0 issues', async () =
   assert.ok(apiClient.calls.getRunResults.length >= 3);
 });
 
-test('Beta projects remain included and pass only exposure P1 findings to alerting', async () => {
+test('Beta projects stay included, and the FULL P0 snapshot reaches the lifecycle hook', async () => {
   const projects = [
     project({ is_beta: false }),
     project({
@@ -102,10 +102,11 @@ test('Beta projects remain included and pass only exposure P1 findings to alerti
       status: 'COMPLETED',
       siteRecommendations: [
         {
-          priority: 'P1',
+          priority: 'P0',
           area: 'robots',
           message: 'Beta/Staging site is crawlable by Googlebot and Googlebot-News',
         },
+        { priority: 'P0', area: 'meta', message: 'Ordinary critical SEO issue' },
         { priority: 'P1', area: 'sitemap', message: 'Unrelated warning' },
       ],
       results: [],
@@ -126,12 +127,19 @@ test('Beta projects remain included and pass only exposure P1 findings to alerti
   assert.equal(apiClient.calls.startAudit.length, 2);
   assert.equal(report.entries.filter((entry) => entry.outcome === OUTCOME.COMPLETED).length, 2);
   assert.deepEqual(completedProjects.map((item) => item.project.id), ['p1', 'p2']);
-  assert.equal(completedProjects[0].criticalIssues.length, 0, 'Production remains P0-only');
-  assert.deepEqual(
-    completedProjects[1].criticalIssues.map((issue) => [issue.priority, issue.message]),
-    [['P1', 'Beta/Staging site is crawlable by Googlebot and Googlebot-News']],
-  );
-  assert.equal(report.criticalIssues.length, 0, 'P1 Beta exposure does not become a report P0');
+
+  // Both environments hand the pipeline the COMPLETE P0 set. Narrowing to what
+  // Slack may announce happens inside the pipeline, not here — otherwise an
+  // unalerted Beta P0 would drop out of the snapshot and be falsely RESOLVED.
+  const expected = [
+    ['P0', 'Beta/Staging site is crawlable by Googlebot and Googlebot-News'],
+    ['P0', 'Ordinary critical SEO issue'],
+  ];
+  for (const entry of completedProjects) {
+    assert.deepEqual(entry.criticalIssues.map((issue) => [issue.priority, issue.message]), expected);
+  }
+  assert.equal(report.criticalIssues.length, 4, 'the local report keeps every P0 for both projects');
+  assert.ok(!report.criticalIssues.some((issue) => issue.message === 'Unrelated warning'));
 });
 
 test('failed audit: FAILED status is terminal', async () => {

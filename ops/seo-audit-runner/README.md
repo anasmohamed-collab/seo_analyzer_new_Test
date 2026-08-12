@@ -102,7 +102,7 @@ SLACK_BOT_TOKEN=
 SLACK_CHANNEL_ID=
 SLACK_WEBHOOK_URL=
 
-SLACK_CRITICAL_MENTION=channel
+SLACK_CRITICAL_MENTION=none
 SLACK_REQUEST_TIMEOUT_MS=15000
 SLACK_MAX_RETRIES=4
 SLACK_MAX_ISSUES_PER_MESSAGE=20
@@ -162,35 +162,33 @@ without channel ID or vice versa) is always a configuration error.
 | `summary_only` | Project-level counts only, no individual issues. |
 | `disabled` | Never send Slack messages — issue lifecycle state is still updated after successful audits. |
 
-### Critical mentions (`SLACK_CRITICAL_MENTION`)
+### Broad mentions (`SLACK_CRITICAL_MENTION`) — permanently disabled
 
-| Value | Slack token | Who is notified |
-|---|---|---|
-| `channel` *(default)* | `<!channel>` | **all members of the Slack channel**, online or not |
-| `here` | `<!here>` | only the **currently active** members of the channel |
-| `everyone` | `<!everyone>` | everyone in the workspace — **only appropriate for `#general`** |
-| `none` | *(none)* | disables critical mentions entirely |
+**No runner message can page a whole channel.** `<!channel>`, `<!here>` and
+`<!everyone>` are not generated anywhere: the formatter has no mention
+parameter, and the notification pipeline passes none. This applies to every
+message type — Production critical alerts, Beta Exposure alerts, run summaries
+and failure notices alike. The literal string `@all` is never emitted either.
 
-Rules:
+| Value | Effect |
+|---|---|
+| *(omitted)* / `none` *(default)* | no mention — the only effective behavior |
+| `channel` / `here` / `everyone` | **accepted, then neutralized to `none`** so existing env files keep validating; the value is never honored |
+| anything else | **configuration error** — `validate-config` fails rather than guessing |
 
-- The mention is added **only** when the alert contains at least one **new or
-  reopened P0** issue, and then exactly once, in the first line (so it is
-  present in both the plain-text fallback and the first mrkdwn block).
-- **Unchanged-only** and **resolved-only** alerts carry no mention.
-- **Run summaries never contain a broad mention**, and neither do ordinary
-  informational or failure messages.
-- The literal string `@all` is never emitted.
-- An invalid value is a **configuration error** (`validate-config` fails) —
-  the runner never silently falls back to a different mention type. Use
-  `none` to switch mentions off.
-- **Slack workspace permissions may restrict broad mentions.** If the posting
-  identity is not allowed to use `@channel`/`@here`, Slack still delivers the
-  message but renders the mention as plain text without notifying anyone.
+`validate-config` and `status` print which of the two happened, so a
+neutralized legacy value is visible rather than silent.
+
+Defense in depth: a notification payload that was serialized into the runner's
+SQLite state **before** this change still contains its mention token. Slack
+delivery strips broad mentions from the top-level text and from every mrkdwn
+block immediately before transmitting, on the first send and on every
+`retry-notifications` replay. The stored notification row is never rewritten,
+so notification history stays intact and auditable.
 
 ### Message format
 
-A critical alert is one short message: header (with the mention when it
-applies), project name (falling back to the normalized domain), P0 counts,
+A critical alert is one short message: header, project name (falling back to the normalized domain), P0 counts,
 **at most 5** issues — each one line of title + page type, the URL, and the
 canonical fix hint capped at 180 characters — a `+ N more critical issues`
 remainder when there are more, a compact technical line
@@ -216,6 +214,7 @@ current-critical-state conclusion was produced.
 ```bash
 seo-audit-runner init                     # explicit state create/migrate (idempotent)
 seo-audit-runner validate-config          # config + state dir + state DB (offline)
+seo-audit-runner version                  # release identity (see below)
 seo-audit-runner list-projects            # read-only listing with dedupe preview
 seo-audit-runner run --all                # audit every eligible, deduplicated project
 seo-audit-runner run --project PROJECT_ID # audit one project
@@ -280,7 +279,7 @@ Full specification: **`docs/CLI_CONTRACT.md`**. In short:
 
 ### Read-only commands
 
-`init`, `validate-config`, `list-projects`, `status`, `health`, `doctor`,
+`init`, `validate-config`, `version`, `list-projects`, `status`, `health`, `doctor`,
 `job list`, `job show`, `schedule list`, `retry-notifications --dry-run`, and
 `run --dry-run` never trigger an audit, send a notification, create a job or
 schedule, or write any row. Tests enforce this by snapshotting row counts and
@@ -507,3 +506,55 @@ real audits are started and no real Slack messages are sent.
 - Fingerprints are versioned (`v2` since Phase 3.1). The v2 change re-bases
   identities once: on the first run after upgrading, previously tracked
   issues resolve and reappear as new in a single transition.
+
+## Release identity and the deployment parity gate
+
+`seo-audit-runner version` answers **which reviewed commit is this runner?** —
+the RUNNER_SHA half of
+
+```
+REPO_SHA == APP_SHA == RUNNER_SHA
+```
+
+```bash
+sudo -u seo-runner seo-audit-runner version
+sudo -u seo-runner seo-audit-runner version --output json
+```
+
+It prints the package version, the **full** Git SHA, the release stamp, the
+release checksum, and the Node version. It loads no env file, no configuration
+and no secret, and creates no state — so it works on a half-configured host.
+
+`.release-stamp` (when it was installed) and `.release-checksum` (what the
+files hash to) are **not** repository identity: two different commits can
+produce byte-identical runner files. `.release-sha`, recorded by the installer,
+is. A different commit therefore produces a **new release** even when the files
+are unchanged, so the recorded identity can never name a stale commit.
+
+**Supplying the SHA**
+
+| Situation | How |
+|---|---|
+| git checkout | automatic — derived from `git rev-parse HEAD` in `--source` |
+| archive / tarball | `install.sh --git-sha <full-sha>` or `upgrade.sh --git-sha <full-sha>` |
+| either | `SEO_RUNNER_GIT_SHA=<full-sha>` in the installing shell |
+
+Only a **full** 40- or 64-character hex SHA is accepted; an abbreviated or
+malformed value is rejected outright rather than recorded. When no SHA is
+available the installer warns, records nothing, and `version` reports
+`unknown` — which fails the gate, by design.
+
+**Verifying all three sides** (every command read-only):
+
+```bash
+git -C <checkout> rev-parse HEAD                                    # REPO_SHA
+curl -s https://<app-host>/api/build-info | jq -r .gitSha           # APP_SHA
+sudo -u seo-runner seo-audit-runner version --output json \
+  | jq -r .data.gitSha                                              # RUNNER_SHA
+```
+
+The application side is injected at build/deploy time via `APP_GIT_SHA`
+(`docker build --build-arg APP_GIT_SHA="$(git rev-parse HEAD)"`, or a runtime
+variable on Nixpacks and similar platforms); common platform-provided variables
+are read automatically. An uninjected value is reported as `gitSha: null`, never
+fabricated.

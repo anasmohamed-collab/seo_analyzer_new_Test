@@ -1,7 +1,16 @@
 import { normalizeDomainKey } from './normalizeDomain.js';
 
+/**
+ * Exact hostname LABELS that mark a non-production environment. Matching is
+ * label-exact (`hostname.split('.')`), never substring — `newtimes.co.rw` and
+ * `stagecoach.example.com` are Production sites and must stay eligible.
+ *
+ * Kept in sync with the GSC sync and audit-config discovery classifiers, which
+ * already recognize the exact label `new` (as in `new.example.com`).
+ */
 export const NONPRODUCTION_LABELS = new Set([
   'beta',
+  'new',
   'next',
   'staging',
   'stage',

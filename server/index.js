@@ -9,6 +9,7 @@ import { seoIntelligenceRouter } from './routes/seo-intelligence.js';
 import { seoCrawlerRouter } from './routes/seo-site-crawler.js';
 import { newsSeoRouter } from './routes/news-seo.js';
 import { unifiedAuditRouter } from './routes/unified-audit.js';
+import { GIT_SHA_ENV_VARS, resolveGitSha } from '../shared/git-sha.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -246,7 +247,23 @@ try {
 }
 
 // Build/runtime diagnostics — confirm the deployed container runs the latest code.
+//
+// `gitSha` is the repository identity half of the deployment parity gate
+// REPO_SHA == APP_SHA == RUNNER_SHA. It is resolved ONCE, at start-up, from an
+// environment value injected at build/deploy time; `git` is never executed.
+// When no valid full SHA was injected it is reported as null — honestly
+// unknown, which must fail the gate rather than be papered over.
 const BUILD_TIME = new Date().toISOString();
+const { gitSha, gitShaShort, gitShaSource } = resolveGitSha(process.env);
+if (gitSha) {
+  console.log(`Build identity: gitSha=${gitSha} (from ${gitShaSource})`);
+} else {
+  console.warn(
+    'Build identity: gitSha is UNKNOWN — no valid full Git SHA was injected. ' +
+      `Set one of ${GIT_SHA_ENV_VARS.slice(0, 3).join(', ')} at build/deploy time; ` +
+      'the REPO_SHA == APP_SHA == RUNNER_SHA gate cannot pass without it.',
+  );
+}
 app.get('/api/build-info', (_req, res) => {
   res.json({
     app: 'seo-analyzer',
@@ -254,6 +271,11 @@ app.get('/api/build-info', (_req, res) => {
     model: process.env.NVIDIA_MODEL || null,
     buildTime: BUILD_TIME,
     nodeEnv: process.env.NODE_ENV || null,
+    // Added fields — all pre-existing fields above are unchanged.
+    gitSha,
+    gitShaShort,
+    gitShaSource,
+    nodeVersion: process.version,
   });
 });
 

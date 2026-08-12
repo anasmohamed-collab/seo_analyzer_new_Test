@@ -1,6 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { extractAutomationAlertIssues, extractCriticalIssues } from '../src/criticalFilter.js';
+import {
+  extractCriticalIssues,
+  filterNotificationIssues,
+  filterNotificationLifecycle,
+  isBetaExposureIssue,
+  isNotificationEligibleIssue,
+} from '../src/criticalFilter.js';
 
 const runResults = {
   id: 'run-1',
@@ -97,57 +103,115 @@ test('empty or malformed payloads produce no issues', () => {
   assert.equal(extractCriticalIssues({ results: 'nope', siteRecommendations: 42 }).length, 0);
 });
 
-test('Production scheduled alerts remain P0-only', () => {
-  const issues = extractAutomationAlertIssues(runResults, {
-    projectId: 'p1',
-    auditRunId: 'run-1',
-    isBeta: false,
-  });
-  assert.equal(issues.length, 3);
-  assert.ok(issues.every((issue) => issue.priority === 'P0'));
+test('Production notification candidates are every P0 finding', () => {
+  const criticals = extractCriticalIssues(runResults, { projectId: 'p1', auditRunId: 'run-1' });
+  const notifiable = filterNotificationIssues(criticals, { isBeta: false });
+  assert.equal(notifiable.length, 3);
+  assert.deepEqual(notifiable, criticals, 'Production filtering is a no-op');
+  assert.ok(notifiable.every((issue) => issue.priority === 'P0'));
 });
 
-test('Beta scheduled alerts add only the two explicit P1 exposure findings', () => {
-  const betaResults = {
-    siteRecommendations: [
-      {
-        priority: 'P1',
-        area: 'robots',
-        message: 'Beta/Staging site is crawlable by Googlebot and Googlebot-News',
-        fixHint: 'Block crawlers before launch.',
-      },
-      { priority: 'P1', area: 'sitemap', message: 'sitemap stale', fixHint: 'Refresh it.' },
-    ],
-    results: [
-      {
-        url: 'https://beta.example.com/',
-        data: { pageType: 'home' },
-        recommendations: [
-          {
-            priority: 'P1',
-            area: 'indexability',
-            message: 'Beta/Staging seed URL is indexable (no noindex directive detected)',
-            fixHint: 'Add a noindex directive before launch.',
-          },
-          { priority: 'P0', area: 'meta', message: 'Production critical', fixHint: 'Fix it.' },
-          { priority: 'P1', area: 'meta', message: 'Unrelated warning', fixHint: 'Review it.' },
-        ],
-      },
-    ],
-  };
+// The Beta environment now emits its two exposure findings at P0, so they
+// arrive in the ordinary P0 snapshot. Only they may reach Slack.
+const betaResults = {
+  siteRecommendations: [
+    {
+      priority: 'P0',
+      area: 'robots',
+      message: 'Beta/Staging site is crawlable by Googlebot and Googlebot-News',
+      fixHint: 'Block crawlers before launch.',
+    },
+    { priority: 'P1', area: 'sitemap', message: 'sitemap stale', fixHint: 'Refresh it.' },
+  ],
+  results: [
+    {
+      url: 'https://beta.example.com/',
+      data: { pageType: 'home' },
+      recommendations: [
+        {
+          priority: 'P0',
+          area: 'meta',
+          message: 'Beta/Staging seed URL is indexable (no noindex directive detected)',
+          fixHint: 'Add a noindex directive before launch.',
+        },
+        { priority: 'P0', area: 'meta', message: 'Production critical', fixHint: 'Fix it.' },
+        { priority: 'P1', area: 'meta', message: 'Unrelated warning', fixHint: 'Review it.' },
+      ],
+    },
+  ],
+};
 
-  const issues = extractAutomationAlertIssues(betaResults, {
-    projectId: 'beta-1',
-    auditRunId: 'run-beta',
-    isBeta: true,
-  });
-
-  assert.deepEqual(issues.map((issue) => issue.message), [
+test('the Beta snapshot still contains every P0, including ordinary SEO issues', () => {
+  const criticals = extractCriticalIssues(betaResults, { projectId: 'beta-1', auditRunId: 'run-beta' });
+  assert.deepEqual(criticals.map((i) => i.message), [
     'Beta/Staging seed URL is indexable (no noindex directive detected)',
     'Production critical',
     'Beta/Staging site is crawlable by Googlebot and Googlebot-News',
   ]);
-  assert.deepEqual(issues.map((issue) => issue.priority), ['P1', 'P0', 'P1']);
-  assert.ok(!issues.some((issue) => issue.message === 'Unrelated warning'));
-  assert.ok(!issues.some((issue) => issue.message === 'sitemap stale'));
+});
+
+test('Beta notification candidates are ONLY the two exposure findings', () => {
+  const criticals = extractCriticalIssues(betaResults, { projectId: 'beta-1', auditRunId: 'run-beta' });
+  const notifiable = filterNotificationIssues(criticals, { isBeta: true });
+
+  assert.deepEqual(notifiable.map((issue) => issue.message), [
+    'Beta/Staging seed URL is indexable (no noindex directive detected)',
+    'Beta/Staging site is crawlable by Googlebot and Googlebot-News',
+  ]);
+  assert.ok(notifiable.every((issue) => issue.priority === 'P0'), 'nothing is promoted or rewritten');
+  assert.ok(!notifiable.some((issue) => issue.message === 'Production critical'));
+  assert.ok(!notifiable.some((issue) => issue.message === 'Unrelated warning'));
+  assert.ok(!notifiable.some((issue) => issue.message === 'sitemap stale'));
+});
+
+test('the crawlable-exposure message is matched for every crawler combination', () => {
+  for (const exposed of ['Googlebot', 'Googlebot-News', 'Googlebot and Googlebot-News']) {
+    assert.ok(isBetaExposureIssue({ message: `Beta/Staging site is crawlable by ${exposed}` }), exposed);
+  }
+  assert.ok(!isBetaExposureIssue({ message: 'Beta/Staging site is fine' }));
+  assert.ok(!isBetaExposureIssue({ message: null }));
+  assert.ok(!isBetaExposureIssue(null));
+});
+
+test('notification eligibility never depends on priority for Production', () => {
+  assert.ok(isNotificationEligibleIssue({ message: 'anything' }, { isBeta: false }));
+  assert.ok(!isNotificationEligibleIssue({ message: 'anything' }, { isBeta: true }));
+});
+
+test('the lifecycle filter narrows every bucket for Beta and no bucket for Production', () => {
+  const exposure = {
+    fingerprint: 'fp-exposure',
+    message: 'Beta/Staging seed URL is indexable (no noindex directive detected)',
+  };
+  const ordinary = { fingerprint: 'fp-ordinary', message: 'Missing title' };
+  const lifecycle = {
+    new: [exposure, ordinary],
+    reopened: [ordinary],
+    unchanged: [exposure],
+    resolved: [ordinary, exposure],
+  };
+
+  assert.deepEqual(filterNotificationLifecycle(lifecycle, { isBeta: false }), {
+    new: lifecycle.new,
+    reopened: lifecycle.reopened,
+    unchanged: lifecycle.unchanged,
+    resolved: lifecycle.resolved,
+  });
+
+  assert.deepEqual(filterNotificationLifecycle(lifecycle, { isBeta: true }), {
+    new: [exposure],
+    reopened: [],
+    unchanged: [exposure],
+    resolved: [exposure],
+  });
+});
+
+test('the lifecycle filter tolerates missing or malformed buckets', () => {
+  assert.deepEqual(filterNotificationLifecycle(null, { isBeta: true }), {
+    new: [], reopened: [], unchanged: [], resolved: [],
+  });
+  assert.deepEqual(filterNotificationLifecycle({ new: 'nope' }, { isBeta: false }), {
+    new: [], reopened: [], unchanged: [], resolved: [],
+  });
+  assert.deepEqual(filterNotificationIssues(null, { isBeta: true }), []);
 });

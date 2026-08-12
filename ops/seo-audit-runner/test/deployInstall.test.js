@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { openStateDb } from '../src/db.js';
 import { StateStore } from '../src/stateStore.js';
 import {
@@ -122,7 +123,7 @@ test('re-running the installer is idempotent (same release kept, env preserved)'
 
   const second = install(fx);
   assert.equal(second.status, 0, second.output);
-  assert.match(second.stdout, /runner code unchanged — keeping active release/);
+  assert.match(second.stdout, /runner code and git SHA unchanged — keeping active release/);
 
   assert.deepEqual(fs.readdirSync(fx.releases), releasesAfterFirst, 'a second release appeared');
   assert.deepEqual(fs.readFileSync(fx.envFile), envBytes, 'runner.env changed on re-install');
@@ -329,4 +330,149 @@ test('install accepts the real Node runtime with the right flag decision', { ski
       ? /Node\.js \d+\.\d+\.\d+ accepted \(--experimental-sqlite\)/
       : /Node\.js \d+\.\d+\.\d+ accepted \(no experimental flag needed\)/;
   assert.match(r.stdout, expected);
+});
+
+// ── Release identity: the RUNNER_SHA half of the parity gate ────────
+
+const SHA_A = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+const SHA_B = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+
+const releaseShaFile = (fx) => path.join(fx.opt, 'current', '.release-sha');
+
+/**
+ * Run the INSTALLED release's CLI directly with this Node.
+ * The command wrapper drops privileges via runuser, which a rootless test
+ * environment cannot do; invoking the installed entrypoint exercises the same
+ * code and the same release metadata without needing that.
+ */
+function runVersion(fx, args = []) {
+  const entry = path.join(fs.realpathSync(path.join(fx.opt, 'current')), 'bin', 'seo-audit-runner.js');
+  const env = { ...process.env };
+  delete env.SEO_RUNNER_GIT_SHA;
+  const r = spawnSync(process.execPath, [entry, 'version', ...args], { encoding: 'utf8', env });
+  const stdout = r.stdout ?? '';
+  const stderr = r.stderr ?? '';
+  return { status: r.status, stdout, stderr, output: stdout + stderr };
+}
+
+test('the installer records an explicit --git-sha as immutable release metadata', { skip }, () => {
+  const fx = fixture();
+  const r = install(fx, ['--git-sha', SHA_A]);
+  assert.equal(r.status, 0, r.output);
+
+  assert.equal(fs.readFileSync(releaseShaFile(fx), 'utf8').trim(), SHA_A);
+  assert.match(r.stdout, new RegExp(`release identity: git SHA ${SHA_A} \\(source: explicit\\)`));
+  // The pre-existing metadata is still written alongside it.
+  assert.ok(fs.existsSync(path.join(fx.opt, 'current', '.release-stamp')));
+  assert.ok(fs.existsSync(path.join(fx.opt, 'current', '.release-checksum')));
+});
+
+test('SEO_RUNNER_GIT_SHA is accepted for archive installs with no repository', { skip }, () => {
+  const fx = fixture();
+  const r = install(fx, [], { env: { ...process.env, SEO_RUNNER_GIT_SHA: SHA_A } });
+  assert.equal(r.status, 0, r.output);
+  assert.equal(fs.readFileSync(releaseShaFile(fx), 'utf8').trim(), SHA_A);
+});
+
+test('a malformed or abbreviated --git-sha is rejected outright', { skip }, () => {
+  for (const value of ['abc1234', 'not-a-sha', SHA_A.slice(0, 39), `${SHA_A}extra`, 'unknown', '$GIT_SHA']) {
+    const fx = fixture();
+    const r = install(fx, ['--git-sha', value]);
+    assert.notEqual(r.status, 0, `install must fail for ${JSON.stringify(value)}`);
+    assert.match(r.output, /must be a full 40- or 64-character hex Git SHA/);
+  }
+});
+
+test('re-installing the SAME SHA and content keeps the active release', { skip }, () => {
+  const fx = fixture();
+  assert.equal(install(fx, ['--git-sha', SHA_A]).status, 0);
+  const releases = fs.readdirSync(fx.releases);
+
+  const second = install(fx, ['--git-sha', SHA_A]);
+  assert.equal(second.status, 0, second.output);
+  assert.match(second.stdout, /runner code and git SHA unchanged — keeping active release/);
+  assert.deepEqual(fs.readdirSync(fx.releases), releases, 'a redundant release appeared');
+  assert.equal(fs.readFileSync(releaseShaFile(fx), 'utf8').trim(), SHA_A);
+});
+
+test('a DIFFERENT SHA creates a new release even when the runner files are identical', { skip }, () => {
+  const fx = fixture();
+  assert.equal(install(fx, ['--git-sha', SHA_A]).status, 0);
+  const releasesAfterFirst = fs.readdirSync(fx.releases);
+
+  const second = install(fx, ['--git-sha', SHA_B]);
+  assert.equal(second.status, 0, second.output);
+  assert.match(second.stdout, /runner files unchanged but git SHA differs/);
+
+  const releasesAfterSecond = fs.readdirSync(fx.releases);
+  assert.ok(
+    releasesAfterSecond.length > releasesAfterFirst.length,
+    'a new commit must produce a new release identity even with identical files',
+  );
+  assert.equal(fs.readFileSync(releaseShaFile(fx), 'utf8').trim(), SHA_B);
+});
+
+test('an install with no SHA available warns and records no .release-sha', { skip }, () => {
+  const fx = fixture();
+  // Copy the runner sources somewhere with no .git so nothing can be derived.
+  const archive = path.join(fx.work, 'archive');
+  fs.mkdirSync(archive, { recursive: true });
+  for (const entry of ['bin', 'src', 'package.json', 'README.md', 'docs', 'deploy', 'config']) {
+    const from = path.join(RUNNER_ROOT, entry);
+    if (fs.existsSync(from)) fs.cpSync(from, path.join(archive, entry), { recursive: true });
+  }
+
+  const r = runScript(
+    path.join(archive, 'deploy', 'install.sh'),
+    stagedInstallArgs(fx.destdir, ['--source', archive]),
+  );
+  assert.equal(r.status, 0, r.output);
+  assert.ok(!fs.existsSync(releaseShaFile(fx)), 'an unknown SHA must never be fabricated on disk');
+  assert.match(r.output, /no Git SHA available/);
+  assert.match(r.output, /FAILS the/);
+});
+
+test('the version command reports the recorded release identity and never loads secrets', { skip }, () => {
+  const fx = fixture();
+  fs.mkdirSync(fx.etc, { recursive: true });
+  fs.writeFileSync(fx.envFile, EXISTING_ENV);
+  assert.equal(install(fx, ['--git-sha', SHA_A]).status, 0);
+
+  const text = runVersion(fx);
+  assert.equal(text.status, 0, text.output);
+  assert.match(text.stdout, new RegExp(`Git SHA\\s+= ${SHA_A}`));
+  assert.match(text.stdout, /Package version\s+= \d+\.\d+\.\d+/);
+  assert.match(text.stdout, /Release stamp\s+= \d{14}/);
+  assert.match(text.stdout, /Release checksum\s+= [0-9a-f]{64}/);
+  assert.match(text.stdout, /Node version\s+= v\d+\./);
+  assert.ok(!text.output.includes(SECRET), 'version must never surface a configured secret');
+
+  const json = runVersion(fx, ['--output', 'json']);
+  assert.equal(json.status, 0, json.output);
+  const envelope = JSON.parse(json.stdout);
+  assert.equal(envelope.schemaVersion, 1);
+  assert.equal(envelope.command, 'version');
+  assert.equal(envelope.ok, true);
+  assert.equal(envelope.data.gitSha, SHA_A);
+  assert.equal(envelope.data.gitShaShort, SHA_A.slice(0, 7));
+  assert.equal(envelope.data.gitShaSource, '.release-sha');
+  assert.match(envelope.data.releaseStamp, /^\d{14}/);
+  assert.match(envelope.data.releaseChecksum, /^[0-9a-f]{64}$/);
+  assert.match(envelope.data.nodeVersion, /^v\d+\./);
+  assert.ok(!json.output.includes(SECRET));
+});
+
+test('an unknown SHA is visible in version output rather than hidden', { skip }, () => {
+  const fx = fixture();
+  assert.equal(install(fx, ['--git-sha', SHA_A]).status, 0);
+  fs.rmSync(path.join(fs.realpathSync(path.join(fx.opt, 'current')), '.release-sha'));
+
+  const text = runVersion(fx);
+  assert.equal(text.status, 0, text.output);
+  assert.match(text.stdout, /Git SHA\s+= unknown/);
+  assert.match(text.stdout, /FAILS the REPO_SHA == APP_SHA == RUNNER_SHA parity gate/);
+
+  const json = JSON.parse(runVersion(fx, ['--output', 'json']).stdout);
+  assert.equal(json.data.gitSha, null);
+  assert.equal(json.data.gitShaSource, null);
 });

@@ -368,7 +368,19 @@ interface RobotsRule {
 interface RobotsResult {
   status: RobotsStatus;
   httpStatus: number;
+  /**
+   * Absolute http(s) Sitemap: directives — the input to general sitemap
+   * discovery. Deliberately unchanged: `discoverAndValidateSitemaps()`
+   * consumes this list and its candidate ordering must stay stable.
+   */
   sitemapsFound: string[];
+  /**
+   * Every Sitemap: directive value exactly as declared, in declaration order.
+   * A superset of `sitemapsFound` — it also carries root-relative declarations
+   * (e.g. `Sitemap: /news_sitemap.xml`) that the News Sitemap probe resolves
+   * against the audited origin.
+   */
+  sitemapDirectives: string[];
   rules: RobotsRule[];
   notes: string[];
 }
@@ -437,6 +449,7 @@ async function checkRobots(origin: string): Promise<RobotsResult> {
     status: 'ERROR',
     httpStatus: 0,
     sitemapsFound: [],
+    sitemapDirectives: [],
     rules: [],
     notes: [],
   };
@@ -496,6 +509,7 @@ async function checkRobots(origin: string): Promise<RobotsResult> {
       const sitemapMatch = trimmed.match(/^sitemap\s*:\s*(.+)/i);
       if (sitemapMatch) {
         const url = sitemapMatch[1].trim();
+        if (url && !result.sitemapDirectives.includes(url)) result.sitemapDirectives.push(url);
         if (/^https?:\/\//i.test(url)) result.sitemapsFound.push(url);
         continue;
       }
@@ -1033,7 +1047,55 @@ function checkCoverage(sitemap: SitemapResult): void {
 // Also runs even when the main sitemap discovery succeeds, because the
 // primary sitemap may be a sitemapindex with no news-specific entries.
 
-async function checkNewsSitemapPresence(origin: string): Promise<NewsSitemapResult> {
+/**
+ * Resolve one raw `Sitemap:` directive value to an absolute http(s) URL that is
+ * safe to hand to the outbound fetch helpers.
+ *
+ * Accepted:
+ *  - absolute `http://` / `https://` URLs (the standard form)
+ *  - root-relative paths (`/news_sitemap.xml`), resolved against the audited
+ *    origin — non-standard but common in the field
+ *
+ * Rejected (returns null): every other scheme (`ftp:`, `javascript:`,
+ * `file:`, `data:`), protocol-relative `//host/path` (it silently retargets
+ * another host), and anything `URL` cannot parse. Rejection here is only a
+ * candidate filter — the outbound SSRF policy is still enforced per request by
+ * `fetchWithSafeRedirects()`.
+ */
+export function resolveSitemapDirective(raw: string, origin: string): string | null {
+  const value = String(raw ?? '').trim();
+  if (!value) return null;
+
+  let resolved: URL;
+  try {
+    if (/^https?:\/\//i.test(value)) {
+      resolved = new URL(value);
+    } else if (value.startsWith('/') && !value.startsWith('//')) {
+      resolved = new URL(value, origin);
+    } else {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+
+  if (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') return null;
+  return resolved.href;
+}
+
+/** Does this candidate URL name itself as a news sitemap (`news-sitemap`, `news_sitemap`, …)? */
+function isNewsNamedSitemapUrl(url: string): boolean {
+  try {
+    return /news/i.test(new URL(url).pathname);
+  } catch {
+    return /news/i.test(url);
+  }
+}
+
+export async function checkNewsSitemapPresence(
+  origin: string,
+  declaredSitemaps: string[] = [],
+): Promise<NewsSitemapResult> {
   const result: NewsSitemapResult = {
     status: 'NOT_FOUND',
     url: null,
@@ -1047,9 +1109,26 @@ async function checkNewsSitemapPresence(origin: string): Promise<NewsSitemapResu
     notes: [],
   };
 
-  // Build deduplicated probe list (https first, http fallback)
-  const candidates: string[] = [];
+  // Build the deduplicated probe list. robots.txt-declared sitemaps come first
+  // (in declaration order), then the guessed well-known paths (https first,
+  // http fallback). Deduplication never reorders: the first occurrence wins.
+  interface NewsCandidate { url: string; source: 'robots.txt' | 'guessed'; newsNamed: boolean }
+  const candidates: NewsCandidate[] = [];
   const seen = new Set<string>();
+  const candidateKey = (url: string) => url.toLowerCase().replace(/\/+$/, '');
+  const addCandidate = (url: string, source: NewsCandidate['source']) => {
+    const key = candidateKey(url);
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push({ url, source, newsNamed: isNewsNamedSitemapUrl(url) });
+  };
+
+  const rejectedDirectives: string[] = [];
+  for (const directive of declaredSitemaps) {
+    const resolved = resolveSitemapDirective(directive, origin);
+    if (resolved) addCandidate(resolved, 'robots.txt');
+    else if (String(directive ?? '').trim()) rejectedDirectives.push(String(directive).trim());
+  }
 
   for (const path of NEWS_SITEMAP_PATHS) {
     const https = origin.startsWith('https://')
@@ -1059,18 +1138,27 @@ async function checkNewsSitemapPresence(origin: string): Promise<NewsSitemapResu
       ? `${origin}${path}`
       : `${origin.replace(/^https:\/\//, 'http://')}${path}`;
 
-    if (!seen.has(https)) { seen.add(https); candidates.push(https); }
-    if (!seen.has(http))  { seen.add(http);  candidates.push(http); }
+    addCandidate(https, 'guessed');
+    addCandidate(http, 'guessed');
   }
 
-  result.probedUrls = candidates;
-  console.log(`[news-sitemap] Probing ${candidates.length} candidates`);
+  result.probedUrls = candidates.map((c) => c.url);
+  console.log(
+    `[news-sitemap] Probing ${candidates.length} candidates ` +
+      `(${candidates.filter((c) => c.source === 'robots.txt').length} declared in robots.txt)`,
+  );
+  if (rejectedDirectives.length > 0) {
+    console.log(`[news-sitemap] Ignored unsupported Sitemap directive(s): ${rejectedDirectives.join(', ')}`);
+  }
 
   let lastBlockedUrl: string | null = null;
   let lastBlockedStatus: number | null = null;
   let lastBotProtectionUrl: string | null = null;
+  // An ordinary (non-news-named) sitemap with no news signals must not mask a
+  // News Sitemap declared later in robots.txt — remember it and keep probing.
+  let skippedGeneralSitemapUrl: string | null = null;
 
-  for (const url of candidates) {
+  for (const { url, newsNamed } of candidates) {
     let res: Awaited<ReturnType<typeof safeFetch>>;
     try {
       res = await safeFetch(url, SITEMAP_TIMEOUT, { maxBytes: MAX_CHILD_SIZE });
@@ -1135,6 +1223,18 @@ async function checkNewsSitemapPresence(origin: string): Promise<NewsSitemapResu
     const hasTitle   = /<news:title[\s>]/i.test(body);
     const hasPubTag  = /<news:publication[\s>]/i.test(body);
     const urlCount   = countUrlEntries(body);
+
+    // A general sitemap declared in robots.txt is valid XML with no news
+    // signals at all. Accepting it here would report "News sitemap found but
+    // missing everything" and hide a real News Sitemap declared further down.
+    // News-NAMED candidates (every guessed path, plus declared *news* URLs)
+    // keep the existing FOUND + missing-tags reporting so genuinely malformed
+    // News Sitemaps are still surfaced.
+    if (!hasNewsNS && !hasPubDate && !hasTitle && !hasPubTag && !newsNamed) {
+      if (!skippedGeneralSitemapUrl) skippedGeneralSitemapUrl = url;
+      console.log(`[news-sitemap] SKIP: ${url} is a general ${root} with no news signals — continuing`);
+      continue;
+    }
 
     result.status           = 'FOUND';
     result.url              = url;
@@ -1215,6 +1315,17 @@ async function checkNewsSitemapPresence(origin: string): Promise<NewsSitemapResu
     console.log('[news-sitemap] Final status: NOT_FOUND');
   }
 
+  if (skippedGeneralSitemapUrl) {
+    result.notes.push(
+      `A sitemap declared in robots.txt (${skippedGeneralSitemapUrl}) is a general sitemap with no Google News tags — it was not counted as a news sitemap.`,
+    );
+  }
+  if (rejectedDirectives.length > 0) {
+    result.notes.push(
+      `Ignored ${rejectedDirectives.length} unsupported Sitemap: directive(s) in robots.txt — only absolute http(s) URLs and root-relative paths are probed.`,
+    );
+  }
+
   return result;
 }
 
@@ -1232,6 +1343,7 @@ export async function runSiteChecks(domain: string): Promise<SiteChecksResult> {
         status: 'ERROR',
         httpStatus: 0,
         sitemapsFound: [],
+        sitemapDirectives: [],
         rules: [],
         notes: ['Invalid domain'],
       },
@@ -1267,6 +1379,7 @@ export async function runSiteChecks(domain: string): Promise<SiteChecksResult> {
       status: 'ERROR',
       httpStatus: 0,
       sitemapsFound: [],
+      sitemapDirectives: [],
       rules: [],
       notes: [`Unexpected error: ${err instanceof Error ? err.message : 'unknown'}`],
     };
@@ -1277,7 +1390,9 @@ export async function runSiteChecks(domain: string): Promise<SiteChecksResult> {
   // sitemap is blocked, and it validates Google News namespace + required tags.
   const [sitemapSettled, newsSitemapSettled] = await Promise.allSettled([
     discoverAndValidateSitemaps(origin, robotsResult.sitemapsFound),
-    checkNewsSitemapPresence(origin),
+    // The News probe receives every declared directive (including root-relative
+    // ones), not just the absolute list general discovery consumes.
+    checkNewsSitemapPresence(origin, robotsResult.sitemapDirectives),
   ]);
 
   let sitemapResult: SitemapResult;

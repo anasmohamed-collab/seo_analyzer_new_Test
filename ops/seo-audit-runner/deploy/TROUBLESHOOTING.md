@@ -143,15 +143,18 @@ Fix the configuration, then re-run the audit to generate a fresh message —
 retrying the old record cannot succeed for a permanent error.
 
 **The channel is not notified even though the alert arrived**
-Critical alerts add a channel-wide mention (`SLACK_CRITICAL_MENTION`, default
-`channel`) **only** when the alert contains a new or reopened P0 issue —
-unchanged-only alerts, resolved-only alerts, and run summaries never mention
-the channel by design. If a new-P0 alert shows `@channel` as plain text
-instead of notifying anyone, the Slack **workspace** restricts who may post
-broad mentions; grant the posting identity that permission in Slack, or set
-`SLACK_CRITICAL_MENTION=none` and rely on the message itself. An invalid value
-(anything but `channel`, `here`, `everyone`, `none`) fails `validate-config`
-rather than falling back silently.
+This is intended. **Broad mentions are permanently disabled**: no runner
+message emits `<!channel>`, `<!here>` or `<!everyone>`. Critical alerts, Beta
+Exposure alerts and run summaries all arrive without paging the channel — use
+Slack channel notification preferences or a keyword highlight if someone needs
+to be woken.
+
+`SLACK_CRITICAL_MENTION` is still accepted so old env files keep validating.
+A broad value (`channel` / `here` / `everyone`) is **neutralized to `none`**
+and `status` / `validate-config` say so; anything outside that vocabulary is
+still a configuration error rather than a silent fallback. A payload queued in
+SQLite before this change is stripped of its mention at delivery time, so even
+a replayed legacy notification cannot page the channel.
 
 **Message queued but not sent (`PENDING` / `FAILED`)**
 Transient failures are retried by the next tick. To force a pass now:

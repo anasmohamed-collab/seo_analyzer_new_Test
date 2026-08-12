@@ -28,6 +28,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Deployment parity gate (REPO_SHA == APP_SHA == RUNNER_SHA).
+        # Build with:  APP_GIT_SHA=$(git rev-parse HEAD) docker compose build
+        # Unset → /api/build-info reports gitSha: null, and the gate fails.
+        APP_GIT_SHA: ${APP_GIT_SHA:-}
     ports:
       - "${PORT:-3000}:3000"
     environment:

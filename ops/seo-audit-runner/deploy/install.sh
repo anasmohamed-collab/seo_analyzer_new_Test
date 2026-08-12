@@ -63,6 +63,7 @@ DESTDIR=
 SOURCE_DIR=$DEFAULT_SOURCE
 NODE_BIN=
 NODE_EXPLICIT=0
+GIT_SHA=${SEO_RUNNER_GIT_SHA:-}
 
 usage() {
   cat <<'EOF'
@@ -87,6 +88,14 @@ Options:
                     This installer NEVER downloads or installs Node.js itself.
   --source <dir>    Runner source directory (default: the checkout containing
                     this script).
+  --git-sha <sha>   FULL 40- or 64-character Git SHA of the reviewed commit
+                    being installed. Recorded immutably in the release as
+                    .release-sha and reported by `seo-audit-runner version`.
+                    Also accepted via SEO_RUNNER_GIT_SHA. Required for the
+                    REPO_SHA == APP_SHA == RUNNER_SHA deployment gate; an
+                    abbreviated or malformed value is rejected outright.
+                    Omitted for a git checkout → derived from `git rev-parse
+                    HEAD` in --source when that is a clean, usable repository.
   --destdir <dir>   Stage the layout under <dir> instead of / (rootless
                     testing / packaging). System install without --destdir
                     requires root.
@@ -123,6 +132,15 @@ while [ "$#" -gt 0 ]; do
       ;;
     --source=*)
       SOURCE_DIR=${1#*=}
+      shift
+      ;;
+    --git-sha)
+      [ "$#" -ge 2 ] || fail "--git-sha requires a value"
+      GIT_SHA=$2
+      shift 2
+      ;;
+    --git-sha=*)
+      GIT_SHA=${1#*=}
       shift
       ;;
     --destdir)
@@ -287,7 +305,53 @@ else
   fi
 fi
 
-# ── Release install (immutable; new release only when content changed) ──
+# ── Repository identity (RUNNER_SHA half of the parity gate) ────────
+#
+# The release checksum is CONTENT identity, not REPOSITORY identity: two
+# different commits can produce byte-identical runner files. `.release-sha`
+# records which reviewed commit was installed, so the deployment gate
+# REPO_SHA == APP_SHA == RUNNER_SHA can actually be verified.
+#
+# Precedence: explicit --git-sha / SEO_RUNNER_GIT_SHA, else `git rev-parse
+# HEAD` when --source is a usable git checkout. An archive/tarball install has
+# neither, so the SHA stays unknown — reported honestly, and it fails the gate.
+normalize_git_sha() { # <raw> -> prints the normalized SHA, or nothing
+  raw=$(printf '%s' "${1:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+  case $raw in
+    '' | unknown | none | null | undefined | head | 'n/a' | na | -) return 0 ;;
+    *'$'* | *'{'* | *'}'*) return 0 ;;  # unexpanded ${VAR} templating
+  esac
+  case $raw in
+    *[!0-9a-f]*) return 0 ;;
+  esac
+  case ${#raw} in
+    40 | 64) printf '%s' "$raw" ;;
+  esac
+}
+
+GIT_SHA_SOURCE=
+if [ -n "$GIT_SHA" ]; then
+  raw_git_sha=$GIT_SHA
+  GIT_SHA=$(normalize_git_sha "$raw_git_sha")
+  [ -n "$GIT_SHA" ] || fail "--git-sha/SEO_RUNNER_GIT_SHA must be a full 40- or 64-character hex Git SHA, got: $raw_git_sha"
+  GIT_SHA_SOURCE=explicit
+else
+  if command -v git >/dev/null 2>&1 && [ -d "$SOURCE_DIR/.git" ] || \
+     { command -v git >/dev/null 2>&1 && git -C "$SOURCE_DIR" rev-parse --git-dir >/dev/null 2>&1; }; then
+    GIT_SHA=$(normalize_git_sha "$(git -C "$SOURCE_DIR" rev-parse HEAD 2>/dev/null || true)")
+    [ -n "$GIT_SHA" ] && GIT_SHA_SOURCE=git-checkout
+  fi
+fi
+
+if [ -n "$GIT_SHA" ]; then
+  log "release identity: git SHA $GIT_SHA (source: $GIT_SHA_SOURCE)"
+else
+  log "WARNING: no Git SHA available — pass --git-sha <full-sha> for an archive install."
+  log "WARNING: 'seo-audit-runner version' will report an unknown SHA, which FAILS the"
+  log "WARNING: REPO_SHA == APP_SHA == RUNNER_SHA deployment parity gate."
+fi
+
+# ── Release install (immutable; new release only when identity changed) ──
 release_checksum() {
   (
     cd -- "$SOURCE_DIR" &&
@@ -304,14 +368,30 @@ current_checksum=
 if [ -f "$OPT_DIR/current/.release-checksum" ]; then
   current_checksum=$(cat -- "$OPT_DIR/current/.release-checksum")
 fi
+current_git_sha=
+if [ -f "$OPT_DIR/current/.release-sha" ]; then
+  current_git_sha=$(cat -- "$OPT_DIR/current/.release-sha" | tr -d '[:space:]')
+fi
 
-if [ -n "$current_checksum" ] && [ "$new_checksum" = "$current_checksum" ]; then
+# A different reviewed commit MUST produce a new release even when the runner
+# files are byte-identical — otherwise the recorded RUNNER_SHA would still name
+# the previous commit and the parity gate would pass on a stale identity.
+identity_unchanged=0
+if [ -n "$current_checksum" ] && [ "$new_checksum" = "$current_checksum" ] && \
+   [ "$GIT_SHA" = "$current_git_sha" ]; then
+  identity_unchanged=1
+fi
+
+if [ "$identity_unchanged" -eq 1 ]; then
   active_stamp=unknown
   if [ -f "$OPT_DIR/current/.release-stamp" ]; then
     active_stamp=$(cat -- "$OPT_DIR/current/.release-stamp")
   fi
-  log "runner code unchanged — keeping active release $active_stamp"
+  log "runner code and git SHA unchanged — keeping active release $active_stamp"
 else
+  if [ -n "$current_checksum" ] && [ "$new_checksum" = "$current_checksum" ]; then
+    log "runner files unchanged but git SHA differs (${current_git_sha:-unknown} -> ${GIT_SHA:-unknown}) — creating a new release"
+  fi
   stamp=$(date -u +%Y%m%d%H%M%S)
   REL_DIR=$RELEASES_DIR/$stamp
   suffix=0
@@ -335,6 +415,11 @@ else
   # deploy scripts (they administer the host, they are not runner code).
   printf '%s\n' "$new_checksum" > "$REL_DIR/.release-checksum"
   printf '%s\n' "${REL_DIR##*/}" > "$REL_DIR/.release-stamp"
+  # Immutable repository identity for this release. Written only when a full
+  # SHA is known — an empty or fabricated file would defeat the parity gate.
+  if [ -n "$GIT_SHA" ]; then
+    printf '%s\n' "$GIT_SHA" > "$REL_DIR/.release-sha"
+  fi
 
   find "$REL_DIR" -type d -exec chmod 0755 {} +
   find "$REL_DIR" -type f -exec chmod 0644 {} +

@@ -10,7 +10,11 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { SLACK_CRITICAL_MENTION_MODES } from './slackFormat.js';
+import {
+  BROAD_MENTION_MODES,
+  NO_MENTION_MODE,
+  SLACK_CRITICAL_MENTION_MODES,
+} from './slackFormat.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const PACKAGE_ROOT = path.resolve(__dirname, '..');
@@ -46,11 +50,12 @@ const DEFAULTS = {
   SLACK_MAX_RETRIES: '4',
   SLACK_MAX_ISSUES_PER_MESSAGE: '20',
   SLACK_MAX_MESSAGE_CHARACTERS: '30000',
-  SLACK_CRITICAL_MENTION: 'channel',
+  // Broad channel mentions are permanently off. See the validation below.
+  SLACK_CRITICAL_MENTION: NO_MENTION_MODE,
 };
 
 export const ALERT_MODES = ['new_or_regressed', 'all_current', 'summary_only', 'disabled'];
-export { SLACK_CRITICAL_MENTION_MODES };
+export { BROAD_MENTION_MODES, NO_MENTION_MODE, SLACK_CRITICAL_MENTION_MODES };
 
 // Hostnames considered private/trusted for plain-http transport.
 const PRIVATE_HOST_PATTERNS = [
@@ -259,15 +264,21 @@ export function loadConfig(env = process.env) {
     );
   }
 
-  // Channel-wide mention for NEW / REOPENED P0 alerts only. An unknown or
-  // empty value is a hard error — silently falling back to another mention
-  // type would either spam a channel or quietly stop paging it.
-  const slackCriticalMention = raw('SLACK_CRITICAL_MENTION').toLowerCase();
-  if (!SLACK_CRITICAL_MENTION_MODES.includes(slackCriticalMention)) {
+  // Broad channel mentions are permanently disabled. The variable is still
+  // ACCEPTED so existing env files keep validating, but a broad value is
+  // neutralized to `none` rather than honored — no runner alert may page a
+  // whole channel. An unrecognized value is still a hard error, so a typo can
+  // never be mistaken for a deliberate setting.
+  const rawCriticalMention = raw('SLACK_CRITICAL_MENTION').toLowerCase();
+  let slackCriticalMention = NO_MENTION_MODE;
+  let slackCriticalMentionNeutralized = false;
+  if (rawCriticalMention && !SLACK_CRITICAL_MENTION_MODES.includes(rawCriticalMention)) {
     problems.push(
       `SLACK_CRITICAL_MENTION must be one of ${SLACK_CRITICAL_MENTION_MODES.join(', ')}, ` +
-        `got: ${raw('SLACK_CRITICAL_MENTION') || '(empty)'}`,
+        `got: ${raw('SLACK_CRITICAL_MENTION')}`,
     );
+  } else if (BROAD_MENTION_MODES.includes(rawCriticalMention)) {
+    slackCriticalMentionNeutralized = true;
   }
 
   const slackRequestTimeoutMs = parsePositiveInt('SLACK_REQUEST_TIMEOUT_MS', { min: 1000 });
@@ -313,6 +324,7 @@ export function loadConfig(env = process.env) {
     slackMaxIssuesPerMessage,
     slackMaxMessageCharacters,
     slackCriticalMention,
+    slackCriticalMentionNeutralized,
     dashboardUrl,
     allowInsecurePublicApi,
   };

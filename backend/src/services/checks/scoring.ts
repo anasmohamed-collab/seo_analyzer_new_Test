@@ -462,9 +462,14 @@ export function scoreResult(data: CheckData, options: ScoringOptions = {}): Scor
       !data.contentMeta.robotsMeta.noindex &&
       !data.contentMeta.xRobotsTag?.noindex
     ) {
-      escalate('WARN');
+      // Critical Exposure: a Beta/Staging environment that search engines may
+      // index is a P0 incident, not a warning. The message is deliberately
+      // byte-identical to the previous P1 wording — the runner's issue
+      // fingerprint excludes priority, so promoting it must not create a
+      // NEW + RESOLVED churn pair in the notification lifecycle.
+      escalate('FAIL');
       recs.push({
-        priority: 'P1', area: 'meta',
+        priority: 'P0', area: 'meta',
         message: 'Beta/Staging seed URL is indexable (no noindex directive detected)',
         fixHint: 'Add a meta robots noindex directive or an X-Robots-Tag noindex header before exposing the Beta/Staging site.',
       });
@@ -649,8 +654,10 @@ export function scoreSiteChecks(data: SiteChecksData | null, options: ScoringOpt
             !googleBlocked ? 'Googlebot' : null,
             !newsBlocked ? 'Googlebot-News' : null,
           ].filter(Boolean).join(' and ');
+          // Critical Exposure — see the seed-URL note above: P0 severity,
+          // unchanged wording so the stored issue identity survives.
           recs.push({
-            priority: 'P1', area: 'robots',
+            priority: 'P0', area: 'robots',
             message: `Beta/Staging site is crawlable by ${exposed}`,
             fixHint: 'Block search crawlers on the Beta/Staging environment (for example with an environment-specific robots.txt) until it is ready for Production.',
           });

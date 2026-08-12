@@ -14,6 +14,7 @@
  *    remote ambiguity cannot be fully eliminated with Slack's API
  */
 
+import { filterNotificationIssues, filterNotificationLifecycle } from './criticalFilter.js';
 import { fingerprintIssue, sha256Hex } from './fingerprint.js';
 import { normalizeDomainKey } from './normalizeDomain.js';
 import {
@@ -21,7 +22,6 @@ import {
   buildProjectMessages,
   buildRunSummaryMessage,
   createTechnicalAggregate,
-  criticalMentionToken,
 } from './slackFormat.js';
 import { SlackPermanentError } from './slackClient.js';
 import { evaluateAuditEvidence } from './evidenceGate.js';
@@ -171,6 +171,9 @@ export function createNotificationPipeline({
         fingerprint: fingerprintIssue(project.id, issue),
       }));
 
+      // The snapshot always records the COMPLETE current P0 set — for Beta
+      // projects too. Narrowing the snapshot instead of the notification would
+      // make the next audit report untouched Beta P0s as RESOLVED.
       const lifecycle = stateStore.recordSnapshotAndLifecycle({
         projectId: project.id,
         normalizedDomain: normalizeDomainKey(project.website_url || project.domain || ''),
@@ -180,19 +183,33 @@ export function createNotificationPipeline({
         now: now(),
       });
 
-      const counts = {
+      const isBeta = project.is_beta === true;
+      // Slack sees only the notification-eligible view: all P0 for Production,
+      // Critical Exposure only for Beta. Identity, counts, message content and
+      // run-summary totals are all derived from THIS lifecycle.
+      const notificationLifecycle = filterNotificationLifecycle(lifecycle, { isBeta });
+      const notificationIssues = filterNotificationIssues(issues, { isBeta });
+
+      const snapshotCounts = {
         new: lifecycle.new.length,
         reopened: lifecycle.reopened.length,
         unchanged: lifecycle.unchanged.length,
         resolved: lifecycle.resolved.length,
         current: issues.length,
       };
+      const counts = {
+        new: notificationLifecycle.new.length,
+        reopened: notificationLifecycle.reopened.length,
+        unchanged: notificationLifecycle.unchanged.length,
+        resolved: notificationLifecycle.resolved.length,
+        current: notificationIssues.length,
+      };
       const p0Count = (items) => items.filter((issue) => issue.priority === 'P0').length;
-      const currentP0 = p0Count(issues);
-      lifecycleTotals.new += p0Count(lifecycle.new);
-      lifecycleTotals.reopened += p0Count(lifecycle.reopened);
-      lifecycleTotals.unchanged += p0Count(lifecycle.unchanged);
-      lifecycleTotals.resolved += p0Count(lifecycle.resolved);
+      const currentP0 = p0Count(notificationIssues);
+      lifecycleTotals.new += p0Count(notificationLifecycle.new);
+      lifecycleTotals.reopened += p0Count(notificationLifecycle.reopened);
+      lifecycleTotals.unchanged += p0Count(notificationLifecycle.unchanged);
+      lifecycleTotals.resolved += p0Count(notificationLifecycle.resolved);
       lifecycleTotals.currentP0 += currentP0;
       if (currentP0 > 0) lifecycleTotals.projectsWithCritical++;
 
@@ -202,12 +219,6 @@ export function createNotificationPipeline({
 
       let notificationStatus = 'not-required';
       if (slackActive && shouldNotify(alertMode, counts)) {
-        // A channel-wide mention is for genuinely NEW or REOPENED P0 issues.
-        // Unchanged-only and resolved-only alerts never page the channel.
-        const mention =
-          p0Count([...lifecycle.new, ...lifecycle.reopened]) > 0
-            ? criticalMentionToken(config.slackCriticalMention ?? 'channel')
-            : null;
         const messages = buildProjectMessages({
           projectName: project.project_name ?? project.name ?? null,
           domain: project.domain ?? project.website_url ?? null,
@@ -215,11 +226,10 @@ export function createNotificationPipeline({
           auditRunId,
           auditCompletedAt: results.finished_at ?? null,
           dashboardUrl: config.dashboardUrl ?? null,
-          lifecycle,
+          lifecycle: notificationLifecycle,
           mode: alertMode,
           siteChecks: results.siteChecks ?? null,
-          isBeta: project.is_beta === true,
-          mention,
+          isBeta,
           maxIssuesPerMessage: config.slackMaxIssuesPerMessage,
           maxMessageCharacters: config.slackMaxMessageCharacters,
         });
@@ -227,17 +237,27 @@ export function createNotificationPipeline({
           type: 'project_update',
           projectId: project.id,
           auditRunId,
-          lifecycle,
+          lifecycle: notificationLifecycle,
           messages,
         });
         if (notificationStatus === 'delivered') {
-          const alerted = [...lifecycle.new, ...lifecycle.reopened].map((i) => i.fingerprint);
-          if (alertMode === 'all_current') alerted.push(...lifecycle.unchanged.map((i) => i.fingerprint));
+          const alerted = [...notificationLifecycle.new, ...notificationLifecycle.reopened]
+            .map((i) => i.fingerprint);
+          if (alertMode === 'all_current') {
+            alerted.push(...notificationLifecycle.unchanged.map((i) => i.fingerprint));
+          }
           stateStore.markIssuesAlerted(project.id, alerted, now());
         }
       }
 
-      return { evidenceComplete: true, lifecycleCounts: counts, notificationStatus };
+      return {
+        evidenceComplete: true,
+        // The local report keeps the complete P0 picture; `notificationCounts`
+        // is what Slack was told.
+        lifecycleCounts: snapshotCounts,
+        notificationCounts: counts,
+        notificationStatus,
+      };
     },
 
     /** Optional end-of-execution summary (SEO_RUNNER_SEND_RUN_SUMMARY). */
