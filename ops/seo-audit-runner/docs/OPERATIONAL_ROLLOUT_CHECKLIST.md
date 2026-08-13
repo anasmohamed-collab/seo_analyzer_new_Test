@@ -108,9 +108,14 @@ Nothing in this part modifies anything.
       NOTIFICATIONS_ENABLED=false
       ```
 
-      `SLACK_CRITICAL_MENTION` is now accepted-but-neutralized for broad
-      values; `none` is the default and the only effective setting. Setting it
-      explicitly documents the intent.
+      `SLACK_CRITICAL_MENTION=none` is the default and the correct starting
+      value: nothing pages the channel. `channel` is an explicit opt-in that
+      belongs in Part F, not here. `here`/`everyone` stay neutralized to `none`.
+
+      Confirm `SLACK_CHANNEL_ID` is the **immutable channel ID** (`C…`) of
+      **`#seo_analyzer_bot`**, that the bot is already invited to that channel,
+      and that the app holds `chat:write`. The runner posts to the ID and does
+      no channel-name lookup.
 
 ## Part E — Staged validation (one project per step, watched live)
 
@@ -133,7 +138,8 @@ Nothing in this part modifies anything.
 
 ## Part F — Enable Slack (only after E passes and a review)
 
-- [ ] **F1.** Set `NOTIFICATIONS_ENABLED=true`. Then verify, in order:
+- [ ] **F1.** Set `NOTIFICATIONS_ENABLED=true`, keeping
+      `SLACK_CRITICAL_MENTION=none`. Then verify, in order:
       - NEW → alerts
       - REOPENED → alerts
       - RESOLVED → updates
@@ -143,8 +149,24 @@ Nothing in this part modifies anything.
 - [ ] **F2. Replay check.** If `notifications list` shows any `PENDING`/`FAILED`
       record created **before** this deployment, run
       `retry-notifications --dry-run` first, then a real retry, and confirm the
-      delivered message carries no broad mention (the last-mile sanitizer
-      strips it without rewriting the stored row).
+      delivered message carries no broad mention (those rows carry no
+      authorization, so the last-mile sanitizer strips every token without
+      rewriting the stored row).
+- [ ] **F3. Optional `@channel` opt-in.** Only after F1 and F2 pass, and only
+      as a deliberate, separately approved decision, set
+      `SLACK_CRITICAL_MENTION=channel` and re-run `validate-config` (it must
+      report `channel`, not neutralized). Then confirm on live traffic:
+      - a Production **NEW P0** alert carries exactly **one** `<!channel>`
+      - a Production **REOPENED P0** alert carries exactly **one**
+      - an alert with NEW **and** REOPENED P0 still carries exactly **one**
+      - Beta Exposure alerts, UNCHANGED-only and RESOLVED-only alerts, run
+        summaries and failure notices carry **none**
+      - the mention lands in `#seo_analyzer_bot` (the channel `SLACK_CHANNEL_ID`
+        points at) and the bot can post there
+
+      Reverting is a single edit back to `SLACK_CRITICAL_MENTION=none`.
+      **Status: not executed — no real Slack validation of the mention has been
+      performed.**
 
 ## Part G — Scale up
 

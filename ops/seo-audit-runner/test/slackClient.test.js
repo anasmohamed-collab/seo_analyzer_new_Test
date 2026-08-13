@@ -7,7 +7,7 @@ import {
   SLACK_POST_MESSAGE_URL,
 } from '../src/slackClient.js';
 import { createLogger } from '../src/logger.js';
-import { buildProjectMessages } from '../src/slackFormat.js';
+import { buildProjectMessages, countBroadMentions } from '../src/slackFormat.js';
 
 const FAKE_TOKEN = 'xoxb-000-000-VERYSECRETFAKETOKEN';
 const FAKE_WEBHOOK = 'https://hooks.slack.com/services/T0/B0/SECRETWEBHOOKPATH';
@@ -183,12 +183,11 @@ test('logger redacts a bot token registered as a secret', () => {
   assert.ok(stream.data.includes('[REDACTED]'));
 });
 
-// ── Broad mentions are stripped at the last mile, on both methods ───
+// ── Mention policy is enforced at the last mile, on both methods ────
 
-test('a bot-token payload leaves the delivered message free of broad mentions', async () => {
-  const fetchImpl = fetchQueue([jsonRes({ ok: true })]);
-  const sender = createSlackSender({ config: botConfig(), fetchImpl, sleepFn: noSleep });
-  const [message] = buildProjectMessages({
+/** One Production critical alert, built exactly as the pipeline builds it. */
+const criticalAlert = (mentionPolicy = 'none') =>
+  buildProjectMessages({
     projectName: 'Arab Times',
     domain: 'arabtimesonline.com',
     projectId: 'p1',
@@ -196,20 +195,80 @@ test('a bot-token payload leaves the delivered message free of broad mentions', 
     lifecycle: { new: [criticalIssue], reopened: [], unchanged: [], resolved: [] },
     mode: 'new_or_regressed',
     siteChecks: { robots: { status: 'FOUND' }, sitemap: { status: 'FOUND' }, newsSitemap: { status: 'NOT_FOUND' } },
-  });
+    mentionPolicy,
+  })[0];
 
-  await sender.send(message);
+test('an unauthorized bot-token payload leaves the delivered message mention-free', async () => {
+  const fetchImpl = fetchQueue([jsonRes({ ok: true })]);
+  const sender = createSlackSender({ config: botConfig(), fetchImpl, sleepFn: noSleep });
+
+  await sender.send(criticalAlert());
   const body = JSON.parse(fetchImpl.calls[0].init.body);
-  assert.ok(!/<!(channel|here|everyone)>/.test(body.text));
-  assert.ok(body.blocks.every((b) => !/<!(channel|here|everyone)>/.test(b.text.text)));
+  assert.equal(countBroadMentions(body), 0);
   assert.ok(!body.text.includes('@all'));
   assert.match(body.text, /Critical SEO Alert/, 'the alert itself is intact');
+});
+
+test('an authorized alert is delivered with exactly one <!channel> over the bot token', async () => {
+  const fetchImpl = fetchQueue([jsonRes({ ok: true })]);
+  const sender = createSlackSender({ config: botConfig(), fetchImpl, sleepFn: noSleep });
+
+  await sender.send(criticalAlert('channel'));
+  const body = JSON.parse(fetchImpl.calls[0].init.body);
+  assert.equal(countBroadMentions(body), 1, 'one token across text AND blocks');
+  assert.match(body.blocks[0].text.text, /^<!channel> :rotating_light:/);
+  assert.ok(!/<!(channel|here|everyone)/.test(body.text), 'the fallback carries no duplicate');
+  assert.equal(body.channel, 'C0123456789', 'delivery uses the immutable channel ID, not a name');
+});
+
+test('an authorized alert is delivered with exactly one <!channel> over a webhook', async () => {
+  const fetchImpl = fetchQueue([new Response('ok', { status: 200 })]);
+  const sender = createSlackSender({ config: webhookConfig(), fetchImpl, sleepFn: noSleep });
+
+  await sender.send(criticalAlert('channel'));
+  const body = JSON.parse(fetchImpl.calls[0].init.body);
+  assert.equal(countBroadMentions(body), 1);
+  assert.match(body.blocks[0].text.text, /^<!channel> :rotating_light:/);
+});
+
+test('the internal authorization field never reaches Slack, on either method', async () => {
+  for (const [config, res] of [
+    [botConfig(), jsonRes({ ok: true })],
+    [webhookConfig(), new Response('ok', { status: 200 })],
+  ]) {
+    const fetchImpl = fetchQueue([res]);
+    const sender = createSlackSender({ config, fetchImpl, sleepFn: noSleep });
+    const message = criticalAlert('channel');
+    assert.equal(message.mentionPolicy, 'channel', 'the pipeline stamped it');
+
+    await sender.send(message);
+    const body = JSON.parse(fetchImpl.calls[0].init.body);
+    assert.ok(!('mentionPolicy' in body), 'internal metadata is not transmitted');
+    const supported = config.slackMethod === 'bot' ? ['blocks', 'channel', 'text'] : ['blocks', 'text'];
+    assert.deepEqual(Object.keys(body).sort(), supported, 'only Slack-supported fields are sent');
+    assert.equal(message.mentionPolicy, 'channel', 'and the caller’s message is not mutated');
+  }
+});
+
+test('an authorization stamp cannot smuggle <!here> or <!everyone> out', async () => {
+  const fetchImpl = fetchQueue([jsonRes({ ok: true })]);
+  const sender = createSlackSender({ config: botConfig(), fetchImpl, sleepFn: noSleep });
+
+  await sender.send({
+    text: 'header',
+    mentionPolicy: 'channel',
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: '<!here> <!everyone> header' } }],
+  });
+
+  const body = JSON.parse(fetchImpl.calls[0].init.body);
+  assert.equal(countBroadMentions(body), 0, 'only <!channel> is ever honored');
 });
 
 test('a legacy stored payload is stripped of its mention before a bot-token retry', async () => {
   const fetchImpl = fetchQueue([jsonRes({ ok: true })]);
   const sender = createSlackSender({ config: botConfig(), fetchImpl, sleepFn: noSleep });
-  // Exactly the shape `retry-notifications` replays out of SQLite.
+  // Exactly the shape `retry-notifications` replays out of SQLite: no
+  // authorization field, because the row predates this change.
   const legacy = {
     text: ':rotating_light: <!channel> *Critical SEO Alert*\n\n*Arab Times*',
     blocks: [
@@ -221,8 +280,7 @@ test('a legacy stored payload is stripped of its mention before a bot-token retr
 
   await sender.send(legacy);
   const body = JSON.parse(fetchImpl.calls[0].init.body);
-  assert.ok(!/<!(channel|here|everyone)/.test(body.text), 'no broad mention leaves the process');
-  assert.ok(body.blocks.every((b) => !/<!(channel|here|everyone)/.test(b.text.text)));
+  assert.equal(countBroadMentions(body), 0, 'no broad mention leaves the process');
   assert.match(body.text, /\*Critical SEO Alert\*/, 'the rest of the legacy body is preserved');
   assert.deepEqual(legacy, frozen, 'the stored notification payload is not mutated');
 });
@@ -237,8 +295,18 @@ test('a webhook payload gets the same last-mile stripping', async () => {
   });
 
   const body = JSON.parse(fetchImpl.calls[0].init.body);
-  assert.ok(!/<!(channel|here|everyone)/.test(body.text));
-  assert.ok(!/<!(channel|here|everyone)/.test(body.blocks[0].text.text));
+  assert.equal(countBroadMentions(body), 0);
   assert.equal(body.text, 'queued before the change');
   assert.ok(!body.text.includes('@all'));
+});
+
+test('an authorized message keeps exactly one mention across delivery retries', async () => {
+  const fetchImpl = fetchQueue([jsonRes({ ok: false, error: 'internal_error' }), jsonRes({ ok: true })]);
+  const sender = createSlackSender({ config: botConfig(), fetchImpl, sleepFn: noSleep });
+
+  await sender.send(criticalAlert('channel'));
+  assert.equal(fetchImpl.calls.length, 2);
+  for (const call of fetchImpl.calls) {
+    assert.equal(countBroadMentions(JSON.parse(call.init.body)), 1, 'no accumulation across attempts');
+  }
 });

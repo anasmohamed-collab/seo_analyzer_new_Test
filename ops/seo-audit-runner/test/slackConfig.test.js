@@ -53,16 +53,27 @@ test('alert mode is validated strictly', () => {
 });
 
 test('SLACK_CRITICAL_MENTION defaults to none when omitted or empty', () => {
+  // An existing deployment that never set the variable keeps its current
+  // no-mention behavior.
   assert.equal(loadConfig({}).slackCriticalMention, 'none');
   assert.equal(loadConfig({ SLACK_CRITICAL_MENTION: '' }).slackCriticalMention, 'none');
   assert.equal(loadConfig({ SLACK_CRITICAL_MENTION: '   ' }).slackCriticalMention, 'none');
   assert.equal(loadConfig({ SLACK_CRITICAL_MENTION: 'none' }).slackCriticalMention, 'none');
   assert.equal(loadConfig({ SLACK_CRITICAL_MENTION: 'NONE' }).slackCriticalMention, 'none');
   assert.equal(loadConfig({}).slackCriticalMentionNeutralized, false);
+  assert.equal(loadConfig({ SLACK_CRITICAL_MENTION: 'none' }).slackCriticalMentionNeutralized, false);
 });
 
-test('a broad SLACK_CRITICAL_MENTION is accepted but neutralized, never honored', () => {
-  for (const mode of ['channel', 'here', 'everyone']) {
+test('SLACK_CRITICAL_MENTION=channel is accepted and retained, not neutralized', () => {
+  for (const value of ['channel', 'CHANNEL', ' channel ']) {
+    const config = loadConfig({ SLACK_CRITICAL_MENTION: value });
+    assert.equal(config.slackCriticalMention, 'channel', `${JSON.stringify(value)} must be honored`);
+    assert.equal(config.slackCriticalMentionNeutralized, false, 'channel is not a neutralized value');
+  }
+});
+
+test('here and everyone stay neutralized to none and can never become active', () => {
+  for (const mode of ['here', 'everyone']) {
     for (const value of [mode, mode.toUpperCase()]) {
       const config = loadConfig({ SLACK_CRITICAL_MENTION: value });
       assert.equal(config.slackCriticalMention, 'none', `${value} must not be honored`);

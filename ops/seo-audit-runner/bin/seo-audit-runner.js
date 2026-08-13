@@ -306,8 +306,10 @@ function validateConfigCommand(config, logger, out) {
     `  Send run summary        = ${config.sendRunSummary}`,
     `  SLACK_CRITICAL_MENTION  = ${config.slackCriticalMention}` +
       (config.slackCriticalMentionNeutralized
-        ? ' (configured broad mention neutralized — runner alerts never mention a channel)'
-        : ' (broad channel mentions are permanently disabled)'),
+        ? ' (here/everyone are neutralized to none — never activated)'
+        : config.slackCriticalMention === 'channel'
+          ? ' (<!channel> on Production critical alerts reporting a NEW or REOPENED P0 only)'
+          : ' (no broad mention on any message)'),
   ];
 
   // Never print configured Slack values — only whether they are set.

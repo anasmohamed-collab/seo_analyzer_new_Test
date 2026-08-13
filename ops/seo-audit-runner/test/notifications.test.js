@@ -7,11 +7,13 @@ import { openStateDb } from '../src/db.js';
 import { StateStore } from '../src/stateStore.js';
 import {
   createNotificationPipeline,
+  criticalMentionPolicy,
   retryPendingNotifications,
   notificationIdentity,
   shouldNotify,
 } from '../src/notificationPipeline.js';
 import { SlackPermanentError, SlackRetryableError } from '../src/slackClient.js';
+import { countBroadMentions, sanitizeSlackMessage } from '../src/slackFormat.js';
 
 function freshStore() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'seo-runner-notif-'));
@@ -754,28 +756,62 @@ test('shouldNotify matrix', () => {
   assert.equal(shouldNotify('summary_only', { new: 0, reopened: 0, resolved: 0, unchanged: 0, current: 0 }), false);
 });
 
-// ── Broad mentions: never emitted by any alert ──────────────────────
+// ── Broad mentions: opt-in, Production NEW/REOPENED P0 only ─────────
 
-test('a new P0 alert carries no broad mention', async () => {
+/** Total broad-mention tokens across a message's text AND blocks. */
+const mentions = (message) => countBroadMentions(message);
+
+test('the mention eligibility rule is exactly config + Production + NEW/REOPENED P0', () => {
+  const counts = (over = {}) => ({ new: 0, reopened: 0, unchanged: 0, resolved: 0, current: 0, ...over });
+
+  // Authorized: opted in, Production, and a NEW or REOPENED P0.
+  for (const c of [counts({ new: 1 }), counts({ reopened: 1 }), counts({ new: 2, reopened: 3, resolved: 4 })]) {
+    assert.equal(
+      criticalMentionPolicy({ configuredMention: 'channel', isBeta: false, counts: c }),
+      'channel',
+    );
+  }
+  // Not opted in.
+  for (const configured of ['none', 'here', 'everyone', '', undefined, null]) {
+    assert.equal(
+      criticalMentionPolicy({ configuredMention: configured, isBeta: false, counts: counts({ new: 1 }) }),
+      'none',
+      `configuredMention=${String(configured)} must not authorize`,
+    );
+  }
+  // Beta, whatever the lifecycle.
+  assert.equal(
+    criticalMentionPolicy({ configuredMention: 'channel', isBeta: true, counts: counts({ new: 1, reopened: 1 }) }),
+    'none',
+  );
+  // No NEW/REOPENED bucket.
+  for (const c of [counts(), counts({ unchanged: 3, current: 3 }), counts({ resolved: 2 })]) {
+    assert.equal(criticalMentionPolicy({ configuredMention: 'channel', isBeta: false, counts: c }), 'none');
+  }
+});
+
+test('an opted-in Production NEW P0 alert carries exactly one <!channel>', async () => {
   const { db, store } = freshStore();
   const sender = mockSender();
-  const pipeline = pipelineWith(store, sender);
+  const pipeline = pipelineWith(store, sender, { slackCriticalMention: 'channel' });
 
   await pipeline.handleProjectCompleted({
     project, auditRunId: 'r1', results: results(1, { siteChecks: siteChecks() }), criticalIssues: [critical(1)],
   });
 
-  const text = sender.sent[0].text;
-  assert.ok(!/<!(channel|here|everyone)>/.test(text), 'a Production P0 alert never pages the channel');
-  assert.ok(!text.includes('@all'), 'never a literal @all');
-  assert.match(text, /\*P0:\* 1 new/, 'the alert itself is unchanged');
+  const message = sender.sent[0];
+  assert.equal(mentions(message), 1, 'exactly one token across text and blocks');
+  assert.match(message.blocks[0].text.text, /^<!channel> :rotating_light: \*Critical SEO Alert\*/);
+  assert.ok(!/<!/.test(message.text), 'the fallback keeps no duplicate copy');
+  assert.match(message.text, /\*P0:\* 1 new/, 'the alert itself is unchanged');
+  assert.ok(!message.text.includes('@all'), 'never a literal @all');
   db.close();
 });
 
-test('a reopened P0 alert carries no broad mention', async () => {
+test('an opted-in Production REOPENED P0 alert carries exactly one <!channel>', async () => {
   const { db, store } = freshStore();
   const sender = mockSender();
-  const pipeline = pipelineWith(store, sender);
+  const pipeline = pipelineWith(store, sender, { slackCriticalMention: 'channel' });
 
   // seen → resolved (clean audit) → seen again = REOPENED
   await pipeline.handleProjectCompleted({ project, auditRunId: 'r1', results: results(), criticalIssues: [critical(1)] });
@@ -787,28 +823,67 @@ test('a reopened P0 alert carries no broad mention', async () => {
   assert.equal(third.lifecycleCounts.reopened, 1);
   assert.equal(sender.sent.length, 3);
   assert.match(sender.sent[2].text, /\*P0:\* 1 reopened/);
-  assert.ok(sender.sent.every((m) => !/<!(channel|here|everyone)>/.test(m.text)));
+  assert.equal(mentions(sender.sent[2]), 1, 'the REOPENED P0 alert pages once');
+  // The middle message is the RESOLVED-only alert — it must not page.
+  assert.equal(mentions(sender.sent[1]), 0, 'a RESOLVED-only alert never pages');
   db.close();
 });
 
-test('no configured SLACK_CRITICAL_MENTION value can reintroduce a mention', async () => {
-  for (const mode of ['channel', 'here', 'everyone', 'none', undefined]) {
+test('a NEW and a REOPENED P0 in one alert still page the channel only once', async () => {
+  const { db, store } = freshStore();
+  const sender = mockSender();
+  const pipeline = pipelineWith(store, sender, { slackCriticalMention: 'channel' });
+
+  await pipeline.handleProjectCompleted({ project, auditRunId: 'r1', results: results(), criticalIssues: [critical(1)] });
+  await pipeline.handleProjectCompleted({ project, auditRunId: 'r2', results: results(), criticalIssues: [] });
+  const third = await pipeline.handleProjectCompleted({
+    project, auditRunId: 'r3', results: results(), criticalIssues: [critical(1), critical(2)],
+  });
+
+  assert.equal(third.notificationCounts.reopened, 1);
+  assert.equal(third.notificationCounts.new, 1);
+  assert.equal(mentions(sender.sent.at(-1)), 1, 'one mention, authorized once by the NEW/REOPENED P0');
+  db.close();
+});
+
+test('P1 and P2 findings never reach the critical pipeline and never page', async () => {
+  const { db, store } = freshStore();
+  const sender = mockSender();
+  const pipeline = pipelineWith(store, sender, { slackCriticalMention: 'channel', alertMode: 'all_current' });
+
+  // `extractCriticalIssues` is strictly P0, so a P1/P2 run produces no
+  // critical issue at all — and therefore no notification to mention on.
+  const outcome = await pipeline.handleProjectCompleted({
+    project, auditRunId: 'r1', results: results(), criticalIssues: [],
+  });
+
+  assert.equal(outcome.notificationStatus, 'not-required');
+  assert.equal(sender.sent.length, 0, 'nothing is sent, so nothing can page');
+  db.close();
+});
+
+test('no non-channel SLACK_CRITICAL_MENTION value can introduce a mention', async () => {
+  for (const mode of ['here', 'everyone', 'none', '', undefined]) {
     const { db, store } = freshStore();
     const sender = mockSender();
     const pipeline = pipelineWith(store, sender, { slackCriticalMention: mode });
     await pipeline.handleProjectCompleted({ project, auditRunId: 'r1', results: results(), criticalIssues: [critical(1)] });
-    assert.ok(
-      !/<!(channel|here|everyone)>/.test(sender.sent[0].text),
-      `slackCriticalMention=${mode} must not render a mention`,
+    assert.equal(
+      mentions(sender.sent[0]),
+      0,
+      `slackCriticalMention=${String(mode)} must not render a mention`,
     );
     db.close();
   }
 });
 
-test('an unchanged-only alert carries no broad mention (all_current mode)', async () => {
+test('an unchanged-only alert carries no broad mention, even opted in (all_current)', async () => {
   const { db, store } = freshStore();
   const sender = mockSender();
-  const pipeline = pipelineWith(store, sender, { alertMode: 'all_current' });
+  const pipeline = pipelineWith(store, sender, {
+    alertMode: 'all_current',
+    slackCriticalMention: 'channel',
+  });
 
   await pipeline.handleProjectCompleted({ project, auditRunId: 'r1', results: results(), criticalIssues: [critical(1)] });
   const second = await pipeline.handleProjectCompleted({
@@ -817,14 +892,72 @@ test('an unchanged-only alert carries no broad mention (all_current mode)', asyn
 
   assert.equal(second.lifecycleCounts.unchanged, 1);
   assert.equal(sender.sent.length, 2);
-  assert.ok(sender.sent.every((m) => !/<!(channel|here|everyone)>/.test(m.text)));
+  assert.equal(mentions(sender.sent[0]), 1, 'the first alert was NEW and pages');
+  assert.equal(mentions(sender.sent[1]), 0, 'the UNCHANGED-only repeat does not');
   db.close();
 });
 
-test('the run summary never carries a broad mention', async () => {
+test('a resolved-only alert carries no broad mention, even opted in', async () => {
   const { db, store } = freshStore();
   const sender = mockSender();
-  const pipeline = pipelineWith(store, sender);
+  const pipeline = pipelineWith(store, sender, { slackCriticalMention: 'channel' });
+
+  await pipeline.handleProjectCompleted({ project, auditRunId: 'r1', results: results(), criticalIssues: [critical(1)] });
+  const second = await pipeline.handleProjectCompleted({
+    project, auditRunId: 'r2', results: results(), criticalIssues: [],
+  });
+
+  assert.equal(second.notificationCounts.resolved, 1);
+  assert.equal(mentions(sender.sent[1]), 0);
+  assert.match(sender.sent[1].text, /\*Resolved:\* 1/);
+  db.close();
+});
+
+test('a Beta exposure alert never pages the channel, even opted in', async () => {
+  const { db, store } = freshStore();
+  const sender = mockSender();
+  const pipeline = pipelineWith(store, sender, { slackCriticalMention: 'channel' });
+
+  await pipeline.handleProjectCompleted({
+    project: { ...project, is_beta: true },
+    auditRunId: 'r1',
+    results: results(),
+    criticalIssues: [betaExposure(1)],
+  });
+
+  assert.match(sender.sent[0].text, /Beta SEO Exposure Alert/);
+  assert.equal(mentions(sender.sent[0]), 0, 'a NEW Beta exposure finding is not an on-call page');
+  db.close();
+});
+
+test('audit-controlled content cannot inject a mention through the pipeline', async () => {
+  const { db, store } = freshStore();
+  const sender = mockSender();
+  const pipeline = pipelineWith(store, sender, { slackCriticalMention: 'none' });
+
+  await pipeline.handleProjectCompleted({
+    project: { ...project, project_name: '<!channel> Corp' },
+    auditRunId: 'r1',
+    results: results(),
+    criticalIssues: [
+      {
+        ...critical(1),
+        message: '<!channel> <!here> <!everyone> @channel',
+        fixHint: 'ping <!channel|channel>',
+        pageUrl: 'https://example.com/<!everyone>',
+      },
+    ],
+  });
+
+  assert.equal(mentions(sender.sent[0]), 0, 'hostile finding text cannot page the channel');
+  assert.match(sender.sent[0].text, /&lt;!channel&gt;/, 'it is escaped and still visible');
+  db.close();
+});
+
+test('the run summary never carries a broad mention, even opted in', async () => {
+  const { db, store } = freshStore();
+  const sender = mockSender();
+  const pipeline = pipelineWith(store, sender, { slackCriticalMention: 'channel' });
 
   await pipeline.handleProjectCompleted({
     project, auditRunId: 'r1', results: results(1, { siteChecks: siteChecks() }), criticalIssues: [critical(1)],
@@ -840,10 +973,42 @@ test('the run summary never carries a broad mention', async () => {
     },
   });
 
-  const summary = sender.sent.at(-1).text;
-  assert.match(summary, /SEO Audit Summary/);
-  assert.ok(!/<!(channel|here|everyone)>/.test(summary));
-  assert.ok(!summary.includes('@all'));
+  const summary = sender.sent.at(-1);
+  assert.match(summary.text, /SEO Audit Summary/);
+  assert.equal(mentions(summary), 0);
+  assert.equal(summary.mentionPolicy, undefined, 'a summary is never stamped as authorized');
+  assert.ok(!summary.text.includes('@all'));
+  db.close();
+});
+
+test('failed, timed-out, incomplete, skipped and deferred results never page', async () => {
+  const { db, store } = freshStore();
+  const sender = mockSender();
+  const pipeline = pipelineWith(store, sender, { slackCriticalMention: 'channel' });
+
+  // Incomplete / failed evidence updates nothing and sends nothing.
+  for (const payload of [{ status: 'FAILED' }, { status: 'TIMED_OUT' }, results(1, { siteChecks: undefined })]) {
+    const outcome = await pipeline.handleProjectCompleted({
+      project, auditRunId: 'r1', results: payload, criticalIssues: [critical(1)],
+    });
+    assert.equal(outcome.notificationStatus, 'skipped-incomplete-evidence');
+  }
+  assert.equal(sender.sent.length, 0, 'no project alert exists to carry a mention');
+
+  // A run in which everything failed, timed out or was skipped/deferred is a
+  // run summary, and summaries never page.
+  await pipeline.sendRunSummary({
+    startedAt: '2026-07-13T06:00:00.000Z',
+    finishedAt: '2026-07-13T06:00:20.000Z',
+    totals: {
+      discovered: 5, selected: 5, deduplicated: 0, completed: 0, failed: 2, timedOut: 1,
+      triggerFailed: 2, skippedAlreadyRunning: 1, skippedMissingConfig: 1, triggerOutcomeUnknown: 1,
+      projectsWithCritical: 0, currentP0: 0, newIssues: 0, reopenedIssues: 0,
+      unchangedIssues: 0, resolvedIssues: 0, notificationFailures: 1,
+    },
+  });
+  assert.equal(sender.sent.length, 1);
+  assert.equal(mentions(sender.sent[0]), 0, 'an operational summary never pages the channel');
   db.close();
 });
 
@@ -970,8 +1135,9 @@ test('a retry resends the persisted body verbatim rather than rebuilding it', as
   });
 
   const [row] = store.listRetryableNotifications({ now: new Date(Date.now() + 7 * 3600_000).toISOString() });
-  const storedText = JSON.parse(row.payload_json)[0].text;
-  assert.ok(!/<!(channel|here|everyone)>/.test(storedText), 'nothing stores a broad mention any more');
+  const stored = JSON.parse(row.payload_json)[0];
+  assert.equal(countBroadMentions(stored), 0, 'an un-opted-in deployment stores no broad mention');
+  assert.equal(stored.mentionPolicy, undefined, 'and no authorization metadata');
 
   const sender = mockSender();
   const summary = await retryPendingNotifications({
@@ -981,8 +1147,115 @@ test('a retry resends the persisted body verbatim rather than rebuilding it', as
     options: {},
   });
   assert.equal(summary.sent, 1);
-  assert.equal(sender.sent[0].text, storedText, 'the retry must resend the stored payload byte for byte');
+  assert.equal(sender.sent[0].text, stored.text, 'the retry must resend the stored payload byte for byte');
   assert.equal(store.getNotification(row.id).status, 'DELIVERED');
+  db.close();
+});
+
+// ── Mention authorization survives persistence, exactly once ─────────
+
+const laterIso = () => new Date(Date.now() + 7 * 3600_000).toISOString();
+
+test('an authorized alert persists its one mention and its authorization', async () => {
+  const { db, store } = freshStore();
+  const failing = mockSender({ failWith: new SlackRetryableError('503') });
+  const pipeline = pipelineWith(store, failing, { slackCriticalMention: 'channel' });
+
+  await pipeline.handleProjectCompleted({
+    project, auditRunId: 'r1', results: results(1, { siteChecks: siteChecks() }), criticalIssues: [critical(1)],
+  });
+
+  const [row] = store.listRetryableNotifications({ now: laterIso() });
+  const stored = JSON.parse(row.payload_json)[0];
+  assert.equal(stored.mentionPolicy, 'channel', 'the authorization is persisted with the payload');
+  assert.equal(countBroadMentions(stored), 1, 'and exactly one token with it');
+  db.close();
+});
+
+test('a retry of an authorized notification still delivers exactly one mention', async () => {
+  const { db, store } = freshStore();
+  const failing = mockSender({ failWith: new SlackRetryableError('503') });
+  const pipeline = pipelineWith(store, failing, { slackCriticalMention: 'channel' });
+
+  await pipeline.handleProjectCompleted({
+    project, auditRunId: 'r1', results: results(1, { siteChecks: siteChecks() }), criticalIssues: [critical(1)],
+  });
+  const [row] = store.listRetryableNotifications({ now: laterIso() });
+  const storedBefore = row.payload_json;
+
+  const sender = mockSender();
+  const summary = await retryPendingNotifications({
+    stateStore: store, slackSender: sender, now: laterIso, options: {},
+  });
+
+  assert.equal(summary.sent, 1);
+  // The pipeline hands the stored payload to the sender; the sender's own
+  // last-mile sanitizer is what Slack actually receives.
+  assert.equal(countBroadMentions(sanitizeSlackMessage(sender.sent[0])), 1, 'no accumulation, no loss');
+  assert.equal(store.getNotification(row.id).status, 'DELIVERED');
+  assert.equal(store.getNotification(row.id).payload_json, storedBefore, 'the stored row is not rewritten');
+  db.close();
+});
+
+test('a legacy stored notification without authorization is stripped on retry', async () => {
+  const { db, store } = freshStore();
+  const failing = mockSender({ failWith: new SlackRetryableError('503') });
+  const pipeline = pipelineWith(store, failing, { slackCriticalMention: 'channel' });
+
+  await pipeline.handleProjectCompleted({
+    project, auditRunId: 'r1', results: results(1, { siteChecks: siteChecks() }), criticalIssues: [critical(1)],
+  });
+  const [row] = store.listRetryableNotifications({ now: laterIso() });
+
+  // Rewrite the row into the pre-change shape: mentions in the body, no
+  // authorization metadata. Nothing in production does this — it is how a row
+  // queued before this change looks on disk.
+  const legacy = JSON.parse(row.payload_json).map(({ mentionPolicy: _drop, ...m }) => ({
+    ...m,
+    text: `<!channel> ${m.text}`,
+    blocks: m.blocks.map((b) => ({ ...b, text: { ...b.text, text: `<!here> ${b.text.text}` } })),
+  }));
+  db.prepare('UPDATE notifications SET payload_json = ? WHERE id = ?').run(JSON.stringify(legacy), row.id);
+
+  const sender = mockSender();
+  await retryPendingNotifications({ stateStore: store, slackSender: sender, now: laterIso, options: {} });
+
+  assert.equal(sender.sent.length, 1);
+  assert.equal(
+    countBroadMentions(sanitizeSlackMessage(sender.sent[0])),
+    0,
+    'an unauthorized legacy payload is never allowed to page the channel',
+  );
+  db.close();
+});
+
+test('a delivered authorized notification is never sent again', async () => {
+  const { db, store } = freshStore();
+  const sender = mockSender();
+  const pipeline = pipelineWith(store, sender, { slackCriticalMention: 'channel' });
+
+  const first = await pipeline.handleProjectCompleted({
+    project, auditRunId: 'r1', results: results(1, { siteChecks: siteChecks() }), criticalIssues: [critical(1)],
+  });
+  // Reset issue state so the lifecycle set — and therefore the notification
+  // identity — is identical to the delivered one.
+  db.prepare('DELETE FROM issue_states').run();
+  db.prepare('DELETE FROM project_snapshots').run();
+  const repeat = await pipeline.handleProjectCompleted({
+    project, auditRunId: 'r1', results: results(1, { siteChecks: siteChecks() }), criticalIssues: [critical(1)],
+  });
+
+  assert.equal(first.notificationStatus, 'delivered');
+  assert.equal(repeat.notificationStatus, 'already-delivered');
+  assert.equal(sender.sent.length, 1, 'idempotency is unchanged by the mention');
+
+  // …and a retry sweep skips it too.
+  const retrySender = mockSender();
+  const summary = await retryPendingNotifications({
+    stateStore: store, slackSender: retrySender, now: laterIso, options: {},
+  });
+  assert.equal(summary.sent, 0);
+  assert.equal(retrySender.sent.length, 0);
   db.close();
 });
 
