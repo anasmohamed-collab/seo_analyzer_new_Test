@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import {
   buildProjectMessages,
   buildRunSummaryMessage,
+  countBroadMentions,
   escapeSlack,
   cleanRecommendation,
   sanitizeSlackMessage,
@@ -60,52 +61,106 @@ const lc = (over = {}) => ({ new: [], reopened: [], unchanged: [], resolved: [],
 
 const count = (haystack, needle) => haystack.split(needle).length - 1;
 
-// ── Broad mentions: never generated, always stripped ────────────────
+// ── Broad mentions: one authorized token, everything else stripped ───
 
 const BROAD = /<!(channel|here|everyone)(\|[^>]*)?>/;
 
-test('the formatter has no way to emit a broad mention', () => {
-  // `mention` is not a parameter any more — passing one must change nothing.
-  for (const lifecycle of [
-    lc({ new: [mkIssue(1)] }),
-    lc({ reopened: [mkIssue(2)] }),
-    lc({ unchanged: [mkIssue(3)] }),
-    lc({ resolved: [mkIssue(4)] }),
-  ]) {
-    const [message] = buildProjectMessages(
-      baseArgs(lifecycle, { mode: 'all_current', mention: '<!channel>' }),
-    );
-    assert.ok(!BROAD.test(message.text), 'no broad mention in the text');
-    assert.ok(
-      message.blocks.every((b) => !BROAD.test(b.text.text)),
-      'no broad mention in any block',
-    );
-    assert.ok(!message.text.includes('@all'), 'never a literal @all');
-    assert.ok(!message.text.includes('@channel'), 'never a literal @channel');
+/** Every broad-mention token in a whole message (text + blocks). */
+const mentionsIn = (message) => countBroadMentions(message);
+
+test('a Production NEW P0 alert carries exactly one <!channel> when authorized', () => {
+  const [message] = buildProjectMessages(
+    baseArgs(lc({ new: [mkIssue(1)] }), { mentionPolicy: 'channel' }),
+  );
+
+  assert.equal(mentionsIn(message), 1, 'exactly one token in the entire message');
+  assert.equal(message.mentionPolicy, 'channel', 'the message is stamped as authorized');
+  assert.match(
+    message.blocks[0].text.text,
+    /^<!channel> :rotating_light: \*Critical SEO Alert\*/,
+    'the token opens the visible header',
+  );
+  assert.ok(!BROAD.test(message.text), 'the top-level fallback keeps no duplicate copy');
+  assert.match(message.text, /^:rotating_light: \*Critical SEO Alert\*/, 'the fallback is still meaningful');
+  assert.match(message.text, /\*P0:\* 1 new/);
+});
+
+test('a Production REOPENED P0 alert carries exactly one <!channel> when authorized', () => {
+  const [message] = buildProjectMessages(
+    baseArgs(lc({ reopened: [mkIssue(2)] }), { mentionPolicy: 'channel' }),
+  );
+  assert.equal(mentionsIn(message), 1);
+  assert.match(message.blocks[0].text.text, /^<!channel> /);
+  assert.match(message.text, /\*P0:\* 1 reopened/);
+});
+
+test('NEW and REOPENED P0 together still produce only one token', () => {
+  const [message] = buildProjectMessages(
+    baseArgs(lc({ new: [mkIssue(1)], reopened: [mkIssue(2)], resolved: [mkIssue(3)] }), {
+      mentionPolicy: 'channel',
+    }),
+  );
+  assert.equal(mentionsIn(message), 1, 'the NEW/REOPENED P0 authorizes one mention, not one each');
+  assert.match(message.text, /\*P0:\* 1 new, 1 reopened \| \*Resolved:\* 1/);
+});
+
+test('a multi-block authorized alert still carries exactly one token', () => {
+  // Force several section blocks by exceeding the 2900-character chunk size.
+  // Titles and fix hints are length-capped, so the bulk comes from the URL.
+  const long = (n) => mkIssue(n, { pageUrl: `https://example.com/${'p'.repeat(700)}-${n}` });
+  const [message] = buildProjectMessages(
+    baseArgs(lc({ new: [long(1), long(2), long(3), long(4), long(5)] }), { mentionPolicy: 'channel' }),
+  );
+  assert.ok(message.blocks.length > 1, 'this case must actually span multiple blocks');
+  assert.equal(mentionsIn(message), 1);
+  assert.ok(
+    message.blocks.slice(1).every((b) => !BROAD.test(b.text.text)),
+    'only the header block carries the token',
+  );
+  assert.ok(
+    message.blocks.every((b) => b.text.text.length <= 3000),
+    'the token must not push a block past the Slack section limit',
+  );
+});
+
+test('an unauthorized policy renders no mention, whatever the lifecycle', () => {
+  for (const policy of ['none', '', undefined, 'here', 'everyone', 'CHANNEL', true, '<!channel>']) {
+    for (const lifecycle of [
+      lc({ new: [mkIssue(1)] }),
+      lc({ reopened: [mkIssue(2)] }),
+      lc({ unchanged: [mkIssue(3)] }),
+      lc({ resolved: [mkIssue(4)] }),
+    ]) {
+      const [message] = buildProjectMessages(
+        baseArgs(lifecycle, { mode: 'all_current', mentionPolicy: policy }),
+      );
+      assert.equal(mentionsIn(message), 0, `mentionPolicy=${String(policy)} must render no mention`);
+      assert.equal(message.mentionPolicy, undefined, 'and stamp no authorization');
+      assert.ok(!message.text.includes('@all'), 'never a literal @all');
+      assert.ok(!message.text.includes('@channel'), 'never a literal @channel');
+    }
   }
 });
 
-test('a new-P0 alert renders its header without any mention', () => {
-  const [message] = buildProjectMessages(baseArgs(lc({ new: [mkIssue(1)] })));
-  assert.match(message.text, /^:rotating_light: \*Critical SEO Alert\*/);
-  assert.match(message.text, /\*P0:\* 1 new/);
-  assert.ok(!BROAD.test(message.text));
+test('the default (no mentionPolicy argument) stays mention-free', () => {
+  for (const lifecycle of [lc({ new: [mkIssue(1)] }), lc({ reopened: [mkIssue(2)] })]) {
+    const [message] = buildProjectMessages(baseArgs(lifecycle));
+    assert.equal(mentionsIn(message), 0, 'existing callers keep their current behavior');
+    assert.equal(message.mentionPolicy, undefined);
+  }
 });
 
-test('a reopened-P0 alert renders without any mention', () => {
-  const [message] = buildProjectMessages(baseArgs(lc({ reopened: [mkIssue(2)] })));
-  assert.match(message.text, /\*P0:\* 1 reopened/);
-  assert.ok(!BROAD.test(message.text));
-});
-
-test('unchanged-only and resolved-only alerts carry no broad mention', () => {
+test('unchanged-only and resolved-only alerts never mention, even when authorized', () => {
   const unchanged = buildProjectMessages(
-    baseArgs(lc({ unchanged: [mkIssue(3)] }), { mode: 'all_current' }),
+    baseArgs(lc({ unchanged: [mkIssue(3)] }), { mode: 'all_current', mentionPolicy: 'channel' }),
   )[0];
-  assert.ok(!BROAD.test(unchanged.text));
+  assert.equal(mentionsIn(unchanged), 0, 'UNCHANGED-only is not a paging event');
+  assert.equal(unchanged.mentionPolicy, undefined);
 
-  const resolved = buildProjectMessages(baseArgs(lc({ resolved: [mkIssue(4)] })))[0];
-  assert.ok(!BROAD.test(resolved.text));
+  const resolved = buildProjectMessages(
+    baseArgs(lc({ resolved: [mkIssue(4)] }), { mentionPolicy: 'channel' }),
+  )[0];
+  assert.equal(mentionsIn(resolved), 0, 'RESOLVED-only is not a paging event');
   assert.match(resolved.text, /\*P0:\* none currently open \| \*Resolved:\* 1/);
 });
 
@@ -114,13 +169,45 @@ test('Beta exposure alerts are distinct and never carry a broad mention', () => 
     priority: 'P0',
     message: 'Beta/Staging seed URL is indexable (no noindex directive detected)',
   });
-  const [message] = buildProjectMessages(baseArgs(lc({ new: [exposure] }), { isBeta: true }));
+  // Even with the operator opted in AND a new finding, Beta never pages.
+  const [message] = buildProjectMessages(
+    baseArgs(lc({ new: [exposure] }), { isBeta: true, mentionPolicy: 'channel' }),
+  );
 
   assert.match(message.text, /^:warning: \*Beta SEO Exposure Alert\*/);
   assert.match(message.text, /\*Exposure findings:\* 1 new/);
   assert.match(message.text, /Beta\/Staging seed URL is indexable/);
-  assert.ok(!BROAD.test(message.text));
+  assert.equal(mentionsIn(message), 0);
+  assert.equal(message.mentionPolicy, undefined);
   assert.ok(!/\*P0:\*/.test(message.text));
+});
+
+test('audit-controlled content cannot inject a broad mention', () => {
+  const hostile = (n) =>
+    mkIssue(n, {
+      message: '<!channel> <!here> <!everyone> <!channel|channel> @channel urgent',
+      fixHint: 'Fix by pinging <!channel> and <!everyone>',
+      pageUrl: 'https://example.com/<!channel>?x=<!here>',
+      pageType: '<!everyone>',
+    });
+
+  for (const policy of ['none', 'channel']) {
+    const [message] = buildProjectMessages(
+      baseArgs(lc({ new: [hostile(1)], resolved: [hostile(2)] }), {
+        projectName: '<!channel> Corp',
+        domain: 'example.com',
+        mentionPolicy: policy,
+      }),
+    );
+    // `channel` authorizes exactly ONE token — the header one this module
+    // adds — no matter how many the audit content spells.
+    assert.equal(
+      mentionsIn(message),
+      policy === 'channel' ? 1 : 0,
+      `hostile content must not add tokens (policy=${policy})`,
+    );
+    assert.match(message.text, /&lt;!channel&gt;/, 'audit content stays escaped and visible');
+  }
 });
 
 test('stripBroadMentions removes every token form and leaves other text alone', () => {
@@ -128,6 +215,7 @@ test('stripBroadMentions removes every token form and leaves other text alone', 
   assert.equal(stripBroadMentions('<!here|here> alert'), 'alert');
   assert.equal(stripBroadMentions('<!everyone> alert'), 'alert');
   assert.equal(stripBroadMentions('<!CHANNEL> alert'), 'alert');
+  assert.equal(stripBroadMentions('<!channel|channel> alert'), 'alert');
   assert.equal(stripBroadMentions('a <!channel> b'), 'a b');
   assert.equal(stripBroadMentions('plain text'), 'plain text');
   assert.equal(stripBroadMentions('<@U123> direct mention'), '<@U123> direct mention');
@@ -135,7 +223,7 @@ test('stripBroadMentions removes every token form and leaves other text alone', 
   assert.equal(stripBroadMentions(null), null);
 });
 
-test('sanitizeSlackMessage cleans text and mrkdwn blocks without mutating the input', () => {
+test('sanitizeSlackMessage strips an unauthorized payload without mutating the input', () => {
   const legacy = {
     text: ':rotating_light: <!channel> *Critical SEO Alert*',
     blocks: [
@@ -147,10 +235,54 @@ test('sanitizeSlackMessage cleans text and mrkdwn blocks without mutating the in
   const before = JSON.parse(JSON.stringify(legacy));
 
   const clean = sanitizeSlackMessage(legacy);
-  assert.ok(!BROAD.test(clean.text));
-  assert.ok(clean.blocks.every((b) => !BROAD.test(JSON.stringify(b))));
+  assert.equal(countBroadMentions(clean), 0, 'no authorization field means no mention survives');
   assert.match(clean.text, /\*Critical SEO Alert\*/, 'the rest of the message survives');
   assert.deepEqual(legacy, before, 'the stored payload is never mutated');
+});
+
+test('sanitizeSlackMessage keeps exactly one token for an authorized payload', () => {
+  const authorized = {
+    text: ':rotating_light: *Critical SEO Alert*',
+    mentionPolicy: 'channel',
+    blocks: [
+      { type: 'section', text: { type: 'mrkdwn', text: '<!channel> :rotating_light: *Critical SEO Alert*' } },
+      // Extra tokens beyond the authorized one are still removed.
+      { type: 'section', text: { type: 'mrkdwn', text: 'tail <!channel> <!here> <!channel|channel>' } },
+      { type: 'context', elements: [{ type: 'mrkdwn', text: 'ctx <!everyone>' }] },
+    ],
+  };
+  const before = JSON.parse(JSON.stringify(authorized));
+
+  const clean = sanitizeSlackMessage(authorized);
+  assert.equal(countBroadMentions(clean), 1, 'the authorization buys exactly one token');
+  assert.match(clean.blocks[0].text.text, /^<!channel> :rotating_light:/);
+  assert.ok(!BROAD.test(clean.blocks[1].text.text), 'surplus tokens are stripped');
+  assert.deepEqual(authorized, before, 'the stored payload is never mutated');
+});
+
+test('sanitizeSlackMessage always removes the internal authorization field', () => {
+  for (const policy of ['channel', 'none', 'here', 'everyone']) {
+    const clean = sanitizeSlackMessage({
+      text: 'x',
+      mentionPolicy: policy,
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: '<!channel> x' } }],
+    });
+    assert.ok(!Object.hasOwn(clean, 'mentionPolicy'), `mentionPolicy=${policy} must not survive`);
+    assert.deepEqual(Object.keys(clean).sort(), ['blocks', 'text']);
+    assert.equal(countBroadMentions(clean), policy === 'channel' ? 1 : 0);
+  }
+});
+
+test('a labeled or upper-case token is never treated as the authorized one', () => {
+  for (const token of ['<!channel|channel>', '<!CHANNEL>', '<!here>', '<!everyone>']) {
+    const clean = sanitizeSlackMessage({
+      text: '',
+      mentionPolicy: 'channel',
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `${token} header` } }],
+    });
+    assert.equal(countBroadMentions(clean), 0, `${token} must be stripped`);
+    assert.equal(clean.blocks[0].text.text, 'header');
+  }
 });
 
 test('sanitizeSlackMessage returns the same object when nothing needs stripping', () => {

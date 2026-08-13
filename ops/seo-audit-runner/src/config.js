@@ -12,6 +12,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   BROAD_MENTION_MODES,
+  CHANNEL_MENTION_MODE,
+  HONORED_MENTION_MODES,
+  NEUTRALIZED_MENTION_MODES,
   NO_MENTION_MODE,
   SLACK_CRITICAL_MENTION_MODES,
 } from './slackFormat.js';
@@ -50,12 +53,19 @@ const DEFAULTS = {
   SLACK_MAX_RETRIES: '4',
   SLACK_MAX_ISSUES_PER_MESSAGE: '20',
   SLACK_MAX_MESSAGE_CHARACTERS: '30000',
-  // Broad channel mentions are permanently off. See the validation below.
+  // Safe default: no broad mention. Opt in with `channel`. See the validation below.
   SLACK_CRITICAL_MENTION: NO_MENTION_MODE,
 };
 
 export const ALERT_MODES = ['new_or_regressed', 'all_current', 'summary_only', 'disabled'];
-export { BROAD_MENTION_MODES, NO_MENTION_MODE, SLACK_CRITICAL_MENTION_MODES };
+export {
+  BROAD_MENTION_MODES,
+  CHANNEL_MENTION_MODE,
+  HONORED_MENTION_MODES,
+  NEUTRALIZED_MENTION_MODES,
+  NO_MENTION_MODE,
+  SLACK_CRITICAL_MENTION_MODES,
+};
 
 // Hostnames considered private/trusted for plain-http transport.
 const PRIVATE_HOST_PATTERNS = [
@@ -264,11 +274,16 @@ export function loadConfig(env = process.env) {
     );
   }
 
-  // Broad channel mentions are permanently disabled. The variable is still
-  // ACCEPTED so existing env files keep validating, but a broad value is
-  // neutralized to `none` rather than honored — no runner alert may page a
-  // whole channel. An unrecognized value is still a hard error, so a typo can
-  // never be mistaken for a deliberate setting.
+  // Broad channel mentions are OPT-IN and narrowly scoped:
+  //   missing / empty / `none` → no mention (the default, and what every
+  //     existing deployment that never set the variable keeps getting)
+  //   `channel`                → honored; a single <!channel> is added to a
+  //     Production critical alert that reports a NEW or REOPENED P0 (the
+  //     eligibility rule lives in notificationPipeline.js)
+  //   `here` / `everyone`      → still ACCEPTED vocabulary but neutralized to
+  //     `none`, so neither can become active by accident
+  //   anything else            → hard error, so a typo can never be mistaken
+  //     for a deliberate setting
   const rawCriticalMention = raw('SLACK_CRITICAL_MENTION').toLowerCase();
   let slackCriticalMention = NO_MENTION_MODE;
   let slackCriticalMentionNeutralized = false;
@@ -277,8 +292,10 @@ export function loadConfig(env = process.env) {
       `SLACK_CRITICAL_MENTION must be one of ${SLACK_CRITICAL_MENTION_MODES.join(', ')}, ` +
         `got: ${raw('SLACK_CRITICAL_MENTION')}`,
     );
-  } else if (BROAD_MENTION_MODES.includes(rawCriticalMention)) {
+  } else if (NEUTRALIZED_MENTION_MODES.includes(rawCriticalMention)) {
     slackCriticalMentionNeutralized = true;
+  } else if (rawCriticalMention === CHANNEL_MENTION_MODE) {
+    slackCriticalMention = CHANNEL_MENTION_MODE;
   }
 
   const slackRequestTimeoutMs = parsePositiveInt('SLACK_REQUEST_TIMEOUT_MS', { min: 1000 });

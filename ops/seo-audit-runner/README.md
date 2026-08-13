@@ -137,13 +137,21 @@ identity**. Private routing alone is not authentication. Therefore:
 
 ### Preferred: bot token (`chat.postMessage`)
 
+The intended alert channel is **`#seo_analyzer_bot`**. The runner never
+resolves that name: it posts to whatever immutable channel ID
+`SLACK_CHANNEL_ID` holds, and performs **no channel-name lookup and no Slack
+discovery call**. Configuring the ID that corresponds to `#seo_analyzer_bot` is
+an operator responsibility.
+
 1. Create a Slack app for your workspace (api.slack.com → *Create New App*).
 2. Add the **`chat:write`** bot scope and install the app to the workspace.
 3. Copy the **Bot User OAuth Token** (`xoxb-…`) → `SLACK_BOT_TOKEN`.
 4. Use the **channel ID** (e.g. `C0123456789`, from the channel's details
-   page), NOT the channel name → `SLACK_CHANNEL_ID`.
-5. For private channels, **invite the bot** to the channel
-   (`/invite @your-bot`), otherwise Slack returns `not_in_channel`.
+   page), NOT the channel name → `SLACK_CHANNEL_ID`. It must be the ID of
+   `#seo_analyzer_bot`.
+5. **Invite the bot** to `#seo_analyzer_bot` (`/invite @your-bot`); otherwise
+   Slack returns `not_in_channel`. Required for private channels, and the
+   simplest way to guarantee delivery for public ones.
 
 ### Fallback: incoming webhook
 
@@ -162,29 +170,73 @@ without channel ID or vice versa) is always a configuration error.
 | `summary_only` | Project-level counts only, no individual issues. |
 | `disabled` | Never send Slack messages — issue lifecycle state is still updated after successful audits. |
 
-### Broad mentions (`SLACK_CRITICAL_MENTION`) — permanently disabled
+### Broad mentions (`SLACK_CRITICAL_MENTION`) — off by default, opt-in for Production P0
 
-**No runner message can page a whole channel.** `<!channel>`, `<!here>` and
-`<!everyone>` are not generated anywhere: the formatter has no mention
-parameter, and the notification pipeline passes none. This applies to every
-message type — Production critical alerts, Beta Exposure alerts, run summaries
-and failure notices alike. The literal string `@all` is never emitted either.
+The default is **no mention on any message**. An operator may opt in to a
+single `<!channel>` (`@channel`) on genuine Production critical alerts.
+`<!here>` and `<!everyone>` are never activated, and the literal string `@all`
+is never emitted.
 
 | Value | Effect |
 |---|---|
-| *(omitted)* / `none` *(default)* | no mention — the only effective behavior |
-| `channel` / `here` / `everyone` | **accepted, then neutralized to `none`** so existing env files keep validating; the value is never honored |
+| *(omitted)* / `none` *(default)* | no broad mention on any message |
+| `channel` | **opt-in:** one `<!channel>` on a Production critical alert that reports a NEW or REOPENED P0 |
+| `here` / `everyone` | **accepted, then neutralized to `none`** so existing env files keep validating; neither can become active |
 | anything else | **configuration error** — `validate-config` fails rather than guessing |
 
-`validate-config` and `status` print which of the two happened, so a
-neutralized legacy value is visible rather than silent.
+`validate-config` and `status` print the effective value and whether a broad
+value was neutralized, so nothing is silent.
 
-Defense in depth: a notification payload that was serialized into the runner's
-SQLite state **before** this change still contains its mention token. Slack
-delivery strips broad mentions from the top-level text and from every mrkdwn
-block immediately before transmitting, on the first send and on every
-`retry-notifications` replay. The stored notification row is never rewritten,
-so notification history stays intact and auditable.
+**Exact eligibility.** With `SLACK_CRITICAL_MENTION=channel`, the mention is
+rendered only when **all** of the following hold:
+
+1. the message is a project-level critical SEO alert,
+2. the project is Production (`is_beta !== true`),
+3. the notification-eligible lifecycle contains at least one **NEW** or
+   **REOPENED** P0,
+4. Slack notifications and the project's alert mode already permit the message
+   to be sent.
+
+A message that reports a NEW/REOPENED P0 *and* other lifecycle buckets mentions
+the channel **once** — the mention is authorized by the NEW/REOPENED P0, not by
+the other buckets. Everything else stays mention-free: P1/P2 findings, page
+PASS/WARN/FAIL promotions, **Beta Exposure alerts**, UNCHANGED-only and
+RESOLVED-only alerts, **run summaries**, zero-completed-audit summaries,
+operational and trigger failures, incomplete evidence, timed-out or failed
+audits, skipped/deferred projects, health and doctor output, audit-config
+discovery, notification previews and dry runs, and ordinary runner logs. No
+P0/P1/P2 scoring rule changed to make this work.
+
+**Authorization is data, never text.** The decision travels from configuration
+through the notification pipeline to the formatter as an explicit value; no
+code path grants a mention by searching a rendered message, alert title, or any
+audit-controlled string. The formatter inserts exactly one token at the start
+of the visible header block and deliberately keeps no copy in the top-level
+fallback text, so the payload carries it exactly once in total. Audit-supplied
+content is escaped (`<` → `&lt;`), so an issue title, message, URL, project
+name, recommendation, or fix hint cannot inject one.
+
+**Last-mile control.** Slack delivery re-checks every payload immediately
+before transmitting, on the first send and on every `retry-notifications`
+replay: at most the ONE authorized `<!channel>` survives, and every other broad
+mention — including `<!here>`, `<!everyone>`, and labeled variants such as
+`<!channel|channel>` — is stripped from the top-level text and from every
+mrkdwn block. Authorization is carried by an internal field on the message,
+which is removed before the request is built, so only Slack-supported fields
+are transmitted on both the bot-token and webhook methods.
+
+**Persistence and retry.** The authorization is persisted inside the
+notification payload, so a legitimate retry of an authorized alert still
+delivers exactly one mention. A row stored **before** this change has no
+authorization field and is therefore stripped of every broad mention at
+delivery — old queued messages are never authorized retroactively, and no
+historical row is rewritten. Delivered notifications are still never resent,
+retries never rerun an audit, and retries never modify issue lifecycle state.
+
+**Enabling it is a separate operator action.** Setting
+`SLACK_CRITICAL_MENTION=channel` on a host is a deliberate change made outside
+this repository. **No real Slack validation of the mention has been executed** —
+the behavior above is covered by unit tests with mocked HTTP only.
 
 ### Message format
 

@@ -143,18 +143,34 @@ Fix the configuration, then re-run the audit to generate a fresh message —
 retrying the old record cannot succeed for a permanent error.
 
 **The channel is not notified even though the alert arrived**
-This is intended. **Broad mentions are permanently disabled**: no runner
-message emits `<!channel>`, `<!here>` or `<!everyone>`. Critical alerts, Beta
-Exposure alerts and run summaries all arrive without paging the channel — use
-Slack channel notification preferences or a keyword highlight if someone needs
-to be woken.
+Check `SLACK_CRITICAL_MENTION` with `status` / `validate-config`. The **default
+is `none`** — no message pages the channel — and enabling the mention is a
+deliberate operator action (`SLACK_CRITICAL_MENTION=channel`).
 
-`SLACK_CRITICAL_MENTION` is still accepted so old env files keep validating.
-A broad value (`channel` / `here` / `everyone`) is **neutralized to `none`**
-and `status` / `validate-config` say so; anything outside that vocabulary is
-still a configuration error rather than a silent fallback. A payload queued in
-SQLite before this change is stripped of its mention at delivery time, so even
-a replayed legacy notification cannot page the channel.
+Even with `channel` set, only a **Production critical alert reporting a NEW or
+REOPENED P0** carries the single `<!channel>`. These are mention-free by
+design and are not a bug:
+
+- Beta Exposure alerts (`is_beta === true`)
+- UNCHANGED-only and RESOLVED-only alerts
+- run summaries, zero-completed-audit summaries, and failure notices
+- failed, timed-out, incomplete-evidence, skipped and deferred results
+
+`here` and `everyone` are accepted vocabulary but **neutralized to `none`** and
+never activated; anything outside the vocabulary is a configuration error
+rather than a silent fallback. If the channel still needs to be woken for a
+case listed above, use Slack channel notification preferences or a keyword
+highlight rather than widening the runner's policy.
+
+If the mention is enabled but the message shows `@channel` as plain text, the
+Slack workspace restricts who may post broad mentions — a workspace setting,
+not a runner problem.
+
+A payload queued in SQLite **without explicit authorization** — every row
+written before this feature — is stripped of all broad mentions at delivery
+time, so a replayed legacy notification can never page the channel. A retry of
+a genuinely authorized alert still delivers exactly one mention, and no stored
+row is ever rewritten.
 
 **Message queued but not sent (`PENDING` / `FAILED`)**
 Transient failures are retried by the next tick. To force a pass now:
