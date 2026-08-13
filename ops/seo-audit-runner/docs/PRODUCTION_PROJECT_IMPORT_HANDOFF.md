@@ -152,3 +152,15 @@ must not run an import or trigger an audit.
 
 These are hard stops; none may be worked around with the legacy upsert route or
 manual PATCH requests.
+
+## Controlled PostgreSQL alternative
+
+If application SHA proof cannot be completed but IT has direct PostgreSQL
+access, the reviewed manual alternative is `PRODUCTION_PROJECT_IMPORT.sql`.
+It is an insert-only, fail-closed transaction rather than a database dump or
+replacement. The operator instructions and copy/paste IT request are in
+`IT_POSTGRES_PROJECT_IMPORT_REQUEST.md`.
+
+This alternative does not relax the runner pause, notification-disable, backup,
+inventory, or post-import verification gates. It also does not resolve the
+missing application build identity; that remains a separate deployment issue.
