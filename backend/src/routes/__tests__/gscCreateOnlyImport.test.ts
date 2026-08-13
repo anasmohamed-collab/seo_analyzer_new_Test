@@ -29,8 +29,8 @@ const {
   parseProperties,
   planSync,
 } = await import('../../lib/gscSync.js');
-const { applyPlan, fetchInventory } = await import('../../lib/gscSyncApply.js');
-const { buildCoverage } = await import('../../lib/gscSyncCli.js');
+const { applyPlan, applyPlanVerified, fetchInventory } = await import('../../lib/gscSyncApply.js');
+const { buildCoverage, parseArgs, UsageError } = await import('../../lib/gscSyncCli.js');
 
 type LiveCheck = import('../../lib/gscSync.js').LiveCheck;
 type PlanEntry = import('../../lib/gscSync.js').PlanEntry;
@@ -272,7 +272,7 @@ describe('create-only apply', () => {
   });
 
   it('triggers no audit and touches no notification state', async () => {
-    seedKuwaitTimes();
+    const seeded = seedKuwaitTimes();
     const { plan } = await buildPlan();
     db.executedSql.length = 0;
 
@@ -283,7 +283,14 @@ describe('create-only apply', () => {
     expect(touched).not.toMatch(/audit_results/i);
     expect(touched).not.toMatch(/notification/i);
     expect(touched).not.toMatch(/DELETE FROM/i);
-    expect(touched).not.toMatch(/last_form_values/i);
+    // last_form_values is a column in the create-only statement, but without
+    // --with-audit-config every newly created row must still store NULL. The
+    // pre-existing project keeps the configuration it already had.
+    const created = db.sites.filter((s) => s.id !== seeded.id);
+    expect(created.length).toBe(plan.create.length);
+    expect(created.every((s) => s.last_form_values === null)).toBe(true);
+    expect(db.sites.find((s) => s.id === seeded.id)!.last_form_values)
+      .toEqual(seeded.last_form_values);
   });
 
   it('is idempotent — a second apply conflicts and changes nothing', async () => {
@@ -369,6 +376,247 @@ describe('a project that appears between planning and the write', () => {
     expect(outcome.conflicts).toBe(1);
     expect(db.sites[0].project_name).toBe('The Manila Times');
     expect(db.sites[0].website_url).toBe('https://www.manilatimes.net/');
+  });
+});
+
+// ── inventory verification must use two live reads ────────────────
+
+describe('existing-project verification', () => {
+  it('reads the live project list before and after the writes', async () => {
+    seedKuwaitTimes();
+    const { plan } = await buildPlan();
+    db.executedSql.length = 0;
+
+    const verified = await applyPlanVerified(apiBase, plan.create, { createOnly: true });
+
+    // The list query runs once before and once after the inserts.
+    const listReads = db.executedSql
+      .map((sql, i) => ({ sql, i }))
+      .filter((e) => /FROM sites s/i.test(e.sql));
+    const inserts = db.executedSql
+      .map((sql, i) => ({ sql, i }))
+      .filter((e) => /INSERT INTO sites/i.test(e.sql));
+
+    expect(listReads).toHaveLength(2);
+    expect(inserts.length).toBeGreaterThan(0);
+    expect(listReads[0].i).toBeLessThan(inserts[0].i);
+    expect(listReads[1].i).toBeGreaterThan(inserts[inserts.length - 1].i);
+    expect(verified.preservationVerified).toBe(true);
+  });
+
+  it('fails verification when the post-apply read fails', async () => {
+    seedKuwaitTimes();
+    const { plan } = await buildPlan();
+
+    // The database disappears once the writes are done, so preservation is
+    // unproven — which must be reported as a failure, not as "fine".
+    const realQuery = db.query;
+    db.query = ((sql: string, params?: unknown[]) => {
+      const out = realQuery(sql, params);
+      if (/INSERT INTO sites/i.test(sql)) db.available = false;
+      return out;
+    }) as typeof db.query;
+
+    const verified = await applyPlanVerified(apiBase, plan.create.slice(0, 1), { createOnly: true });
+    db.query = realQuery;
+
+    expect(verified.preservationVerified).toBe(false);
+    expect(verified.inventoryAfter).toBeNull();
+    expect(verified.verificationError).toMatch(/preservation could NOT be verified/);
+  });
+
+  it('reports failure when a pre-existing project really did change', async () => {
+    const kuwait = seedKuwaitTimes();
+    const { plan } = await buildPlan();
+
+    const realQuery = db.query;
+    db.query = ((sql: string, params?: unknown[]) => {
+      const out = realQuery(sql, params);
+      // Simulate an unrelated writer touching the project mid-apply.
+      if (/INSERT INTO sites/i.test(sql)) {
+        const row = db.sites.find((s) => s.id === kuwait.id);
+        if (row) row.project_name = 'Renamed By Someone Else';
+      }
+      return out;
+    }) as typeof db.query;
+
+    const verified = await applyPlanVerified(apiBase, plan.create.slice(0, 1), { createOnly: true });
+    db.query = realQuery;
+
+    expect(verified.preservationVerified).toBe(false);
+    expect(verified.comparison?.changed.map((c) => c.field)).toContain('project_name');
+    expect(verified.verificationError).toMatch(/field change/);
+  });
+
+  it('refuses a static inventory file as an apply input', () => {
+    // A captured file describes one moment; re-reading it after writing would
+    // "prove" preservation regardless of what the apply did.
+    expect(() => parseArgs(['--apply', '--create-only', '--existing-projects', 'snapshot.json']))
+      .toThrow(UsageError);
+    expect(() => parseArgs(['--apply', '--create-only', '--existing-projects', 'snapshot.json']))
+      .toThrow(/must read GET \/api\/projects from the real target/);
+  });
+
+  it('has no code path that accepts a captured inventory for verification', () => {
+    // applyPlanVerified takes only the API base: there is no parameter a
+    // static snapshot could be passed through.
+    expect(applyPlanVerified.length).toBe(3);
+    const source = applyPlanVerified.toString();
+    expect(source).toMatch(/fetchInventory\(apiBase\)/);
+    expect(source).not.toMatch(/readFileSync|existingProjects/);
+  });
+});
+
+// ── configured creation ───────────────────────────────────────────
+
+describe('create-only apply with validated audit configuration', () => {
+  const pairFor = (domain: string) => ({
+    homeUrl: `https://${domain}/`,
+    articleUrl: `https://${domain}/2026/07/18/news/a-real-validated-story/1`,
+  });
+
+  it('creates a configured project automation-ready in one insert', async () => {
+    const { plan } = await buildPlan();
+    const target = plan.create.find((e) => e.domain === 'manilatimes.net')!;
+    db.executedSql.length = 0;
+
+    const outcome = await applyPlan(apiBase, [target], {
+      createOnly: true,
+      auditConfig: { 'manilatimes.net': pairFor('manilatimes.net') },
+    });
+
+    expect(outcome.halted).toBeNull();
+    expect(outcome.created).toBe(1);
+    expect(outcome.configured).toBe(1);
+
+    const row = db.sites.find((s) => s.domain === 'manilatimes.net')!;
+    expect(row.last_form_values).toEqual(pairFor('manilatimes.net'));
+
+    const writes = db.executedSql.filter((s) => /INSERT INTO|UPDATE |DELETE FROM/i.test(s));
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toMatch(/DO NOTHING/i);
+
+    const inventory = await fetchInventory(apiBase);
+    expect(inventory.find((p) => p.domain === 'manilatimes.net')?.automation_ready).toBe(true);
+  });
+
+  it('creates the projects without a validated pair identity-only', async () => {
+    const { plan } = await buildPlan();
+    const configured = plan.create.find((e) => e.domain === 'manilatimes.net')!;
+    const identityOnly = plan.create.find((e) => e.domain === 'lematin.ma')!;
+
+    const outcome = await applyPlan(apiBase, [configured, identityOnly], {
+      createOnly: true,
+      auditConfig: { 'manilatimes.net': pairFor('manilatimes.net') },
+    });
+
+    expect(outcome.created).toBe(2);
+    expect(outcome.configured).toBe(1);
+    expect(db.sites.find((s) => s.domain === 'lematin.ma')!.last_form_values).toBeNull();
+
+    const inventory = await fetchInventory(apiBase);
+    expect(inventory.find((p) => p.domain === 'lematin.ma')?.automation_ready).toBe(false);
+  });
+
+  it('leaves an existing configured project untouched on a race conflict', async () => {
+    const { plan } = await buildPlan();
+    const target = plan.create.find((e) => e.domain === 'manilatimes.net')!;
+
+    const raced = db.seed({
+      domain: 'manilatimes.net',
+      project_name: 'Created By Someone Else',
+      website_url: 'https://manilatimes.net/custom',
+      is_beta: true,
+      last_form_values: {
+        homeUrl: 'https://manilatimes.net/',
+        articleUrl: 'https://manilatimes.net/their-own-story',
+      },
+    });
+    const before = db.snapshot();
+    const inventoryBefore = await fetchInventory(apiBase);
+    db.executedSql.length = 0;
+
+    const outcome = await applyPlan(apiBase, [target], {
+      createOnly: true,
+      auditConfig: { 'manilatimes.net': pairFor('manilatimes.net') },
+    });
+
+    expect(outcome.conflicts).toBe(1);
+    expect(outcome.configured).toBe(0);
+    expect(outcome.results[0]).toMatchObject({ httpStatus: 409, conflict: true, projectId: raced.id });
+
+    // No UPDATE and no PATCH followed the conflict.
+    expect(db.executedSql.some((s) => /DO UPDATE/i.test(s))).toBe(false);
+    expect(db.executedSql.some((s) => /^\s*UPDATE sites/i.test(s))).toBe(false);
+    expect(db.snapshot()).toEqual(before);
+    expect(compareInventories(inventoryBefore, await fetchInventory(apiBase)).preserved).toBe(true);
+  });
+
+  it('refuses to send an incomplete pair', async () => {
+    const { plan } = await buildPlan();
+    const target = plan.create.find((e) => e.domain === 'manilatimes.net')!;
+    db.executedSql.length = 0;
+
+    const outcome = await applyPlan(apiBase, [target], {
+      createOnly: true,
+      auditConfig: { 'manilatimes.net': { homeUrl: 'https://manilatimes.net/', articleUrl: '' } },
+    });
+
+    expect(outcome.failed).toBe(1);
+    expect(outcome.halted).toMatch(/incomplete audit configuration/);
+    expect(db.executedSql.filter((s) => /INSERT INTO sites/i.test(s))).toHaveLength(0);
+    expect(db.sites).toHaveLength(0);
+  });
+
+  it('refuses to send a pair belonging to another domain', async () => {
+    const { plan } = await buildPlan();
+    const target = plan.create.find((e) => e.domain === 'manilatimes.net')!;
+
+    const outcome = await applyPlan(apiBase, [target], {
+      createOnly: true,
+      auditConfig: {
+        'manilatimes.net': {
+          homeUrl: 'https://manilatimes.net/',
+          articleUrl: 'https://another-paper.test/story',
+        },
+      },
+    });
+
+    expect(outcome.failed).toBe(1);
+    expect(outcome.halted).toMatch(/on a different domain/);
+    expect(db.sites).toHaveLength(0);
+  });
+
+  it('is idempotent — a repeated configured apply conflicts and changes nothing', async () => {
+    const { plan } = await buildPlan();
+    const target = plan.create.find((e) => e.domain === 'manilatimes.net')!;
+    const config = { 'manilatimes.net': pairFor('manilatimes.net') };
+
+    const first = await applyPlan(apiBase, [target], { createOnly: true, auditConfig: config });
+    expect(first.configured).toBe(1);
+    const afterFirst = db.snapshot();
+
+    const second = await applyPlan(apiBase, [target], { createOnly: true, auditConfig: config });
+    expect(second.conflicts).toBe(1);
+    expect(second.created).toBe(0);
+    expect(db.snapshot()).toEqual(afterFirst);
+  });
+
+  it('triggers no audit and no notification when configuring', async () => {
+    const { plan } = await buildPlan();
+    const target = plan.create.find((e) => e.domain === 'manilatimes.net')!;
+    db.executedSql.length = 0;
+
+    await applyPlan(apiBase, [target], {
+      createOnly: true,
+      auditConfig: { 'manilatimes.net': pairFor('manilatimes.net') },
+    });
+
+    const touched = db.executedSql.join('\n');
+    expect(touched).not.toMatch(/audit_runs/i);
+    expect(touched).not.toMatch(/audit_results/i);
+    expect(touched).not.toMatch(/notification/i);
+    expect(touched).not.toMatch(/DELETE FROM/i);
   });
 });
 

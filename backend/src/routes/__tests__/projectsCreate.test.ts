@@ -444,6 +444,165 @@ describe('POST /api/projects — create_only contract', () => {
   });
 });
 
+// ── configured create-only ────────────────────────────────────────
+
+describe('POST /api/projects — create_only + with_audit_config', () => {
+  const pair = {
+    homeUrl: 'https://example.com/',
+    articleUrl: 'https://example.com/2026/07/18/news/a-real-story/1',
+  };
+  const configuredCreate = (over: Record<string, unknown> = {}) =>
+    postProject({
+      website_url: 'https://example.com',
+      project_name: 'Example',
+      create_only: true,
+      with_audit_config: true,
+      ...pair,
+      ...over,
+    });
+
+  it('stores the complete pair in the same atomic insert', async () => {
+    const res = await configuredCreate();
+    expect(res.status).toBe(201);
+
+    const body = await json<CreateResponse>(res);
+    expect(body.created).toBe(true);
+    expect(body.project.last_form_values).toEqual(pair);
+    expect(body.automation_ready).toBe(true);
+
+    // One statement, no SELECT-then-INSERT, no follow-up UPDATE/PATCH.
+    const writes = executedSql.filter((s) => /INSERT INTO|UPDATE |DELETE FROM/i.test(s));
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toMatch(/ON CONFLICT \(domain\)\s+DO NOTHING/i);
+    expect(writes[0]).toMatch(/last_form_values/);
+    expect(executedSql.filter((s) => /^\s*SELECT/i.test(s))).toHaveLength(0);
+  });
+
+  it('reports automation_ready:true only for a complete stored pair', async () => {
+    const body = await json<CreateResponse>(await configuredCreate());
+    expect(body.automation_ready).toBe(true);
+
+    const listed = await json<{ projects: (SiteRow & { automation_ready: boolean })[] }>(
+      await fetch(`${base}/api/projects`),
+    );
+    expect(listed.projects[0].automation_ready).toBe(true);
+  });
+
+  it('rejects a partial pair and writes nothing', async () => {
+    const homeOnly = await postProject({
+      website_url: 'https://example.com',
+      create_only: true,
+      with_audit_config: true,
+      homeUrl: pair.homeUrl,
+    });
+    expect(homeOnly.status).toBe(400);
+    expect((await json<ErrorResponse>(homeOnly)).error).toMatch(/articleUrl/);
+
+    const articleOnly = await postProject({
+      website_url: 'https://example.com',
+      create_only: true,
+      with_audit_config: true,
+      articleUrl: pair.articleUrl,
+    });
+    expect(articleOnly.status).toBe(400);
+
+    const neither = await postProject({
+      website_url: 'https://example.com',
+      create_only: true,
+      with_audit_config: true,
+    });
+    expect(neither.status).toBe(400);
+    expect((await json<ErrorResponse>(neither)).error).toMatch(/complete homeUrl and articleUrl pair/);
+
+    expect(sites).toHaveLength(0);
+  });
+
+  it('rejects a cross-domain homeUrl or articleUrl', async () => {
+    const res = await configuredCreate({ articleUrl: 'https://other.test/story' });
+    expect(res.status).toBe(400);
+    expect((await json<ErrorResponse>(res)).error).toMatch(/must belong to example.com/);
+    expect(sites).toHaveLength(0);
+  });
+
+  it('rejects a non-http(s) URL in the pair', async () => {
+    const res = await configuredCreate({ articleUrl: 'javascript:alert(1)' });
+    expect(res.status).toBe(400);
+    expect(sites).toHaveLength(0);
+  });
+
+  it('refuses invented optional audit URLs', async () => {
+    const res = await configuredCreate({ sectionUrl: 'https://example.com/section' });
+    expect(res.status).toBe(400);
+    expect((await json<ErrorResponse>(res)).error).toMatch(/accepts only homeUrl and articleUrl/);
+    expect(sites).toHaveLength(0);
+  });
+
+  it('requires create_only', async () => {
+    const res = await postProject({
+      website_url: 'https://example.com',
+      with_audit_config: true,
+      ...pair,
+    });
+    expect(res.status).toBe(400);
+    expect((await json<ErrorResponse>(res)).error).toMatch(/only valid together with create_only/);
+    expect(sites).toHaveLength(0);
+  });
+
+  it('rejects a non-boolean with_audit_config', async () => {
+    const res = await postProject({
+      website_url: 'https://example.com',
+      create_only: true,
+      with_audit_config: 'yes',
+    });
+    expect(res.status).toBe(400);
+    expect((await json<ErrorResponse>(res)).error).toMatch(/with_audit_config must be a boolean/);
+  });
+
+  it('conflicts without changing any field of the existing project', async () => {
+    const existing = db.seed({
+      domain: 'example.com',
+      project_name: 'Hand-Curated',
+      website_url: 'https://example.com/',
+      is_beta: true,
+      last_form_values: {
+        homeUrl: 'https://example.com/original',
+        articleUrl: 'https://example.com/their-own-story',
+      },
+    });
+    const before = db.snapshot();
+
+    const res = await configuredCreate();
+    expect(res.status).toBe(409);
+    expect((await json<{ existing_project_id: string }>(res)).existing_project_id).toBe(existing.id);
+
+    // No UPDATE, no PATCH, no field touched — including updated_at.
+    expect(db.snapshot()).toEqual(before);
+    expect(executedSql.some((s) => /DO UPDATE/i.test(s))).toBe(false);
+    expect(executedSql.some((s) => /^\s*UPDATE sites/i.test(s))).toBe(false);
+  });
+
+  it('never leaves a half-configured project behind on conflict', async () => {
+    db.seed({ domain: 'example.com', project_name: 'Existing', last_form_values: null });
+    const res = await configuredCreate();
+
+    expect(res.status).toBe(409);
+    expect(sites).toHaveLength(1);
+    expect(sites[0].last_form_values).toBeNull();
+  });
+
+  it('leaves identity-only create_only unchanged when the flag is absent', async () => {
+    const res = await postProject({
+      website_url: 'https://example.com',
+      create_only: true,
+    });
+    expect(res.status).toBe(201);
+
+    const body = await json<CreateResponse>(res);
+    expect(body.project.last_form_values).toBeNull();
+    expect(body.automation_ready).toBe(false);
+  });
+});
+
 describe('no database configured', () => {
   it('returns 501 from POST /api/projects', async () => {
     db.available = false;

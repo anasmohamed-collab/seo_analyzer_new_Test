@@ -58,6 +58,11 @@ export type ParsedCreateProject =
        * project or fail with a conflict, never update an existing row.
        */
       createOnly: boolean;
+      /**
+       * true when a create-only caller explicitly asked to store a validated
+       * homeUrl + articleUrl pair on the row it inserts.
+       */
+      withAuditConfig: boolean;
     }
   | { ok: false; error: string };
 
@@ -74,6 +79,13 @@ function parseOptionalBeta(input: Record<string, unknown>): boolean | null | und
 /** `undefined` means the value was supplied but is not a boolean. */
 function parseCreateOnly(input: Record<string, unknown>): boolean | undefined {
   const value = input.create_only ?? input.createOnly;
+  if (value === undefined) return false;
+  return typeof value === 'boolean' ? value : undefined;
+}
+
+/** `undefined` means the value was supplied but is not a boolean. */
+function parseWithAuditConfig(input: Record<string, unknown>): boolean | undefined {
+  const value = input.with_audit_config ?? input.withAuditConfig;
   if (value === undefined) return false;
   return typeof value === 'boolean' ? value : undefined;
 }
@@ -180,10 +192,17 @@ export function parseProjectFormValues(
  * by the runner. Supplying none is fine — the project is simply not yet
  * automation-ready.
  *
- * `create_only: true` selects the insert-or-conflict contract. It additionally
- * refuses audit configuration: a create-only import establishes project
+ * `create_only: true` selects the insert-or-conflict contract. By default it
+ * also refuses audit configuration: a create-only import establishes project
  * identity and nothing else, so it can never write a fabricated homeUrl or
  * articleUrl and can never make a brand new project automation-ready.
+ *
+ * `with_audit_config: true` is the explicit opt-out, valid only alongside
+ * `create_only`. It permits exactly one shape — a complete homeUrl +
+ * articleUrl pair, both on the project's own canonical domain, and no other
+ * audit URL. Every optional key is refused rather than stored, because an
+ * importer has no evidence for a sectionUrl or a tagUrl and a fabricated one
+ * would silently misdirect audits.
  */
 export function parseCreateProjectBody(body: unknown): ParsedCreateProject {
   const input =
@@ -205,22 +224,51 @@ export function parseCreateProjectBody(body: unknown): ParsedCreateProject {
     return { ok: false, error: 'create_only must be a boolean when supplied' };
   }
 
+  const withAuditConfig = parseWithAuditConfig(input);
+  if (withAuditConfig === undefined) {
+    return { ok: false, error: 'with_audit_config must be a boolean when supplied' };
+  }
+  if (withAuditConfig && !createOnly) {
+    return { ok: false, error: 'with_audit_config is only valid together with create_only' };
+  }
+
   const site = normalizeWebsiteUrl(input.website_url);
   if (!site.ok) {
     return { ok: false, error: describeUrlRejection('website_url', site.reason) };
   }
 
+  // parseProjectFormValues already enforces the http/https scheme, the
+  // homeUrl+articleUrl pairing and same-domain membership for both keys.
   const parsedFormValues = parseProjectFormValues(input, site.domain);
   if (!parsedFormValues.ok) return parsedFormValues;
 
-  if (createOnly && parsedFormValues.formValues !== null) {
+  if (createOnly && !withAuditConfig && parsedFormValues.formValues !== null) {
     return {
       ok: false,
       error:
         'create_only requests must not carry audit configuration — ' +
         `remove ${Object.keys(parsedFormValues.formValues).sort().join(', ')} ` +
-        'and configure the project separately once it exists',
+        'or set with_audit_config:true to store a validated homeUrl + articleUrl pair',
     };
+  }
+
+  if (withAuditConfig) {
+    const supplied = parsedFormValues.formValues;
+    if (!supplied || !supplied.homeUrl || !supplied.articleUrl) {
+      return {
+        ok: false,
+        error: 'with_audit_config requires a complete homeUrl and articleUrl pair',
+      };
+    }
+    const extra = Object.keys(supplied).filter((k) => k !== 'homeUrl' && k !== 'articleUrl');
+    if (extra.length) {
+      return {
+        ok: false,
+        error:
+          `with_audit_config accepts only homeUrl and articleUrl — remove ${extra.sort().join(', ')}; ` +
+          'an import has no evidence for the other audit URLs',
+      };
+    }
   }
 
   return {
@@ -231,5 +279,6 @@ export function parseCreateProjectBody(body: unknown): ParsedCreateProject {
     isBeta,
     formValues: parsedFormValues.formValues,
     createOnly,
+    withAuditConfig,
   };
 }

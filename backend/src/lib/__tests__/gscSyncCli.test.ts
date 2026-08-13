@@ -8,6 +8,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   assertAllowedTarget,
+  AUTOMATION_READY_WARNING,
   buildCoverage,
   collapsedPropertyGroups,
   extractSiteName,
@@ -90,6 +91,74 @@ describe('parseArgs', () => {
     expect(modeLabel(parseArgs(['--dry-run', '--create-only']))).toContain('no writes');
     expect(modeLabel(parseArgs(['--apply', '--create-only']))).toBe('APPLY, create-only');
     expect(modeLabel(parseArgs(['--apply', '--allow-updates']))).toContain('updates allowed');
+    expect(modeLabel(parseArgs(['--apply', '--create-only', '--with-audit-config'])))
+      .toBe('APPLY, create-only + audit config');
+  });
+});
+
+describe('parseArgs — --existing-projects is a planning input only', () => {
+  it('accepts a captured inventory for a dry run', () => {
+    const opts = parseArgs(['--dry-run', '--create-only', '--existing-projects', 'inventory.json']);
+    expect(opts.apply).toBe(false);
+    expect(opts.existingProjects).toBe('inventory.json');
+  });
+
+  it('rejects --apply combined with --existing-projects', () => {
+    expect(() => parseArgs(['--apply', '--create-only', '--existing-projects', 'inventory.json']))
+      .toThrow(UsageError);
+    expect(() => parseArgs(['--apply', '--create-only', '--existing-projects', 'inventory.json']))
+      .toThrow(/cannot be combined with --apply/);
+  });
+
+  it('explains that a static file cannot verify preservation', () => {
+    expect(() => parseArgs(['--apply', '--allow-updates', '--existing-projects', 'i.json']))
+      .toThrow(/static file cannot verify that existing projects survived/);
+  });
+});
+
+describe('parseArgs — --with-audit-config', () => {
+  it('requires --create-only', () => {
+    expect(() => parseArgs(['--with-audit-config'])).toThrow(UsageError);
+    expect(() => parseArgs(['--with-audit-config']))
+      .toThrow(/only valid together with --create-only/);
+    expect(() => parseArgs(['--apply', '--allow-updates', '--with-audit-config']))
+      .toThrow(/only valid together with --create-only/);
+  });
+
+  it('is off by default so identity-only behaviour is unchanged', () => {
+    expect(parseArgs(['--dry-run', '--create-only']).withAuditConfig).toBe(false);
+    expect(parseArgs(['--apply', '--create-only']).withAuditConfig).toBe(false);
+  });
+
+  it('reads the captured GSC page-data file', () => {
+    const opts = parseArgs(['--create-only', '--with-audit-config', '--gsc-page-data', 'pages.json']);
+    expect(opts.withAuditConfig).toBe(true);
+    expect(opts.gscPageData).toBe('pages.json');
+  });
+});
+
+describe('parseArgs — declared counts', () => {
+  it('reads the expected totals', () => {
+    const opts = parseArgs(['--expect-properties', '76', '--expect-raw-entries', '76']);
+    expect(opts.expectProperties).toBe(76);
+    expect(opts.expectRawEntries).toBe(76);
+  });
+
+  it('rejects a non-numeric or negative count', () => {
+    expect(() => parseArgs(['--expect-properties', 'many'])).toThrow(/non-negative whole number/);
+    expect(() => parseArgs(['--expect-properties', '-1'])).toThrow(/non-negative whole number/);
+    expect(() => parseArgs(['--expect-raw-entries', '1.5'])).toThrow(/non-negative whole number/);
+  });
+});
+
+describe('AUTOMATION_READY_WARNING', () => {
+  it('names every operational precondition for a configured apply', () => {
+    expect(AUTOMATION_READY_WARNING).toMatch(/AUTOMATION-READY/);
+    expect(AUTOMATION_READY_WARNING).toMatch(/scheduled runner\/timer is disabled/);
+    expect(AUTOMATION_READY_WARNING).toMatch(/excluded until they are explicitly enabled/);
+    expect(AUTOMATION_READY_WARNING).toMatch(/NOTIFICATIONS_ENABLED=false/);
+    expect(AUTOMATION_READY_WARNING).toMatch(/separate explicit authorization/);
+    expect(AUTOMATION_READY_WARNING).toMatch(/does not disable timers/);
   });
 });
 

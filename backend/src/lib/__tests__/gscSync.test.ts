@@ -150,9 +150,9 @@ describe('collectGscProperties', () => {
       .toThrow(/carries no sites array/);
   });
 
-  it('fails closed on an entry with no site_url', () => {
+  it('fails closed on an entry with no site_url, after counting it', () => {
     expect(() => collectGscProperties({ pages: [{ sites: [{ permission_level: 'siteOwner' }] }] }))
-      .toThrow(/no site_url/);
+      .toThrow(/1 of 1 entries have no usable site_url/);
   });
 
   it('fails closed when zero properties are returned', () => {
@@ -166,6 +166,91 @@ describe('collectGscProperties', () => {
     expect(() => collectGscProperties({})).toThrow(/no gsc_list_sites pages found/);
     expect(() => collectGscProperties(null)).toThrow(GscCollectionError);
     expect(() => collectGscProperties({ pages: [] })).toThrow(GscCollectionError);
+  });
+});
+
+// ── entry accounting: the 77-vs-76 regression ─────────────────────
+
+describe('collectGscProperties — entry accounting', () => {
+  const page = (urls: string[], token?: string) => ({
+    sites: urls.map((u) => site(u)),
+    ...(token ? { next_page_token: token } : {}),
+  });
+
+  it('accounts for every raw entry exactly once', () => {
+    const out = collectGscProperties({
+      pages: [
+        page(['sc-domain:a.com', 'https://b.com/'], 't1'),
+        page(['https://b.com/', 'sc-domain:c.com']),
+      ],
+    });
+
+    expect(out.rawEntryCount).toBe(4);
+    expect(out.usableEntryCount).toBe(4);
+    expect(out.malformedEntryCount).toBe(0);
+    expect(out.exactDuplicateCount).toBe(1);
+    expect(out.uniquePropertyCount).toBe(3);
+    expect(out.entriesPerPage).toEqual([2, 2]);
+    expect(out.reconciled).toBe(true);
+
+    // The two identities the report prints.
+    expect(out.rawEntryCount).toBe(out.usableEntryCount + out.malformedEntryCount);
+    expect(out.usableEntryCount).toBe(out.uniquePropertyCount + out.exactDuplicateCount);
+  });
+
+  it('accepts a declared total that matches', () => {
+    const out = collectGscProperties(
+      { pages: [page(['sc-domain:a.com', 'https://b.com/'])] },
+      { expectedUniqueProperties: 2, expectedRawEntries: 2 },
+    );
+    expect(out.uniquePropertyCount).toBe(2);
+  });
+
+  it('fails closed on an unexplained unique-property count difference', () => {
+    // 76 collected, 77 claimed — exactly the discrepancy the previous import
+    // reported without anything stopping it.
+    expect(() =>
+      collectGscProperties(
+        { pages: [page(['sc-domain:a.com', 'https://b.com/'])] },
+        { expectedUniqueProperties: 3 },
+      ),
+    ).toThrow(/expected 3 unique GSC properties but collected 2/);
+    expect(() =>
+      collectGscProperties(
+        { pages: [page(['sc-domain:a.com', 'https://b.com/'])] },
+        { expectedUniqueProperties: 3 },
+      ),
+    ).toThrow(/difference is unexplained/);
+  });
+
+  it('fails closed on an unexplained raw-entry count difference', () => {
+    expect(() =>
+      collectGscProperties(
+        { pages: [page(['sc-domain:a.com'])] },
+        { expectedRawEntries: 2 },
+      ),
+    ).toThrow(/expected 2 raw gsc_list_sites entries but collected 1/);
+  });
+
+  it('counts a malformed entry before rejecting the collection', () => {
+    let message = '';
+    try {
+      collectGscProperties({
+        pages: [{ sites: [site('sc-domain:a.com'), { permission_level: 'siteOwner' }, site('https://b.com/')] }],
+      });
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    // The operator is told how many of how many, so the totals still add up.
+    expect(message).toMatch(/1 of 3 entries have no usable site_url/);
+  });
+
+  it('exposes per-page entry counts so a short page is visible', () => {
+    const out = collectGscProperties({
+      pages: [page(['sc-domain:a.com', 'https://b.com/', 'https://c.com/'], 't1'), page(['sc-domain:d.com'])],
+    });
+    expect(out.entriesPerPage).toEqual([3, 1]);
+    expect(out.rawEntryCount).toBe(4);
   });
 });
 

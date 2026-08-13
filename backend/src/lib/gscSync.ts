@@ -166,13 +166,39 @@ export interface CollectedGscProperties {
   /** Unique properties, first occurrence order preserved. */
   sites: SmacientSite[];
   pageCount: number;
-  /** Every `site_url` entry across every page, duplicates included. */
+  /** Every entry across every page, duplicates and malformed rows included. */
+  rawEntryCount: number;
+  /** Entries carrying a non-empty `site_url` string. */
+  usableEntryCount: number;
+  /** Entries with no usable `site_url` — always fatal, but always counted first. */
+  malformedEntryCount: number;
+  malformedEntries: string[];
+  /**
+   * Alias of `rawEntryCount`, kept because the report and the operational
+   * checklist both speak of "raw properties".
+   */
   rawPropertyCount: number;
-  /** How many raw entries were exact repeats of an earlier property. */
+  /** How many usable entries were exact repeats of an earlier property. */
   exactDuplicateCount: number;
   uniquePropertyCount: number;
   /** The `next_page_token` observed on each page, in order. */
   pageTokens: (string | null)[];
+  /** Per-page entry counts, so a short page is visible in the report. */
+  entriesPerPage: number[];
+  /** rawEntryCount === usable + malformed, and usable === unique + duplicates. */
+  reconciled: boolean;
+}
+
+export interface CollectOptions {
+  /**
+   * The number of unique properties the operator expects. A mismatch is an
+   * unexplained count difference and fails the run — the previous import
+   * reported two different totals for one collection, and nothing in the code
+   * could tell which was right.
+   */
+  expectedUniqueProperties?: number | null;
+  /** The number of raw entries the operator expects, if they counted those. */
+  expectedRawEntries?: number | null;
 }
 
 interface RawPage {
@@ -196,8 +222,17 @@ interface RawPage {
  *
  * Exact duplicate properties across pages are counted and collapsed; they are
  * the normal consequence of overlapping pages, not a failure.
+ *
+ * Every raw entry is accounted for before anything is rejected:
+ *   rawEntryCount === usableEntryCount + malformedEntryCount
+ *   usableEntryCount === uniquePropertyCount + exactDuplicateCount
+ * Both identities are asserted, so a count can never be quietly lost between
+ * reading the response and reporting a total.
  */
-export function collectGscProperties(payload: unknown): CollectedGscProperties {
+export function collectGscProperties(
+  payload: unknown,
+  options: CollectOptions = {},
+): CollectedGscProperties {
   const envelope = payload as { pages?: unknown } | unknown[] | null | undefined;
   const rawPages: unknown[] = Array.isArray(envelope)
     ? envelope
@@ -214,8 +249,11 @@ export function collectGscProperties(payload: unknown): CollectedGscProperties {
   const sites: SmacientSite[] = [];
   const seen = new Set<string>();
   const pageTokens: (string | null)[] = [];
+  const entriesPerPage: number[] = [];
   const seenTokens = new Set<string>();
-  let rawPropertyCount = 0;
+  const malformedEntries: string[] = [];
+  let rawEntryCount = 0;
+  let usableEntryCount = 0;
   let exactDuplicateCount = 0;
 
   rawPages.forEach((page, index) => {
@@ -236,15 +274,20 @@ export function collectGscProperties(payload: unknown): CollectedGscProperties {
       );
     }
 
+    entriesPerPage.push((typed.sites as unknown[]).length);
     for (const entry of typed.sites as unknown[]) {
+      rawEntryCount++;
       const siteUrl =
         entry && typeof entry === 'object' && typeof (entry as SmacientSite).site_url === 'string'
           ? (entry as SmacientSite).site_url.trim()
           : '';
       if (!siteUrl) {
-        throw new GscCollectionError(`${label} contains an entry with no site_url`);
+        // Counted before it is rejected, so the totals still add up in the
+        // error the operator reads.
+        malformedEntries.push(`${label} entry ${rawEntryCount}: ${JSON.stringify(entry)}`);
+        continue;
       }
-      rawPropertyCount++;
+      usableEntryCount++;
       if (seen.has(siteUrl)) {
         exactDuplicateCount++;
         continue;
@@ -274,6 +317,12 @@ export function collectGscProperties(payload: unknown): CollectedGscProperties {
     }
   });
 
+  if (malformedEntries.length) {
+    throw new GscCollectionError(
+      `${malformedEntries.length} of ${rawEntryCount} entries have no usable site_url — ` +
+        `the property list is not trustworthy: ${malformedEntries.slice(0, 5).join('; ')}`,
+    );
+  }
   if (!sites.length) {
     throw new GscCollectionError(
       'gsc_list_sites returned zero Google Search Console properties — ' +
@@ -281,13 +330,48 @@ export function collectGscProperties(payload: unknown): CollectedGscProperties {
     );
   }
 
+  // Both identities must hold or an entry was lost between reading and counting.
+  const reconciled =
+    rawEntryCount === usableEntryCount + malformedEntries.length &&
+    usableEntryCount === sites.length + exactDuplicateCount;
+  if (!reconciled) {
+    throw new GscCollectionError(
+      `entry accounting does not reconcile: ${rawEntryCount} raw entries != ` +
+        `${usableEntryCount} usable + ${malformedEntries.length} malformed, or ` +
+        `${usableEntryCount} usable != ${sites.length} unique + ${exactDuplicateCount} duplicates`,
+    );
+  }
+
+  // An operator-declared total that does not match is an unexplained count
+  // difference. It stops the run rather than being reported alongside a
+  // different number, which is exactly how 77-vs-76 survived the last import.
+  const { expectedUniqueProperties, expectedRawEntries } = options;
+  if (typeof expectedRawEntries === 'number' && expectedRawEntries !== rawEntryCount) {
+    throw new GscCollectionError(
+      `expected ${expectedRawEntries} raw gsc_list_sites entries but collected ${rawEntryCount} — ` +
+        'the difference is unexplained; recount the source before importing',
+    );
+  }
+  if (typeof expectedUniqueProperties === 'number' && expectedUniqueProperties !== sites.length) {
+    throw new GscCollectionError(
+      `expected ${expectedUniqueProperties} unique GSC properties but collected ${sites.length} — ` +
+        'the difference is unexplained; recount the source before importing',
+    );
+  }
+
   return {
     sites,
     pageCount: rawPages.length,
-    rawPropertyCount,
+    rawEntryCount,
+    usableEntryCount,
+    malformedEntryCount: malformedEntries.length,
+    malformedEntries,
+    rawPropertyCount: rawEntryCount,
     exactDuplicateCount,
     uniquePropertyCount: sites.length,
     pageTokens,
+    entriesPerPage,
+    reconciled,
   };
 }
 
@@ -768,11 +852,24 @@ export function buildUpsertBody(entry: PlanEntry): { project_name: string; websi
  * caller cannot smuggle an update, a non-production host or an ambiguous
  * property into the create path.
  */
-export function buildCreateOnlyBody(entry: PlanEntry): {
+export interface CreateOnlyAuditConfig {
+  homeUrl: string;
+  articleUrl: string;
+}
+
+export interface CreateOnlyBody {
   project_name: string;
   website_url: string;
   create_only: true;
-} {
+  with_audit_config?: true;
+  homeUrl?: string;
+  articleUrl?: string;
+}
+
+export function buildCreateOnlyBody(
+  entry: PlanEntry,
+  config?: CreateOnlyAuditConfig | null,
+): CreateOnlyBody {
   if (entry.action !== 'create') {
     throw new Error(
       `entry for ${entry.domain} has action "${entry.action}" — only "create" entries may be applied in create-only mode`,
@@ -784,11 +881,35 @@ export function buildCreateOnlyBody(entry: PlanEntry): {
   if (!entry.proposedWebsiteUrl || !entry.proposedProjectName) {
     throw new Error(`entry for ${entry.domain} is not applyable`);
   }
-  return {
+
+  const body: CreateOnlyBody = {
     project_name: entry.proposedProjectName,
     website_url: entry.proposedWebsiteUrl,
     create_only: true,
   };
+  if (!config) return body;
+
+  // A half pair would be rejected by the route anyway; refusing it here means
+  // the request is never even built, so a partially-resolved project cannot be
+  // sent by mistake.
+  if (!config.homeUrl || !config.articleUrl) {
+    throw new Error(
+      `entry for ${entry.domain} has an incomplete audit configuration ` +
+        `(homeUrl ${config.homeUrl ? 'present' : 'missing'}, articleUrl ${config.articleUrl ? 'present' : 'missing'})`,
+    );
+  }
+  for (const [field, value] of [['homeUrl', config.homeUrl], ['articleUrl', config.articleUrl]] as const) {
+    if (normalizeProjectDomain(value) !== entry.domain) {
+      throw new Error(
+        `entry for ${entry.domain} has a ${field} on a different domain (${value}) — refusing to configure it`,
+      );
+    }
+  }
+
+  body.with_audit_config = true;
+  body.homeUrl = config.homeUrl;
+  body.articleUrl = config.articleUrl;
+  return body;
 }
 
 // ── existing-project preservation proof ───────────────────────────

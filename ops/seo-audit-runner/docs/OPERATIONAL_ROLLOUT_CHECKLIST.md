@@ -175,6 +175,39 @@ Nothing in this part modifies anything.
       updates are never written in create-only mode — review them separately.
       Non-production and ambiguous properties are never created automatically;
       a hostname is not evidence (A2/A3).
+
+      **`--apply --existing-projects` is rejected.** A captured inventory is a
+      dry-run planning input only. Every apply reads `GET /api/projects` from
+      the real target immediately before the first write and again immediately
+      after the last one, and compares those two live snapshots. Re-reading a
+      static file would report "unchanged" no matter what the apply did.
+
+- [ ] **G2b. `--with-audit-config` — AUTOMATION-READY imports.**
+      Adding `--with-audit-config` to a create-only run resolves and validates a
+      `homeUrl` + `articleUrl` pair per website (Search Console page performance
+      first, then the sitemap / news-sitemap / RSS / homepage walk) and stores it
+      in the same atomic INSERT. Only a complete, high-confidence pair is
+      eligible; everything else is created identity-only and reported with its
+      reason.
+
+      **A project with a complete pair is automation-ready and the scheduled
+      runner will pick it up on its next tick.** Before a Production apply with
+      this flag, obtain separate explicit authorization naming the exact target
+      and the exact configured-create count, and record proof of all of:
+
+      1. the scheduled runner/timer is disabled, **or** the exact new project IDs
+         are excluded until they are explicitly enabled;
+      2. `NOTIFICATIONS_ENABLED=false`;
+      3. no audit is being triggered by the import itself (the command never
+         triggers one, but the runner may act on the rows it creates);
+      4. the operator understands the new rows are automation-ready.
+
+      **Open operational prerequisite:** the runner has no documented
+      per-project pause or exclusion switch. Until one exists, the only
+      supported way to satisfy (1) is to disable the runner timer for the
+      duration and re-enable it after the new projects have been reviewed. Do
+      not invent a workaround. The import command never disables a timer and
+      never changes an environment variable.
 - [ ] **G3.** Expand to the full fleet only after monitoring shows: complete
       evidence, no duplicate projects, no false alerts, no stale jobs,
       acceptable WAF failure rate, and acceptable audit duration.

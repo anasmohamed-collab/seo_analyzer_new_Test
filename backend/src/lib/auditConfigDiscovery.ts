@@ -400,7 +400,7 @@ export function validateHomepage(projectDomain: string, page: PageResult): Homep
 
 // ── article validation ────────────────────────────────────────────
 
-export type ArticleSource = 'news-sitemap' | 'sitemap' | 'rss' | 'homepage' | 'bounded-crawl';
+export type ArticleSource = 'gsc' | 'news-sitemap' | 'sitemap' | 'rss' | 'homepage' | 'bounded-crawl';
 
 export interface ArticleDecision {
   verdict: Verdict;
@@ -415,8 +415,21 @@ export interface ArticleDecision {
   reason: string;
 }
 
-/** Sources whose provenance is itself strong evidence of an article. */
-const STRONG_SOURCES: ArticleSource[] = ['news-sitemap', 'sitemap'];
+/**
+ * Sources whose provenance is itself strong evidence of an article.
+ *
+ * `gsc` qualifies: a page the caller supplies from Search Console page
+ * performance is one Google reports as receiving impressions for a *verified*
+ * property, which is stronger provenance than a sitemap entry the site simply
+ * declares about itself. The candidate builder only emits `gsc` candidates for
+ * rows with real impressions (see articleCandidates.ts), so provenance here
+ * always means measured search performance.
+ *
+ * Provenance alone still never accepts a URL — every source must additionally
+ * clear the domain, shape, markup and content checks below, and only markup
+ * plus a publication date reaches `high`.
+ */
+const STRONG_SOURCES: ArticleSource[] = ['gsc', 'news-sitemap', 'sitemap'];
 
 export function validateArticle(
   projectDomain: string,

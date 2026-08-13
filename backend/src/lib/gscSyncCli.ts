@@ -19,12 +19,19 @@ export interface Options {
   apply: boolean;
   createOnly: boolean;
   allowUpdates: boolean;
+  withAuditConfig: boolean;
   input: string | null;
+  /** Captured GET /api/projects response. Dry-run planning only. */
   existingProjects: string | null;
+  /** Captured gsc_top_pages responses, keyed by GSC property. */
+  gscPageData: string | null;
   apiBase: string;
   jsonOut: string | null;
   liveCheck: boolean;
   concurrency: number;
+  /** Operator-declared totals; a mismatch fails the collection. */
+  expectProperties: number | null;
+  expectRawEntries: number | null;
 }
 
 /** A flag problem. Always fatal — a misread flag must never become a write. */
@@ -54,15 +61,27 @@ export function parseArgs(argv: string[]): Options {
     apply: false,
     createOnly: false,
     allowUpdates: false,
+    withAuditConfig: false,
     input: null,
     existingProjects: null,
+    gscPageData: null,
     apiBase: DEFAULT_API,
     jsonOut: null,
     liveCheck: true,
     concurrency: 6,
+    expectProperties: null,
+    expectRawEntries: null,
   };
   let sawApply = false;
   let sawDryRun = false;
+
+  const requireCount = (raw: string, flag: string): number => {
+    const value = Number(raw);
+    if (!Number.isInteger(value) || value < 0) {
+      throw new UsageError(`${flag} requires a non-negative whole number`);
+    }
+    return value;
+  };
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -71,15 +90,25 @@ export function parseArgs(argv: string[]): Options {
       case '--dry-run': sawDryRun = true; break;
       case '--create-only': opts.createOnly = true; break;
       case '--allow-updates': opts.allowUpdates = true; break;
+      case '--with-audit-config': opts.withAuditConfig = true; break;
       case '--no-live-check': opts.liveCheck = false; break;
       case '--input': opts.input = requireValue(argv, ++i, '--input'); break;
       case '--existing-projects':
         opts.existingProjects = requireValue(argv, ++i, '--existing-projects');
         break;
+      case '--gsc-page-data':
+        opts.gscPageData = requireValue(argv, ++i, '--gsc-page-data');
+        break;
       case '--api': opts.apiBase = requireValue(argv, ++i, '--api'); break;
       case '--json': opts.jsonOut = requireValue(argv, ++i, '--json'); break;
       case '--concurrency':
         opts.concurrency = Math.max(1, Number(requireValue(argv, ++i, '--concurrency')) || 6);
+        break;
+      case '--expect-properties':
+        opts.expectProperties = requireCount(requireValue(argv, ++i, '--expect-properties'), '--expect-properties');
+        break;
+      case '--expect-raw-entries':
+        opts.expectRawEntries = requireCount(requireValue(argv, ++i, '--expect-raw-entries'), '--expect-raw-entries');
         break;
       default:
         throw new UsageError(`Unknown flag: ${arg}`);
@@ -97,6 +126,21 @@ export function parseArgs(argv: string[]): Options {
       'refusing to apply without an explicit write mode.\n' +
         '       --create-only    create missing projects only (safe: never updates an existing project)\n' +
         '       --allow-updates  legacy upsert, may modify existing projects',
+    );
+  }
+  if (opts.withAuditConfig && !opts.createOnly) {
+    throw new UsageError('--with-audit-config is only valid together with --create-only');
+  }
+
+  // A captured inventory file is a planning input, never a verification
+  // source. Re-reading the same static file after writing would "prove" that
+  // nothing changed no matter what the apply actually did, so an apply must
+  // read the live target before and after.
+  if (opts.apply && opts.existingProjects) {
+    throw new UsageError(
+      '--existing-projects is a dry-run planning input and cannot be combined with --apply.\n' +
+        '       An apply must read GET /api/projects from the real target immediately before\n' +
+        '       and after writing; a static file cannot verify that existing projects survived.',
     );
   }
   return opts;
@@ -123,9 +167,42 @@ export function assertAllowedTarget(apiBase: string): void {
 }
 
 export function modeLabel(opts: Options): string {
-  if (!opts.apply) return opts.createOnly ? 'DRY RUN, create-only (no writes)' : 'DRY RUN (no writes)';
-  return opts.createOnly ? 'APPLY, create-only' : 'APPLY, legacy upsert (updates allowed)';
+  const config = opts.withAuditConfig ? ' + audit config' : '';
+  if (!opts.apply) {
+    return opts.createOnly ? `DRY RUN, create-only${config} (no writes)` : 'DRY RUN (no writes)';
+  }
+  return opts.createOnly ? `APPLY, create-only${config}` : 'APPLY, legacy upsert (updates allowed)';
 }
+
+/**
+ * The warning printed before any `--with-audit-config` apply.
+ *
+ * Storing a complete homeUrl + articleUrl pair makes a project
+ * automation-ready, which means the scheduled runner will pick it up on its
+ * next tick. That is a real operational change, not a metadata edit, so the
+ * operator has to have arranged for it before the rows exist.
+ */
+export const AUTOMATION_READY_WARNING = [
+  'WARNING — --with-audit-config creates AUTOMATION-READY projects.',
+  '',
+  'A project with a complete homeUrl + articleUrl pair is eligible for scheduled',
+  'audits: the runner selects automation-ready projects on its next tick. These',
+  'rows will be audited without any further action unless you have already',
+  'arranged otherwise.',
+  '',
+  'Before a Production apply, obtain separate explicit authorization and record',
+  'proof of ALL of the following:',
+  '  1. the scheduled runner/timer is disabled, OR the exact new project IDs are',
+  '     excluded until they are explicitly enabled;',
+  '  2. NOTIFICATIONS_ENABLED=false;',
+  '  3. no audit is being triggered by this import (this command never triggers one,',
+  '     but the runner may act on the rows it creates);',
+  '  4. the operator understands the new rows are automation-ready.',
+  '',
+  'This command does not disable timers and does not change any environment',
+  'variable. If no pause or per-project exclusion mechanism exists, that is an',
+  'operational prerequisite to resolve first — not something to work around.',
+].join('\n');
 
 // ── HTML helpers ──────────────────────────────────────────────────
 

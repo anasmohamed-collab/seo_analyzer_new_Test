@@ -24,34 +24,22 @@ import { isAutomationReady, type FormValues } from '../lib/projectInput.js';
 import {
   assertAllowedTarget,
   buildFormValuesPayload,
-  classifyPageShape,
   existingValueIsUsable,
   isNonProductionDomain,
-  extractFeedLinks,
-  extractInternalLinks,
-  extractRobotsSitemaps,
-  extractSitemapLocs,
-  hasNewsNamespace,
-  isFeedXml,
-  isSitemapIndex,
   parseStoredFormValues,
   validateArticle,
   validateHomepage,
-  NON_ARTICLE_SHAPES,
   type ArticleDecision,
   type ArticleSource,
   type HomepageDecision,
   type PageResult,
   type ProposedAction,
 } from '../lib/auditConfigDiscovery.js';
+// Sitemap / feed / homepage candidate discovery lives in the shared module so
+// this CLI and the create-only GSC importer cannot drift apart.
+import { discoverSitemapCandidates } from '../lib/articleCandidates.js';
 
 const DEFAULT_API = process.env.SEO_API_BASE_URL ?? 'https://seo-analyzer-new-test-cf2ce81a.dublyo.co';
-
-const CANDIDATE_SITEMAP_PATHS = [
-  '/sitemap.xml', '/sitemap_index.xml', '/sitemap-index.xml',
-  '/news-sitemap.xml', '/sitemap-news.xml', '/google-news-sitemap.xml',
-];
-const CANDIDATE_FEED_PATHS = ['/feed', '/rss', '/rss.xml', '/feed.xml', '/atom.xml'];
 
 interface Options {
   apply: boolean;
@@ -136,97 +124,6 @@ async function fetchPage(url: string): Promise<PageResult> {
       };
     }
   });
-}
-
-// â”€â”€ article candidate discovery â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-interface Candidate {
-  url: string;
-  source: ArticleSource;
-}
-
-/** Plausible article URLs only â€” drop listing pages before spending a fetch. */
-function keepArticleShaped(urls: string[], projectDomain: string, limit: number): string[] {
-  const out: string[] = [];
-  for (const u of urls) {
-    if (normalizeProjectDomain(u) !== projectDomain) continue;
-    if (NON_ARTICLE_SHAPES.includes(classifyPageShape(u))) continue;
-    out.push(u);
-    if (out.length >= limit) break;
-  }
-  return out;
-}
-
-async function discoverCandidates(homeUrl: string, projectDomain: string, homeHtml: string): Promise<Candidate[]> {
-  const candidates: Candidate[] = [];
-  const origin = new URL(homeUrl).origin;
-  const seenDocs = new Set<string>();
-
-  const readXml = async (url: string): Promise<string> => {
-    if (seenDocs.has(url)) return '';
-    seenDocs.add(url);
-    const r = await fetchPage(url);
-    if (!r.ok || r.httpStatus !== 200 || r.challengeDetected) return '';
-    return r.html;
-  };
-
-  // 1 + 2 â€” robots.txt Sitemap: directives, then common locations.
-  const robots = await fetchPage(`${origin}/robots.txt`);
-  const declared = robots.ok && robots.httpStatus === 200 ? extractRobotsSitemaps(robots.html) : [];
-  const sitemapUrls = [...declared, ...CANDIDATE_SITEMAP_PATHS.map((p) => `${origin}${p}`)];
-
-  for (const sitemapUrl of sitemapUrls.slice(0, 8)) {
-    const xml = await readXml(sitemapUrl);
-    if (!xml) continue;
-
-    const news = hasNewsNamespace(xml);
-    if (isSitemapIndex(xml)) {
-      // Descend one level only, preferring child sitemaps that look like news.
-      const children = extractSitemapLocs(xml);
-      const preferred = [
-        ...children.filter((c) => /news/i.test(c)),
-        ...children.filter((c) => !/news/i.test(c)),
-      ].slice(0, 3);
-      for (const child of preferred) {
-        const childXml = await readXml(child);
-        if (!childXml || isSitemapIndex(childXml)) continue;
-        const source: ArticleSource = hasNewsNamespace(childXml) ? 'news-sitemap' : 'sitemap';
-        for (const u of keepArticleShaped(extractSitemapLocs(childXml).reverse(), projectDomain, 6)) {
-          candidates.push({ url: u, source });
-        }
-        if (candidates.length >= 12) break;
-      }
-    } else {
-      const source: ArticleSource = news ? 'news-sitemap' : 'sitemap';
-      for (const u of keepArticleShaped(extractSitemapLocs(xml).reverse(), projectDomain, 6)) {
-        candidates.push({ url: u, source });
-      }
-    }
-    if (candidates.some((c) => c.source === 'news-sitemap')) break;
-    if (candidates.length >= 12) break;
-  }
-
-  // 3 â€” RSS / Atom.
-  if (candidates.length < 4) {
-    for (const path of CANDIDATE_FEED_PATHS) {
-      const xml = await readXml(`${origin}${path}`);
-      if (!xml || !isFeedXml(xml)) continue;
-      for (const u of keepArticleShaped(extractFeedLinks(xml), projectDomain, 5)) {
-        candidates.push({ url: u, source: 'rss' });
-      }
-      if (candidates.length >= 4) break;
-    }
-  }
-
-  // 4 + 5 â€” links on the already-fetched homepage. No site-wide crawl.
-  if (candidates.length < 4 && homeHtml) {
-    for (const u of keepArticleShaped(extractInternalLinks(homeHtml, homeUrl), projectDomain, 8)) {
-      candidates.push({ url: u, source: 'homepage' });
-    }
-  }
-
-  const seen = new Set<string>();
-  return candidates.filter((c) => (seen.has(c.url) ? false : (seen.add(c.url), true))).slice(0, 14);
 }
 
 // â”€â”€ per-project processing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -338,7 +235,9 @@ async function processProject(project: ProjectRow): Promise<ProjectReport> {
     report.problems.push(`existing articleUrl rejected: ${decision.reason}`);
   }
 
-  const candidates = await discoverCandidates(home.homeUrl as string, domain, homePage.html);
+  const candidates = await discoverSitemapCandidates(
+    home.homeUrl as string, domain, homePage.html, fetchPage,
+  );
   let best: ArticleDecision | null = null;
 
   for (const candidate of candidates) {

@@ -108,8 +108,8 @@ export function createFakeSitesDb(): FakeSitesDb {
 
       // ── create-only: INSERT … ON CONFLICT (domain) DO NOTHING ────
       if (/INSERT INTO sites/i.test(sql) && /DO NOTHING/i.test(sql)) {
-        const [domain, projectName, websiteUrl, isBeta] = params as [
-          string, string, string, boolean | null,
+        const [domain, projectName, websiteUrl, isBeta, formValues] = params as [
+          string, string, string, boolean | null, string | null,
         ];
         if (sites.some((s) => s.domain === domain)) {
           // No row returned, and — crucially — nothing about the existing row
@@ -123,8 +123,8 @@ export function createFakeSitesDb(): FakeSitesDb {
           project_name: projectName,
           website_url: websiteUrl,
           is_beta: isBeta ?? false,
-          // Not in the statement's column list, so a created row starts null.
-          last_form_values: null,
+          // NULL unless the caller explicitly asked for a configured create.
+          last_form_values: formValues == null ? null : JSON.parse(formValues),
           created_at: stamp,
           updated_at: stamp,
           last_audit_at: null,

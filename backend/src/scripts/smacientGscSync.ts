@@ -28,6 +28,11 @@
  *                    can modify existing projects and must be chosen
  *                    deliberately.
  *
+ * `--with-audit-config` (create-only only) additionally resolves and validates
+ * a homeUrl + articleUrl pair per website and stores it in the same atomic
+ * INSERT. Only a complete, high-confidence pair is eligible. A configured row
+ * is AUTOMATION-READY — see AUTOMATION_READY_WARNING in ../lib/gscSyncCli.ts.
+ *
  * Neither mode ever deletes, merges, PATCHes, triggers an audit, sends a
  * notification, enables a schedule, or reclassifies an environment.
  */
@@ -38,20 +43,21 @@ import process from 'node:process';
 import {
   buildCreateOnlyBody,
   collectGscProperties,
-  compareInventories,
   GscCollectionError,
   groupByCanonicalDomain,
   parseProperties,
   planSync,
   type CollectedGscProperties,
-  type InventoryComparison,
+  type CreateOnlyAuditConfig,
   type LiveCheck,
+  type PlanEntry,
   type ProjectInventoryRecord,
   type SyncPlan,
 } from '../lib/gscSync.js';
-import { applyPlan, fetchInventory } from '../lib/gscSyncApply.js';
+import { applyPlanVerified, fetchInventory } from '../lib/gscSyncApply.js';
 import {
   assertAllowedTarget,
+  AUTOMATION_READY_WARNING,
   buildCoverage,
   collapsedPropertyGroups,
   extractSiteName,
@@ -62,6 +68,10 @@ import {
   type CoverageReport,
   type Options,
 } from '../lib/gscSyncCli.js';
+import { resolveAuditConfig, type AuditConfigResolution } from '../lib/gscAuditConfig.js';
+import type { GscPropertyPerformance } from '../lib/articleCandidates.js';
+import type { PageResult } from '../lib/auditConfigDiscovery.js';
+import { runFetchEngine } from '../services/fetch/fetchEngine.js';
 
 const USER_AGENT = 'seo-analyzer-smacient-gsc-sync/1.0';
 
@@ -110,6 +120,78 @@ async function runPool<T>(items: T[], limit: number, fn: (item: T) => Promise<vo
   await Promise.all(workers);
 }
 
+// ── audit-config discovery I/O ────────────────────────────────────
+
+/** One in-flight request per hostname, matching audit-config:discover. */
+const hostLocks = new Map<string, Promise<unknown>>();
+
+async function withHostLock<T>(host: string, fn: () => Promise<T>): Promise<T> {
+  const previous = hostLocks.get(host) ?? Promise.resolve();
+  const run = previous.then(fn, fn);
+  hostLocks.set(host, run.then(() => undefined, () => undefined));
+  return run;
+}
+
+/**
+ * The project's own fetch stack, so bot-protection detection, timeouts and UA
+ * profiles behave exactly as they do during a real audit. Read-only: this only
+ * ever issues GETs against public pages.
+ */
+async function fetchPage(url: string): Promise<PageResult> {
+  let host: string;
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    return { ok: false, httpStatus: 0, finalUrl: '', redirectChain: [], html: '', challengeDetected: false, error: 'invalid URL' };
+  }
+  return withHostLock(host, async () => {
+    try {
+      const r = await runFetchEngine(url, {
+        signal: AbortSignal.timeout(30_000),
+        timeoutMs: 30_000,
+        maxBytes: 3 * 1024 * 1024,
+      });
+      return {
+        ok: r.fetchOk,
+        httpStatus: r.httpStatus,
+        finalUrl: r.finalUrl || url,
+        redirectChain: r.redirectChain ?? [],
+        html: r.html ?? '',
+        challengeDetected: r.challengeDetected,
+        error: r.fetchOk ? null : (r.blockedReason ?? `fetch failed (HTTP ${r.httpStatus})`),
+      };
+    } catch (err) {
+      return {
+        ok: false, httpStatus: 0, finalUrl: '', redirectChain: [], html: '',
+        challengeDetected: false, error: sanitize(String((err as Error).message ?? err)),
+      };
+    }
+  });
+}
+
+/**
+ * Read captured `gsc_top_pages` responses.
+ *
+ * Shape: `{ "properties": [ <verbatim gsc_top_pages response>, … ] }`. Each
+ * response must carry the `site_url` it was requested for so a candidate can
+ * be attributed back to its source property in the report.
+ */
+function readGscPageData(path: string): GscPropertyPerformance[] {
+  const parsed = JSON.parse(readFileSync(path, 'utf8')) as
+    | { properties?: GscPropertyPerformance[] }
+    | GscPropertyPerformance[];
+  const properties = Array.isArray(parsed) ? parsed : parsed.properties;
+  if (!Array.isArray(properties)) {
+    throw new Error(`${path} contains no properties array`);
+  }
+  for (const p of properties) {
+    if (!p || typeof p.site_url !== 'string' || !p.site_url.trim()) {
+      throw new Error(`${path} contains a page-performance response with no site_url`);
+    }
+  }
+  return properties;
+}
+
 // ── captured inventory input ──────────────────────────────────────
 
 /** Read a previously captured GET /api/projects response from disk. */
@@ -129,6 +211,53 @@ function readInventoryFile(path: string): ProjectInventoryRecord[] {
   return projects;
 }
 
+// ── report shaping ────────────────────────────────────────────────
+
+/** Everything the report must show for one proposed creation. */
+function describeCreation(
+  entry: PlanEntry,
+  resolution: AuditConfigResolution | undefined,
+  config: CreateOnlyAuditConfig | undefined,
+): Record<string, unknown> {
+  return {
+    canonicalDomain: entry.domain,
+    finalCategory: config ? 'safe_create_configured' : 'safe_create_identity_only',
+    gscProperties: entry.gscProperties,
+    gscPropertyTypes: entry.gscPropertyTypes,
+    permissionLevels: entry.permissionLevels,
+    proposedProjectName: entry.proposedProjectName,
+    verifiedWebsiteUrl: entry.proposedWebsiteUrl,
+    websiteConfidence: entry.confidence,
+    websiteEvidence: entry.reason,
+    verifiedHomeUrl: resolution?.homeUrl ?? null,
+    homepageStatus: resolution?.homepageStatus ?? null,
+    homepageRedirectChain: resolution?.homepageRedirectChain ?? [],
+    homepageEvidence: resolution?.homepageReason ?? null,
+    verifiedArticleUrl: resolution?.articleUrl ?? null,
+    articleSource: resolution?.articleSource ?? null,
+    articleGscProperty: resolution?.gscEvidence?.siteUrl ?? null,
+    articleGscDateRange: resolution?.gscEvidence
+      ? { start: resolution.gscEvidence.startDate, end: resolution.gscEvidence.endDate }
+      : null,
+    articleGscClicks: resolution?.gscEvidence?.clicks ?? null,
+    articleGscImpressions: resolution?.gscEvidence?.impressions ?? null,
+    articleGscPosition: resolution?.gscEvidence?.position ?? null,
+    articleFinalCanonical: resolution?.articleCanonical ?? null,
+    articleHttpStatus: resolution?.articleStatus ?? null,
+    articleValidationSignals: resolution?.articleSignals ?? [],
+    articleConfidence: resolution?.articleConfidence ?? null,
+    articleEvidence: resolution?.articleReason ?? null,
+    candidatesConsidered: resolution?.candidatesConsidered ?? 0,
+    candidatesTried: resolution?.candidatesTried ?? 0,
+    candidateAttempts: resolution?.attempts ?? [],
+    sourcesTried: resolution?.sourcesTried ?? [],
+    usedFallbackDiscovery: resolution?.usedFallback ?? false,
+    gscCandidateReport: resolution?.gscCandidateReport ?? [],
+    heldBackReason: config ? null : (resolution?.reason ?? 'audit-config resolution not requested'),
+    requestBody: buildCreateOnlyBody(entry, config ?? null),
+  };
+}
+
 // ── console report ────────────────────────────────────────────────
 
 function printReport(
@@ -136,6 +265,8 @@ function printReport(
   collected: CollectedGscProperties,
   coverage: CoverageReport,
   opts: Options,
+  resolutions: Record<string, AuditConfigResolution>,
+  auditConfig: Record<string, CreateOnlyAuditConfig>,
 ): void {
   const t = plan.totals;
   const log = console.log;
@@ -145,16 +276,27 @@ function printReport(
   log(`  target                ${opts.apiBase}`);
   log('  source                Smacient MCP query-web-performance / gsc_list_sites');
   log('');
-  log(`  pages collected       ${collected.pageCount}`);
-  log(`  raw properties        ${collected.rawPropertyCount}`);
+  const configured = plan.create.filter((e) => auditConfig[e.domain]);
+  const identityOnly = plan.create.filter((e) => !auditConfig[e.domain]);
+
+  log(`  pages collected       ${collected.pageCount}  (entries per page: ${collected.entriesPerPage.join(', ')})`);
+  log(`  raw entries returned  ${collected.rawEntryCount}`);
+  log(`  usable site_url       ${collected.usableEntryCount}`);
+  log(`  malformed entries     ${collected.malformedEntryCount}`);
   log(`  exact duplicates      ${collected.exactDuplicateCount}`);
   log(`  unique properties     ${collected.uniquePropertyCount}  (domain ${t.domainProperties}, url-prefix ${t.urlPrefixProperties})`);
   log(`  unique canonical webs ${t.uniqueDomains}`);
+  log(`  entry accounting      ${collected.rawEntryCount} = ${collected.usableEntryCount} usable + ${collected.malformedEntryCount} malformed; ` +
+      `${collected.usableEntryCount} = ${collected.uniquePropertyCount} unique + ${collected.exactDuplicateCount} duplicates — ${collected.reconciled ? 'RECONCILED' : 'MISMATCH'}`);
   if (t.unparsableProperties) log(`  unparsable            ${t.unparsableProperties}`);
   log(`  existing projects     ${t.existingProjects}`);
   log('');
   log(`  already represented   ${t.unchanged + t.toUpdate}`);
   log(`  safe to create        ${t.toCreate}`);
+  if (opts.withAuditConfig) {
+    log(`    configured          ${configured.length}  (validated homeUrl + articleUrl — automation-ready)`);
+    log(`    identity only       ${identityOnly.length}  (no high-confidence pair)`);
+  }
   log(`  proposed updates      ${t.toUpdate}${opts.createOnly ? '  (reported only — create-only never writes these)' : ''}`);
   log(`  non-production        ${t.nonProduction}`);
   log(`  ambiguous             ${t.ambiguous}`);
@@ -168,12 +310,26 @@ function printReport(
   if (plan.create.length) {
     log('CREATE (safe canonical websites)');
     for (const e of plan.create) {
-      log(`  + ${e.domain}`);
+      const r = resolutions[e.domain];
+      const cfg = auditConfig[e.domain];
+      log(`  + ${e.domain}   [${cfg ? 'safe_create_configured' : 'safe_create_identity_only'}]`);
       log(`      properties     ${e.gscProperties.join(', ')}`);
       log(`      permission     ${e.permissionLevels.map((p) => p ?? 'unknown').join(', ')}`);
       log(`      website_url    ${e.proposedWebsiteUrl}`);
       log(`      project_name   "${e.proposedProjectName}"`);
       log(`      confidence     ${e.confidence} — ${e.reason}`);
+      if (!r) continue;
+      log(`      homeUrl        ${r.homeUrl ?? '(not verified)'}  HTTP ${r.homepageStatus ?? '-'}`);
+      if (r.articleUrl) {
+        log(`      articleUrl     ${r.articleUrl}  HTTP ${r.articleStatus}  [${r.articleConfidence}]`);
+        log(`      article src    ${r.articleSource}${r.gscEvidence ? ` from ${r.gscEvidence.siteUrl} (${r.gscEvidence.startDate}..${r.gscEvidence.endDate}, ${r.gscEvidence.clicks} clicks / ${r.gscEvidence.impressions} impressions)` : ''}`);
+        log(`      article signals ${r.articleSignals.join(', ') || 'none'}`);
+        if (r.articleCanonical) log(`      article canonical ${r.articleCanonical}`);
+      } else {
+        log(`      articleUrl     (none) — ${r.articleReason}`);
+      }
+      log(`      candidates     ${r.candidatesTried} tried of ${r.candidatesConsidered} considered; sources: ${r.sourcesTried.join(', ') || 'none'}${r.usedFallback ? ' (fallback used)' : ''}`);
+      if (!cfg) log(`      HELD BACK      ${r.reason}`);
     }
     log('');
   }
@@ -251,7 +407,10 @@ async function main(): Promise<number> {
   // Fail closed: an incomplete or looping collection must never be planned on.
   let collected: CollectedGscProperties;
   try {
-    collected = collectGscProperties(payload);
+    collected = collectGscProperties(payload, {
+      expectedUniqueProperties: opts.expectProperties,
+      expectedRawEntries: opts.expectRawEntries,
+    });
   } catch (err) {
     if (err instanceof GscCollectionError) {
       console.error(`error: ${err.message}`);
@@ -288,7 +447,63 @@ async function main(): Promise<number> {
     liveChecks,
   });
   const coverage = buildCoverage(collected, plan, unparsable);
-  printReport(plan, collected, coverage, opts);
+
+  // ── audit-configuration resolution ──────────────────────────────
+  //
+  // Only ever attempted for websites the planner already classified as a safe
+  // creation, and only when the operator asked for it. Resolution is pure
+  // read-only HTTP: it validates, it never writes.
+  const resolutions: Record<string, AuditConfigResolution> = {};
+  const auditConfig: Record<string, CreateOnlyAuditConfig> = {};
+  if (opts.withAuditConfig) {
+    let performances: GscPropertyPerformance[] = [];
+    if (opts.gscPageData) {
+      try {
+        performances = readGscPageData(opts.gscPageData);
+      } catch (err) {
+        console.error(`error: cannot read GSC page data: ${sanitize(String((err as Error).message))}`);
+        return 1;
+      }
+    } else {
+      console.error(
+        'warning: --with-audit-config without --gsc-page-data — Search Console page\n' +
+          '         performance is unavailable, so article discovery falls back to\n' +
+          '         sitemaps, feeds and homepage links only.',
+      );
+    }
+
+    // Attribute each captured response to the canonical website that owns its
+    // GSC property, so a website is only offered its own performance data.
+    const byDomain = new Map<string, GscPropertyPerformance[]>();
+    for (const performance of performances) {
+      const parsedProperty = parseProperties([{ site_url: performance.site_url }]).properties[0];
+      if (!parsedProperty) {
+        console.error(`warning: GSC page data for an unparsable property ignored: ${performance.site_url}`);
+        continue;
+      }
+      const bucket = byDomain.get(parsedProperty.normalizedDomain);
+      if (bucket) bucket.push(performance);
+      else byDomain.set(parsedProperty.normalizedDomain, [performance]);
+    }
+
+    for (const entry of plan.create) {
+      const resolution = await resolveAuditConfig({
+        domain: entry.domain,
+        websiteUrl: entry.proposedWebsiteUrl as string,
+        gscPerformance: byDomain.get(entry.domain) ?? [],
+        fetchPage,
+      });
+      resolutions[entry.domain] = resolution;
+      if (resolution.eligibleForConfiguredCreate && resolution.homeUrl && resolution.articleUrl) {
+        auditConfig[entry.domain] = { homeUrl: resolution.homeUrl, articleUrl: resolution.articleUrl };
+      }
+    }
+  }
+
+  const configuredCreations = plan.create.filter((e) => auditConfig[e.domain]);
+  const identityOnlyCreations = plan.create.filter((e) => !auditConfig[e.domain]);
+
+  printReport(plan, collected, coverage, opts, resolutions, auditConfig);
 
   const alreadyRepresented = [...plan.unchanged, ...plan.update];
   const summary: Record<string, unknown> = {
@@ -302,25 +517,42 @@ async function main(): Promise<number> {
     collection: {
       pagesCollected: collected.pageCount,
       pageTokens: collected.pageTokens,
+      entriesPerPage: collected.entriesPerPage,
+      rawEntryCount: collected.rawEntryCount,
+      entriesWithUsableSiteUrl: collected.usableEntryCount,
+      malformedEntryCount: collected.malformedEntryCount,
       rawPropertyCount: collected.rawPropertyCount,
       exactDuplicatePropertyCount: collected.exactDuplicateCount,
       uniquePropertyCount: collected.uniquePropertyCount,
       uniqueCanonicalWebsiteCount: plan.totals.uniqueDomains,
+      unexplainedEntries: collected.rawEntryCount - collected.usableEntryCount - collected.malformedEntryCount,
+      reconciled: collected.reconciled,
+      expectedUniqueProperties: opts.expectProperties,
+      expectedRawEntries: opts.expectRawEntries,
     },
     coverage,
     totals: plan.totals,
+    /** The final category of every canonical website — one bucket each. */
+    categories: {
+      safe_create_configured: configuredCreations.map((e) => e.domain),
+      safe_create_identity_only: identityOnlyCreations.map((e) => e.domain),
+      already_existing: alreadyRepresented.map((e) => e.domain),
+      proposed_existing_update_ignored: (opts.createOnly ? plan.update : []).map((e) => e.domain),
+      non_production: plan.nonProduction.map((e) => e.domain),
+      ambiguous: plan.ambiguous.map((e) => e.domain),
+      unparsable,
+    },
     existingCanonicalProjects: alreadyRepresented,
-    safeProjectsProposedForCreation: plan.create.map((e) => ({
-      canonicalDomain: e.domain,
-      gscProperties: e.gscProperties,
-      gscPropertyTypes: e.gscPropertyTypes,
-      permissionLevels: e.permissionLevels,
-      proposedWebsiteUrl: e.proposedWebsiteUrl,
-      proposedProjectName: e.proposedProjectName,
-      confidence: e.confidence,
-      evidence: e.reason,
-      requestBody: buildCreateOnlyBody(e),
-    })),
+    safeProjectsProposedForCreation: plan.create.map((e) =>
+      describeCreation(e, resolutions[e.domain], auditConfig[e.domain]),
+    ),
+    configuredCreations: configuredCreations.map((e) =>
+      describeCreation(e, resolutions[e.domain], auditConfig[e.domain]),
+    ),
+    identityOnlyCreations: identityOnlyCreations.map((e) =>
+      describeCreation(e, resolutions[e.domain], auditConfig[e.domain]),
+    ),
+    auditConfigResolutions: resolutions,
     proposedUpdatesIgnoredByCreateOnly: opts.createOnly ? plan.update : [],
     proposedUpdates: plan.update,
     collapsedDuplicateProperties: collapsedPropertyGroups(plan),
@@ -330,6 +562,7 @@ async function main(): Promise<number> {
     databaseDuplicates: plan.duplicates,
     inDatabaseNotInGsc: plan.notInGsc,
     expectedProjectCountAfterCreateOnlyApply: inventoryBefore.length + plan.create.length,
+    automationReadyWarning: opts.withAuditConfig ? AUTOMATION_READY_WARNING : null,
     writesPerformed: 0,
     auditsTriggered: 0,
     projectsUpdated: 0,
@@ -361,11 +594,27 @@ async function main(): Promise<number> {
   // Proposed updates were printed above and written to the JSON report; they
   // are never sent.
   const applyable = opts.createOnly ? plan.create : [...plan.create, ...plan.update];
-  const outcome = await applyPlan(opts.apiBase, applyable, {
+
+  if (opts.withAuditConfig) {
+    console.log('');
+    console.log(AUTOMATION_READY_WARNING);
+    console.log('');
+    console.log(`  ${configuredCreations.length} project(s) would be created AUTOMATION-READY:`);
+    for (const e of configuredCreations) console.log(`    - ${e.domain}`);
+    console.log('');
+  }
+
+  // Both inventory snapshots come from the live target: the before-read
+  // happens immediately before the first write and the after-read immediately
+  // after the last one. A captured file is rejected by parseArgs precisely so
+  // it can never stand in for either of them.
+  const verified = await applyPlanVerified(opts.apiBase, applyable, {
     createOnly: opts.createOnly,
+    auditConfig,
     log: (m) => console.log(m),
     error: (m) => console.error(m),
   });
+  const outcome = verified.outcome;
 
   if (outcome.halted) {
     console.error('');
@@ -373,21 +622,10 @@ async function main(): Promise<number> {
     console.error('Successful writes above are preserved; no further writes were attempted.');
   }
 
-  // ── prove every pre-existing project survived unchanged ─────────
-  let inventoryAfter: ProjectInventoryRecord[] | null = null;
-  let comparison: InventoryComparison | null = null;
-  try {
-    inventoryAfter = opts.existingProjects
-      ? readInventoryFile(opts.existingProjects)
-      : await fetchInventory(opts.apiBase);
-    comparison = compareInventories(inventoryBefore, inventoryAfter);
-  } catch (err) {
-    console.error(`error: cannot re-read projects to verify preservation: ${sanitize(String((err as Error).message))}`);
-  }
-
   summary.writes = {
     attempted: outcome.attempted,
     created: outcome.created,
+    configured: outcome.configured,
     updated: outcome.updated,
     conflicts: outcome.conflicts,
     failed: outcome.failed,
@@ -397,31 +635,37 @@ async function main(): Promise<number> {
   summary.halted = outcome.halted;
   summary.plannedWrites = applyable.length;
   summary.results = outcome.results;
-  summary.inventoryBeforeCount = inventoryBefore.length;
-  summary.inventoryAfterCount = inventoryAfter?.length ?? null;
-  summary.existingProjectPreservation = comparison;
+  summary.inventorySource = 'live GET /api/projects before and after the writes';
+  summary.inventoryBeforeCount = verified.inventoryBefore.length;
+  summary.inventoryAfterCount = verified.inventoryAfter?.length ?? null;
+  summary.existingProjectPreservation = verified.comparison;
+  summary.preservationVerified = verified.preservationVerified;
+  summary.verificationError = verified.verificationError;
   writeSummary();
 
   console.log('');
   console.log(
-    `Apply ${outcome.halted ? 'HALTED' : 'complete'} — created ${outcome.created}, ` +
-      `updated ${outcome.updated}, conflicts ${outcome.conflicts}, failed ${outcome.failed}.`,
+    `Apply ${outcome.halted ? 'HALTED' : 'complete'} — created ${outcome.created} ` +
+      `(${outcome.configured} automation-ready), updated ${outcome.updated}, ` +
+      `conflicts ${outcome.conflicts}, failed ${outcome.failed}.`,
   );
-  if (comparison) {
+
+  if (verified.preservationVerified && verified.comparison) {
     console.log(
-      comparison.preserved
-        ? `Existing-project preservation VERIFIED — ${comparison.unchangedIds.length} pre-existing projects unchanged, ${comparison.addedIds.length} added.`
-        : 'Existing-project preservation FAILED — see existingProjectPreservation in the JSON report.',
+      `Existing-project preservation VERIFIED against two live reads — ` +
+        `${verified.comparison.unchangedIds.length} pre-existing projects unchanged, ` +
+        `${verified.comparison.addedIds.length} added.`,
     );
-    for (const diff of comparison.changed) {
+  } else {
+    console.error(`Existing-project preservation NOT VERIFIED: ${verified.verificationError}`);
+    for (const diff of verified.comparison?.changed ?? []) {
       console.error(`  CHANGED  project ${diff.id} ${diff.field}: ${stringify(diff.before)} -> ${stringify(diff.after)}`);
     }
-    for (const id of comparison.missingIds) console.error(`  MISSING  project ${id}`);
+    for (const id of verified.comparison?.missingIds ?? []) console.error(`  MISSING  project ${id}`);
   }
   console.log('No audit was triggered. No project or audit was deleted or merged.');
 
-  const preservationFailed = comparison ? !comparison.preserved : true;
-  return outcome.failed > 0 || outcome.conflicts > 0 || preservationFailed ? 1 : 0;
+  return outcome.failed > 0 || outcome.conflicts > 0 || !verified.preservationVerified ? 1 : 0;
 }
 
 function stringify(value: unknown): string {

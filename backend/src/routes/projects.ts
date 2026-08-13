@@ -93,33 +93,39 @@ projectsRouter.post('/projects', async (req: Request, res: Response) => {
     return;
   }
 
-  const { domain, websiteUrl, projectName, isBeta, formValues, createOnly } = parsed;
+  const { domain, websiteUrl, projectName, isBeta, formValues, createOnly, withAuditConfig } = parsed;
 
   // ── create-only contract ────────────────────────────────────────
   //
   // A single atomic statement: either this request inserts the row or the row
   // already existed and nothing happens. There is deliberately no SELECT-then-
   // INSERT here — a check-then-write would leave a window in which a concurrent
-  // creation turns this call into an update of somebody else's project.
+  // creation turns this call into an update of somebody else's project. There
+  // is equally no create-then-PATCH: the audit configuration, when explicitly
+  // requested, is part of the same INSERT, so a project can never exist in a
+  // half-configured state and a conflict can never lead to a follow-up write.
   //
   // ON CONFLICT (domain) DO NOTHING means an existing project is not touched at
   // all: no UPDATE runs, so project_name, website_url, is_beta,
   // last_form_values, created_at and updated_at all keep their stored values.
-  // last_form_values is not even in the column list, so a newly created row
-  // starts NULL and is therefore never automation-ready.
+  //
+  // Without with_audit_config the last_form_values parameter is NULL, so a
+  // created row starts NULL and is never automation-ready.
   if (createOnly) {
+    const configuredValues = withAuditConfig && formValues ? JSON.stringify(formValues) : null;
     try {
       const inserted = await db.query<Record<string, unknown>>(
-        `INSERT INTO sites (domain, project_name, website_url, is_beta, updated_at)
-         VALUES ($1, $2, $3, COALESCE($4::boolean, FALSE), NOW())
+        `INSERT INTO sites (domain, project_name, website_url, is_beta, last_form_values, updated_at)
+         VALUES ($1, $2, $3, COALESCE($4::boolean, FALSE), $5::jsonb, NOW())
          ON CONFLICT (domain) DO NOTHING
          RETURNING *`,
-        [domain, projectName, websiteUrl, isBeta],
+        [domain, projectName, websiteUrl, isBeta, configuredValues],
       );
 
       if (!inserted.rows.length) {
         // Read-only lookup so the caller can identify the blocking row. This
-        // runs after the insert attempt and writes nothing.
+        // runs after the insert attempt, writes nothing, and is deliberately
+        // NOT followed by a PATCH — a conflict ends the request.
         const existing = await db.query<{ id: string; domain: string }>(
           'SELECT id, domain FROM sites WHERE domain = $1',
           [domain],
