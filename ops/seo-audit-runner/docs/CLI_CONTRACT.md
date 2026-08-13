@@ -155,7 +155,7 @@ Notes that are part of the contract:
 These commands **never** trigger an audit, send a notification, create a job
 or schedule, or write a row to any table:
 
-`init` · `validate-config` · `list-projects` · `status` · `health` ·
+`init` · `validate-config` · `version` · `list-projects` · `status` · `health` ·
 `doctor` · `job list` · `job show` · `schedule list` ·
 `notifications list` · `notifications show` ·
 `retry-notifications --dry-run` · `run … --dry-run`
@@ -235,6 +235,9 @@ schedules past it. A test asserts that default stays unbounded.
 # initialization and configuration
 seo-audit-runner init                      # explicit state create/migrate (idempotent)
 seo-audit-runner validate-config           # config + state dir + state DB (offline)
+seo-audit-runner version                   # release identity (see §10); loads no
+                                           # config, no env file, no secrets,
+                                           # and creates no state
 
 # read-only inspection
 seo-audit-runner list-projects             # GET /api/projects + dedupe preview
@@ -331,3 +334,65 @@ deployment scripts are POSIX `bash` and are exercised from both Git Bash and
 PowerShell in CI-equivalent local runs; `deploy/*.sh` self-harden `PATH` so
 Windows' `System32` cannot shadow the GNU tools they call. Node ≥ 22.5 is
 required (`--experimental-sqlite` on 22.5–23.x, nothing extra on 24+).
+
+## 10. Release identity (`version`)
+
+`version` answers one question: **which reviewed commit is this runner?** It is
+the RUNNER_SHA half of the deployment parity gate
+
+```
+REPO_SHA == APP_SHA == RUNNER_SHA
+```
+
+It is deliberately the cheapest command in the CLI: it is answered *before* any
+env file is read, any configuration is loaded, or any state directory is
+touched, so it works on a half-configured host and can never surface a secret.
+
+| Field | Meaning |
+|---|---|
+| `packageVersion` | the runner's own semver, from `package.json` |
+| `gitSha` | **full** 40- or 64-character repository SHA, or `null` |
+| `gitShaShort` | first 7 characters of `gitSha`, or `null` |
+| `gitShaSource` | `.release-sha` (recorded by the installer) or `SEO_RUNNER_GIT_SHA` |
+| `releaseStamp` | *when* the release was installed |
+| `releaseChecksum` | *what* the installed files hash to |
+| `nodeVersion` | the Node runtime executing the runner |
+
+`releaseStamp` and `releaseChecksum` are **not** repository identity: two
+different commits can produce byte-identical runner files, so a matching
+checksum proves nothing about which commit was reviewed. That is exactly the
+gap `.release-sha` closes.
+
+**Unknown is reported as `null`, never guessed**, and an unknown SHA fails the
+parity gate. Only a full object name is accepted — an abbreviated SHA cannot be
+expanded without the repository, and comparing a 7-character prefix against a
+full SHA would make the gate report a match nobody verified.
+
+### Verifying the gate (all three read-only)
+
+```bash
+# 1. REPO_SHA — the reviewed commit
+git -C <checkout> rev-parse HEAD
+
+# 2. APP_SHA — the deployed application
+curl -s https://<app-host>/api/build-info | jq -r .gitSha
+
+# 3. RUNNER_SHA — the installed runner
+sudo -u seo-runner seo-audit-runner version --output json | jq -r .data.gitSha
+```
+
+All three must print the same 40-character value. `null` on any side means that
+side does not know its own identity — fix the injection before deploying:
+
+- **application**: build with `--build-arg APP_GIT_SHA=$(git rev-parse HEAD)`
+  (Dockerfile), or set `APP_GIT_SHA` as a runtime variable (Nixpacks and other
+  platforms). Common platform variables (`RAILWAY_GIT_COMMIT_SHA`,
+  `RENDER_GIT_COMMIT`, `VERCEL_GIT_COMMIT_SHA`, `HEROKU_SLUG_COMMIT`,
+  `GITHUB_SHA`, …) are read automatically when present.
+- **runner**: `install.sh --git-sha <full-sha>` / `upgrade.sh --git-sha <full-sha>`,
+  or `SEO_RUNNER_GIT_SHA`. A git checkout install derives it from
+  `git rev-parse HEAD` automatically; an archive/tarball install cannot, so the
+  flag is required there.
+
+A different commit produces a **new runner release** even when the runner files
+are byte-identical, so the recorded identity can never name a stale commit.

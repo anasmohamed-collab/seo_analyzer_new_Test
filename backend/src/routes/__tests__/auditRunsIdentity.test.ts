@@ -32,6 +32,8 @@ const client = {
       }
       return { rows: [site] };
     }
+    // Stale recovery runs before the RUNNING re-check; nothing is stale here.
+    if (/UPDATE audit_runs[\s\S]*status = 'FAILED'/i.test(sql)) return { rows: [], rowCount: 0 };
     if (/FROM audit_runs[\s\S]*status = 'RUNNING'/i.test(sql)) {
       return { rows: runningAuditId ? [{ id: runningAuditId }] : [] };
     }
@@ -177,6 +179,8 @@ describe('POST /api/technical-analyzer/run project binding', () => {
     expect(lockAt).toBeLessThan(siteAt);
     expect(siteAt).toBeLessThan(runningAt);
     expect(runningAt).toBeLessThan(seedsAt);
+    expect(transactionSql[runningAt]).toMatch(/ORDER BY started_at DESC/i);
+    expect(transactionSql[runningAt]).not.toMatch(/ORDER BY created_at DESC/i);
   });
 
   it('rejects an existing RUNNING audit with 409', async () => {

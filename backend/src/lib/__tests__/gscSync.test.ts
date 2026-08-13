@@ -1,8 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import {
+  buildCreateOnlyBody,
   buildUpsertBody,
+  collectGscProperties,
+  compareInventories,
   deriveProjectName,
   groupByCanonicalDomain,
+  GscCollectionError,
   isUnusableProjectName,
   nextPageToken,
   nonProductionMarkers,
@@ -13,6 +17,7 @@ import {
   selectProductionUrl,
   type ExistingProject,
   type LiveCheck,
+  type ProjectInventoryRecord,
   type SmacientSite,
 } from '../gscSync.js';
 
@@ -73,6 +78,179 @@ describe('readSmacientSites', () => {
     expect(nextPageToken({ sites: [], next_page_token: 'abc' })).toBe('abc');
     expect(nextPageToken({ sites: [] })).toBeNull();
     expect(nextPageToken({ sites: [], next_page_token: '' })).toBeNull();
+  });
+});
+
+// ── fail-closed pagination collection ─────────────────────────────
+
+describe('collectGscProperties', () => {
+  const page = (urls: string[], token?: string) => ({
+    sites: urls.map((u) => site(u)),
+    ...(token ? { next_page_token: token } : {}),
+  });
+
+  it('includes every property from every page', () => {
+    const out = collectGscProperties({
+      pages: [
+        page(['sc-domain:a.com', 'https://b.com/'], 't1'),
+        page(['https://c.com/', 'sc-domain:d.com'], 't2'),
+        page(['sc-domain:e.com']),
+      ],
+    });
+    expect(out.pageCount).toBe(3);
+    expect(out.uniquePropertyCount).toBe(5);
+    expect(out.sites.map((s) => s.site_url)).toEqual([
+      'sc-domain:a.com', 'https://b.com/', 'https://c.com/', 'sc-domain:d.com', 'sc-domain:e.com',
+    ]);
+    expect(out.pageTokens).toEqual(['t1', 't2', null]);
+  });
+
+  it('counts and collapses exact duplicate properties across pages', () => {
+    const out = collectGscProperties({
+      pages: [page(['sc-domain:a.com', 'https://b.com/'], 't1'), page(['https://b.com/', 'sc-domain:c.com'])],
+    });
+    expect(out.rawPropertyCount).toBe(4);
+    expect(out.exactDuplicateCount).toBe(1);
+    expect(out.uniquePropertyCount).toBe(3);
+  });
+
+  it('preserves permission_level verbatim', () => {
+    const out = collectGscProperties({
+      pages: [{ sites: [{ site_url: 'sc-domain:a.com', permission_level: 'siteRestrictedUser' }] }],
+    });
+    expect(out.sites[0].permission_level).toBe('siteRestrictedUser');
+  });
+
+  it('fails closed on a repeated pagination token', () => {
+    expect(() =>
+      collectGscProperties({
+        pages: [page(['sc-domain:a.com'], 'same'), page(['sc-domain:b.com'], 'same'), page(['sc-domain:c.com'])],
+      }),
+    ).toThrow(GscCollectionError);
+    expect(() =>
+      collectGscProperties({
+        pages: [page(['sc-domain:a.com'], 'same'), page(['sc-domain:b.com'], 'same'), page(['sc-domain:c.com'])],
+      }),
+    ).toThrow(/repeats a pagination token/);
+  });
+
+  it('fails closed when the last collected page still carries a continuation token', () => {
+    expect(() => collectGscProperties({ pages: [page(['sc-domain:a.com'], 'more')] }))
+      .toThrow(/still carries a next_page_token/);
+  });
+
+  it('fails closed on a page that could not be retrieved', () => {
+    expect(() =>
+      collectGscProperties({ pages: [page(['sc-domain:a.com'], 't1'), { error: 'HTTP 503' }] }),
+    ).toThrow(/reports an error/);
+  });
+
+  it('fails closed on a page with no sites array', () => {
+    expect(() => collectGscProperties({ pages: [page(['sc-domain:a.com'], 't1'), {}] }))
+      .toThrow(/carries no sites array/);
+  });
+
+  it('fails closed on an entry with no site_url, after counting it', () => {
+    expect(() => collectGscProperties({ pages: [{ sites: [{ permission_level: 'siteOwner' }] }] }))
+      .toThrow(/1 of 1 entries have no usable site_url/);
+  });
+
+  it('fails closed when zero properties are returned', () => {
+    expect(() => collectGscProperties({ pages: [{ sites: [] }] }))
+      .toThrow(/zero Google Search Console properties/);
+    expect(() => collectGscProperties({ pages: [{ sites: [] }] }))
+      .toThrow(/NOT a signal to remove existing projects/);
+  });
+
+  it('fails closed when there is no pages envelope at all', () => {
+    expect(() => collectGscProperties({})).toThrow(/no gsc_list_sites pages found/);
+    expect(() => collectGscProperties(null)).toThrow(GscCollectionError);
+    expect(() => collectGscProperties({ pages: [] })).toThrow(GscCollectionError);
+  });
+});
+
+// ── entry accounting: the 77-vs-76 regression ─────────────────────
+
+describe('collectGscProperties — entry accounting', () => {
+  const page = (urls: string[], token?: string) => ({
+    sites: urls.map((u) => site(u)),
+    ...(token ? { next_page_token: token } : {}),
+  });
+
+  it('accounts for every raw entry exactly once', () => {
+    const out = collectGscProperties({
+      pages: [
+        page(['sc-domain:a.com', 'https://b.com/'], 't1'),
+        page(['https://b.com/', 'sc-domain:c.com']),
+      ],
+    });
+
+    expect(out.rawEntryCount).toBe(4);
+    expect(out.usableEntryCount).toBe(4);
+    expect(out.malformedEntryCount).toBe(0);
+    expect(out.exactDuplicateCount).toBe(1);
+    expect(out.uniquePropertyCount).toBe(3);
+    expect(out.entriesPerPage).toEqual([2, 2]);
+    expect(out.reconciled).toBe(true);
+
+    // The two identities the report prints.
+    expect(out.rawEntryCount).toBe(out.usableEntryCount + out.malformedEntryCount);
+    expect(out.usableEntryCount).toBe(out.uniquePropertyCount + out.exactDuplicateCount);
+  });
+
+  it('accepts a declared total that matches', () => {
+    const out = collectGscProperties(
+      { pages: [page(['sc-domain:a.com', 'https://b.com/'])] },
+      { expectedUniqueProperties: 2, expectedRawEntries: 2 },
+    );
+    expect(out.uniquePropertyCount).toBe(2);
+  });
+
+  it('fails closed on an unexplained unique-property count difference', () => {
+    // 76 collected, 77 claimed — exactly the discrepancy the previous import
+    // reported without anything stopping it.
+    expect(() =>
+      collectGscProperties(
+        { pages: [page(['sc-domain:a.com', 'https://b.com/'])] },
+        { expectedUniqueProperties: 3 },
+      ),
+    ).toThrow(/expected 3 unique GSC properties but collected 2/);
+    expect(() =>
+      collectGscProperties(
+        { pages: [page(['sc-domain:a.com', 'https://b.com/'])] },
+        { expectedUniqueProperties: 3 },
+      ),
+    ).toThrow(/difference is unexplained/);
+  });
+
+  it('fails closed on an unexplained raw-entry count difference', () => {
+    expect(() =>
+      collectGscProperties(
+        { pages: [page(['sc-domain:a.com'])] },
+        { expectedRawEntries: 2 },
+      ),
+    ).toThrow(/expected 2 raw gsc_list_sites entries but collected 1/);
+  });
+
+  it('counts a malformed entry before rejecting the collection', () => {
+    let message = '';
+    try {
+      collectGscProperties({
+        pages: [{ sites: [site('sc-domain:a.com'), { permission_level: 'siteOwner' }, site('https://b.com/')] }],
+      });
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    // The operator is told how many of how many, so the totals still add up.
+    expect(message).toMatch(/1 of 3 entries have no usable site_url/);
+  });
+
+  it('exposes per-page entry counts so a short page is visible', () => {
+    const out = collectGscProperties({
+      pages: [page(['sc-domain:a.com', 'https://b.com/', 'https://c.com/'], 't1'), page(['sc-domain:d.com'])],
+    });
+    expect(out.entriesPerPage).toEqual([3, 1]);
+    expect(out.rawEntryCount).toBe(4);
   });
 });
 
@@ -470,5 +648,118 @@ describe('buildUpsertBody', () => {
       liveChecks: { 'raya.com': { ok: false, error: 'fetch failed' } },
     });
     expect(() => buildUpsertBody(plan.ambiguous[0])).toThrow(/not applyable/);
+  });
+});
+
+// ── create-only request shape ─────────────────────────────────────
+
+describe('buildCreateOnlyBody', () => {
+  const planFor = (...urls: string[]) =>
+    planSync({
+      properties: props(...urls),
+      existingProjects: [
+        { id: 'p-stale', domain: 'stale.com', project_name: 'Stale', website_url: null },
+      ],
+      liveChecks: {
+        'manilatimes.net': liveOk('www.manilatimes.net', 'The Manila Times'),
+        'stale.com': liveOk('stale.com', 'Stale'),
+        'beta.example.com': liveOk('beta.example.com'),
+        'raya.com': { ok: false, error: 'fetch failed' },
+      },
+    });
+
+  it('sends the minimum identity plus the create_only flag', () => {
+    const plan = planFor('sc-domain:manilatimes.net');
+    const body = buildCreateOnlyBody(plan.create[0]);
+
+    expect(body).toEqual({
+      project_name: 'The Manila Times',
+      website_url: 'https://www.manilatimes.net/',
+      create_only: true,
+    });
+    // No homeUrl / articleUrl, and no is_beta guessed from the hostname.
+    expect(Object.keys(body).sort()).toEqual(['create_only', 'project_name', 'website_url']);
+  });
+
+  it('refuses a proposed update, so create-only can never send one', () => {
+    const plan = planFor('sc-domain:stale.com');
+    expect(plan.update).toHaveLength(1);
+    expect(() => buildCreateOnlyBody(plan.update[0])).toThrow(/action "update"/);
+  });
+
+  it('refuses non-production and ambiguous entries', () => {
+    const nonProd = planFor('sc-domain:beta.example.com');
+    expect(() => buildCreateOnlyBody(nonProd.nonProduction[0])).toThrow(/action "non_production"/);
+
+    const ambiguous = planFor('sc-domain:raya.com');
+    expect(() => buildCreateOnlyBody(ambiguous.ambiguous[0])).toThrow(/action "ambiguous"/);
+  });
+
+  it('refuses an unchanged entry that already maps to a project', () => {
+    const plan = planSync({
+      properties: props('sc-domain:kept.com'),
+      existingProjects: [
+        { id: 'p-kept', domain: 'kept.com', project_name: 'Kept', website_url: 'https://kept.com/' },
+      ],
+      liveChecks: { 'kept.com': liveOk('kept.com', 'Kept') },
+    });
+    expect(() => buildCreateOnlyBody(plan.unchanged[0])).toThrow(/action "unchanged"/);
+  });
+});
+
+// ── existing-project preservation ─────────────────────────────────
+
+describe('compareInventories', () => {
+  const record = (over: Partial<ProjectInventoryRecord> = {}): ProjectInventoryRecord => ({
+    id: 'p-1',
+    domain: 'kept.com',
+    project_name: 'Kept',
+    website_url: 'https://kept.com/',
+    is_beta: false,
+    last_form_values: { homeUrl: 'https://kept.com/', articleUrl: 'https://kept.com/story' },
+    created_at: '2026-01-01T00:00:00.000Z',
+    updated_at: '2026-01-02T00:00:00.000Z',
+    last_audit_at: '2026-02-01T00:00:00.000Z',
+    audit_count: 4,
+    completed_count: 3,
+    automation_ready: true,
+    ...over,
+  });
+
+  it('reports preservation when nothing changed', () => {
+    const result = compareInventories([record()], [record()]);
+    expect(result.preserved).toBe(true);
+    expect(result.unchangedIds).toEqual(['p-1']);
+    expect(result.changed).toEqual([]);
+    expect(result.addedIds).toEqual([]);
+  });
+
+  it('treats newly created projects as the only permitted difference', () => {
+    const result = compareInventories(
+      [record()],
+      [record(), record({ id: 'p-new', domain: 'new.com', audit_count: 0 })],
+    );
+    expect(result.preserved).toBe(true);
+    expect(result.addedIds).toEqual(['p-new']);
+  });
+
+  it.each([
+    ['project_name', { project_name: 'Renamed' }],
+    ['website_url', { website_url: 'https://kept.com/other' }],
+    ['is_beta', { is_beta: true }],
+    ['last_form_values', { last_form_values: null }],
+    ['updated_at', { updated_at: '2026-06-06T00:00:00.000Z' }],
+    ['audit_count', { audit_count: 5 }],
+    ['automation_ready', { automation_ready: false }],
+  ])('fails preservation when %s changed', (field, over) => {
+    const result = compareInventories([record()], [record(over as Partial<ProjectInventoryRecord>)]);
+    expect(result.preserved).toBe(false);
+    expect(result.changed.map((c) => c.field)).toContain(field);
+  });
+
+  it('fails preservation when a project disappeared', () => {
+    const result = compareInventories([record()], []);
+    expect(result.preserved).toBe(false);
+    expect(result.missingIds).toEqual(['p-1']);
   });
 });

@@ -143,6 +143,20 @@ else
   failv "command wrapper" "missing at $WRAPPER"
 fi
 
+# 5b. Release identity — the RUNNER_SHA half of the deployment parity gate
+#     REPO_SHA == APP_SHA == RUNNER_SHA. An unknown SHA is reported, not
+#     guessed, and it FAILS the gate: the operator cannot prove which reviewed
+#     commit is running.
+release_sha=$(run_wrapper version --output json 2>/dev/null \
+  | sed -n 's/.*"gitSha"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]*\)".*/\1/p' | head -n 1)
+if [ -n "$release_sha" ]; then
+  pass "release git SHA recorded ($release_sha)"
+  printf 'NOTE  verify parity: git rev-parse HEAD == /api/build-info .gitSha == %s\n' "$release_sha"
+else
+  failv "release git SHA" \
+    "unknown — reinstall with 'install.sh --git-sha <full-sha>' (or SEO_RUNNER_GIT_SHA); the REPO_SHA == APP_SHA == RUNNER_SHA gate cannot pass"
+fi
+
 # 6. Configuration validation (also proves state DB access)
 if run_wrapper validate-config >/dev/null 2>&1; then
   pass "validate-config (configuration + state database)"

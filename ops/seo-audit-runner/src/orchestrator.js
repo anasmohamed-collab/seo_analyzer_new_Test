@@ -14,7 +14,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { dedupeProjects } from './dedupe.js';
 import { buildRunRequest } from './buildRunRequest.js';
 import { evaluateProjectEligibility } from './eligibility.js';
-import { extractCriticalIssues } from './criticalFilter.js';
+import { extractCriticalIssues, filterNotificationIssues } from './criticalFilter.js';
 import { AmbiguousTriggerError, TriggerFailedError } from './apiClient.js';
 import { OUTCOME } from './report.js';
 
@@ -207,12 +207,22 @@ export async function runAudits({ config, apiClient, logger = null, options = {}
     // 5. Poll until terminal status or timeout.
     const polled = await pollUntilTerminal(trigger.auditRunId);
     if (polled.outcome === OUTCOME.COMPLETED) {
+      // ONE extraction: the complete P0 set. It is the local report's content
+      // and the snapshot the state store records. Narrowing to what Slack may
+      // announce happens later, in the notification pipeline — never here, so
+      // an unalerted Beta P0 is still tracked and never falsely RESOLVED.
       const criticals = extractCriticalIssues(polled.results, {
         projectId: project.id,
         auditRunId: trigger.auditRunId,
       });
+      const alertIssues = filterNotificationIssues(criticals, {
+        isBeta: project.is_beta === true,
+      });
       report.criticalIssues.push(...criticals);
-      logger?.info?.(`Project ${label}: COMPLETED with ${criticals.length} critical (P0) issue(s)`);
+      logger?.info?.(
+        `Project ${label}: COMPLETED with ${criticals.length} critical (P0) issue(s)` +
+          `${alertIssues.length !== criticals.length ? `, ${alertIssues.length} notification-eligible` : ''}`,
+      );
       const completedEntry = makeEntry(
         project,
         OUTCOME.COMPLETED,

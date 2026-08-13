@@ -12,7 +12,9 @@ Print this and tick every box in order. Details for every step:
 
 ## Install
 - [ ] `cd <checkout>/ops/seo-audit-runner`
-- [ ] `sudo bash deploy/install.sh --node "$(command -v node)"`
+- [ ] `sudo bash deploy/install.sh --node "$(command -v node)" --git-sha "$(git rev-parse HEAD)"`
+      (a git checkout derives the SHA automatically; an extracted archive
+      REQUIRES `--git-sha <full-40-char-sha>` or the parity gate cannot pass)
 - [ ] Installer ended with `installation complete` and validation OK
 - [ ] `sudo systemctl daemon-reload`
 
@@ -21,6 +23,9 @@ Print this and tick every box in order. Details for every step:
 - [ ] Slack: set `SLACK_BOT_TOKEN` + `SLACK_CHANNEL_ID`, then `NOTIFICATIONS_ENABLED=true`
 - [ ] `sudo chmod 0640 /etc/seo-audit-runner/runner.env && sudo chown root:seo-runner /etc/seo-audit-runner/runner.env`
 - [ ] `sudo -u seo-runner seo-audit-runner validate-config` → `Configuration OK`
+- [ ] `sudo -u seo-runner seo-audit-runner version` → full Git SHA, not `unknown`
+- [ ] Parity gate: `git rev-parse HEAD` == `/api/build-info` `.gitSha`
+      == `version --output json` `.data.gitSha` (all three identical)
 - [ ] `sudo -u seo-runner seo-audit-runner init` → state DB created as `seo-runner`
       (always `-u seo-runner`, never plain root — root would leave root-owned state files)
 

@@ -14,6 +14,7 @@
  *    remote ambiguity cannot be fully eliminated with Slack's API
  */
 
+import { filterNotificationIssues, filterNotificationLifecycle } from './criticalFilter.js';
 import { fingerprintIssue, sha256Hex } from './fingerprint.js';
 import { normalizeDomainKey } from './normalizeDomain.js';
 import {
@@ -21,7 +22,8 @@ import {
   buildProjectMessages,
   buildRunSummaryMessage,
   createTechnicalAggregate,
-  criticalMentionToken,
+  CHANNEL_MENTION_MODE,
+  NO_MENTION_MODE,
 } from './slackFormat.js';
 import { SlackPermanentError } from './slackClient.js';
 import { evaluateAuditEvidence } from './evidenceGate.js';
@@ -33,6 +35,32 @@ export function notificationIdentity({ projectId, auditRunId, type, alertMode, l
     .map((key) => `${key}:${(lifecycle?.[key] ?? []).map((i) => i.fingerprint ?? '').sort().join(',')}`)
     .join('|');
   return sha256Hex(['v1', type, projectId ?? '', auditRunId ?? '', alertMode, sets].join(''));
+}
+
+/**
+ * The ONLY rule that authorizes a broad `@channel` mention.
+ *
+ * All of the following must hold — the caller has already established that the
+ * message is a project-level critical alert that Slack notifications and the
+ * project's alert mode permit to be sent:
+ *
+ *  1. the operator opted in with `SLACK_CRITICAL_MENTION=channel`
+ *  2. the project is Production (`project.is_beta !== true`)
+ *  3. the NOTIFICATION-eligible lifecycle carries at least one NEW or
+ *     REOPENED P0 (Beta exposure findings never reach here — condition 2
+ *     already excluded them)
+ *
+ * Nothing about the rendered message, its title, or any audit-controlled
+ * string takes part in this decision.
+ *
+ * @returns 'channel' | 'none'
+ */
+export function criticalMentionPolicy({ configuredMention, isBeta, counts }) {
+  const authorized =
+    configuredMention === CHANNEL_MENTION_MODE &&
+    isBeta !== true &&
+    (counts?.new ?? 0) + (counts?.reopened ?? 0) > 0;
+  return authorized ? CHANNEL_MENTION_MODE : NO_MENTION_MODE;
 }
 
 export function shouldNotify(mode, counts) {
@@ -166,20 +194,14 @@ export function createNotificationPipeline({
         };
       }
 
-      // Beta/Staging projects still complete their audits and evidence checks,
-      // but they are outside the scheduled alerting lifecycle. Skipping before
-      // snapshot/notification persistence also prevents later retry delivery.
-      if (project?.is_beta === true) {
-        counters.notRequired++;
-        logger?.info?.(`Project ${project.id}: Beta/Staging project — scheduled Slack alert skipped`);
-        return { evidenceComplete: true, notificationStatus: 'skipped-beta' };
-      }
-
       const issues = criticalIssues.map((issue) => ({
         ...issue,
         fingerprint: fingerprintIssue(project.id, issue),
       }));
 
+      // The snapshot always records the COMPLETE current P0 set — for Beta
+      // projects too. Narrowing the snapshot instead of the notification would
+      // make the next audit report untouched Beta P0s as RESOLVED.
       const lifecycle = stateStore.recordSnapshotAndLifecycle({
         projectId: project.id,
         normalizedDomain: normalizeDomainKey(project.website_url || project.domain || ''),
@@ -189,19 +211,44 @@ export function createNotificationPipeline({
         now: now(),
       });
 
-      const counts = {
+      const isBeta = project.is_beta === true;
+      // Slack sees only the notification-eligible view: all P0 for Production,
+      // Critical Exposure only for Beta. Identity, counts, message content and
+      // run-summary totals are all derived from THIS lifecycle.
+      const notificationLifecycle = filterNotificationLifecycle(lifecycle, { isBeta });
+      const notificationIssues = filterNotificationIssues(issues, { isBeta });
+
+      const snapshotCounts = {
         new: lifecycle.new.length,
         reopened: lifecycle.reopened.length,
         unchanged: lifecycle.unchanged.length,
         resolved: lifecycle.resolved.length,
         current: issues.length,
       };
-      lifecycleTotals.new += counts.new;
-      lifecycleTotals.reopened += counts.reopened;
-      lifecycleTotals.unchanged += counts.unchanged;
-      lifecycleTotals.resolved += counts.resolved;
-      lifecycleTotals.currentP0 += counts.current;
-      if (counts.current > 0) lifecycleTotals.projectsWithCritical++;
+      const counts = {
+        new: notificationLifecycle.new.length,
+        reopened: notificationLifecycle.reopened.length,
+        unchanged: notificationLifecycle.unchanged.length,
+        resolved: notificationLifecycle.resolved.length,
+        current: notificationIssues.length,
+      };
+      // Count the already-filtered notification buckets DIRECTLY. Re-filtering
+      // them on `issue.priority` used to silently zero the resolved total:
+      // resolved issues are reconstructed from `issue_states`, which stores no
+      // priority column, so every resolved item failed a `priority === 'P0'`
+      // test no matter what it actually was.
+      //
+      // Re-filtering is unnecessary anyway — these buckets are P0 by
+      // construction. The snapshot is built from `extractCriticalIssues()`
+      // (strictly P0), and the notification filter only ever narrows it
+      // further. So the bucket length IS the P0 count, for every bucket.
+      const currentP0 = notificationIssues.length;
+      lifecycleTotals.new += notificationLifecycle.new.length;
+      lifecycleTotals.reopened += notificationLifecycle.reopened.length;
+      lifecycleTotals.unchanged += notificationLifecycle.unchanged.length;
+      lifecycleTotals.resolved += notificationLifecycle.resolved.length;
+      lifecycleTotals.currentP0 += currentP0;
+      if (currentP0 > 0) lifecycleTotals.projectsWithCritical++;
 
       // Technical checks come from THIS completed audit result only — the
       // notification layer never re-fetches robots.txt or a sitemap.
@@ -209,12 +256,6 @@ export function createNotificationPipeline({
 
       let notificationStatus = 'not-required';
       if (slackActive && shouldNotify(alertMode, counts)) {
-        // A channel-wide mention is for genuinely NEW or REOPENED P0 issues.
-        // Unchanged-only and resolved-only alerts never page the channel.
-        const mention =
-          counts.new + counts.reopened > 0
-            ? criticalMentionToken(config.slackCriticalMention ?? 'channel')
-            : null;
         const messages = buildProjectMessages({
           projectName: project.project_name ?? project.name ?? null,
           domain: project.domain ?? project.website_url ?? null,
@@ -222,10 +263,18 @@ export function createNotificationPipeline({
           auditRunId,
           auditCompletedAt: results.finished_at ?? null,
           dashboardUrl: config.dashboardUrl ?? null,
-          lifecycle,
+          lifecycle: notificationLifecycle,
           mode: alertMode,
           siteChecks: results.siteChecks ?? null,
-          mention,
+          isBeta,
+          // Authorization travels as data from configuration → pipeline →
+          // formatter. It is stamped onto the message, persisted with it, and
+          // removed again by the Slack client before transmission.
+          mentionPolicy: criticalMentionPolicy({
+            configuredMention: config.slackCriticalMention,
+            isBeta,
+            counts,
+          }),
           maxIssuesPerMessage: config.slackMaxIssuesPerMessage,
           maxMessageCharacters: config.slackMaxMessageCharacters,
         });
@@ -233,17 +282,27 @@ export function createNotificationPipeline({
           type: 'project_update',
           projectId: project.id,
           auditRunId,
-          lifecycle,
+          lifecycle: notificationLifecycle,
           messages,
         });
         if (notificationStatus === 'delivered') {
-          const alerted = [...lifecycle.new, ...lifecycle.reopened].map((i) => i.fingerprint);
-          if (alertMode === 'all_current') alerted.push(...lifecycle.unchanged.map((i) => i.fingerprint));
+          const alerted = [...notificationLifecycle.new, ...notificationLifecycle.reopened]
+            .map((i) => i.fingerprint);
+          if (alertMode === 'all_current') {
+            alerted.push(...notificationLifecycle.unchanged.map((i) => i.fingerprint));
+          }
           stateStore.markIssuesAlerted(project.id, alerted, now());
         }
       }
 
-      return { evidenceComplete: true, lifecycleCounts: counts, notificationStatus };
+      return {
+        evidenceComplete: true,
+        // The local report keeps the complete P0 picture; `notificationCounts`
+        // is what Slack was told.
+        lifecycleCounts: snapshotCounts,
+        notificationCounts: counts,
+        notificationStatus,
+      };
     },
 
     /** Optional end-of-execution summary (SEO_RUNNER_SEND_RUN_SUMMARY). */
@@ -254,8 +313,9 @@ export function createNotificationPipeline({
         startedAt,
         finishedAt,
         durationMs: Date.parse(finishedAt) - Date.parse(startedAt),
-        // Run summaries never carry a broad mention. The technical aggregate
-        // is the pipeline's own count of successfully completed audits.
+        // Run summaries never carry a broad mention — `buildRunSummaryMessage`
+        // has no mention parameter and stamps no authorization. The technical
+        // aggregate is the pipeline's own count of successfully completed audits.
         totals: { ...totals, technical: totals?.technical ?? technicalTotals },
       });
       return persistAndSend({
@@ -271,7 +331,14 @@ export function createNotificationPipeline({
 
 /**
  * Retry pending/retryable-failed notifications from the state database.
- * Never reruns an SEO audit; only replays stored Slack payloads.
+ * Never reruns an SEO audit, and never touches issue lifecycle state; only
+ * replays stored Slack payloads.
+ *
+ * Mention authorization rides along inside the stored payload, so a retry of
+ * an authorized Production critical alert still delivers its one `<!channel>`,
+ * and a payload stored WITHOUT that field — every row written before this
+ * change — is stripped of any broad mention at delivery. Historical rows are
+ * never rewritten, and nothing is authorized retroactively.
  *
  * @param options.dryRun report eligible records without sending or updating
  */

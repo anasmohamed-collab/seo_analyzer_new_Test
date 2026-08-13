@@ -117,13 +117,22 @@ SEO_API_BASE_URL=<http://127.0.0.1:3000 or your internal app address>
 # after entering Slack credentials, turn notifications on:
 NOTIFICATIONS_ENABLED=true
 SLACK_BOT_TOKEN=<xoxb-your-bot-token>
+# The immutable channel ID of #seo_analyzer_bot — the ID, never the name.
 SLACK_CHANNEL_ID=<C0XXXXXXXXX>
 
-# channel | here | everyone | none  (default: channel)
-# Adds <!channel> to alerts that contain a NEW or REOPENED P0 issue only.
-# Run summaries never contain a broad mention. Use `none` to switch it off.
-SLACK_CRITICAL_MENTION=channel
+# Broad channel mention on critical alerts. `none` is the default: no message
+# pages the channel. Set `channel` ONLY as a deliberate decision — it adds one
+# <!channel> to PRODUCTION critical alerts reporting a NEW or REOPENED P0.
+# Beta exposure alerts, unchanged/resolved-only alerts, run summaries and
+# failure notices never page. `here`/`everyone` are neutralized to `none`.
+SLACK_CRITICAL_MENTION=none
 ```
+
+**Slack destination prerequisites** (operator actions, not performed by the
+installer): the configured `SLACK_CHANNEL_ID` must be the immutable ID
+(`C…`) of **`#seo_analyzer_bot`**, the bot must already be **invited** to that
+channel, and the app must hold the **`chat:write`** scope. The runner performs
+no channel-name lookup and no Slack discovery call.
 
 **Secret handling:** `runner.env` is the ONLY place secrets live
 (`root:seo-runner`, mode `0640`). They never appear in logs (the runner

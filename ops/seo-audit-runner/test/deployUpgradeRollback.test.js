@@ -9,6 +9,7 @@ import {
   bashMissing,
   makeWorkspace,
   runScript,
+  cleanGitSource,
   stagedInstallArgs,
   toPosix,
 } from '../tools/shellHarness.js';
@@ -157,8 +158,11 @@ test('a failed upgrade leaves the active release unchanged', { skip }, () => {
 test('upgrade with unchanged source is a no-op on the release', { skip }, () => {
   const fx = stagedFixture();
   const before = currentStamp(fx.opt);
+  // The SAME clean source the fixture installed from — identical files and
+  // identical HEAD, which is exactly what "unchanged" means now that release
+  // identity includes the commit.
   const r = runScript(UPGRADE_SH, [
-    '--source', toPosix(RUNNER_ROOT),
+    '--source', toPosix(cleanGitSource().dir),
     '--node', toPosix(process.execPath),
     '--destdir', toPosix(fx.destdir),
   ]);

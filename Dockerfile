@@ -20,6 +20,14 @@ FROM node:20-alpine AS runtime
 
 WORKDIR /app
 
+# Repository identity for the deployment parity gate
+# (REPO_SHA == APP_SHA == RUNNER_SHA). Pass the FULL 40-character SHA:
+#   docker build --build-arg APP_GIT_SHA="$(git rev-parse HEAD)" .
+# An abbreviated or missing value is reported by /api/build-info as
+# gitSha: null — honestly unknown, which fails the gate.
+ARG APP_GIT_SHA=""
+ENV APP_GIT_SHA=$APP_GIT_SHA
+
 ENV NODE_ENV=production
 # Force IPv4 DNS — container networks on Dublyo don't support IPv6
 ENV NODE_OPTIONS="--dns-result-order=ipv4first"

@@ -11,9 +11,20 @@
  *
  * Secrets: the bot token, the Authorization header, and the webhook URL are
  * never logged and never included in thrown error messages.
+ *
+ * Broad mentions: `send()` is the last-mile control. It preserves at most the
+ * ONE `<!channel>` a message was explicitly authorized to carry by the
+ * notification pipeline, strips every other broad mention on both methods, and
+ * transmits only Slack-supported fields.
  */
 
 import { setTimeout as sleepDefault } from 'node:timers/promises';
+import {
+  CHANNEL_MENTION_MODE,
+  countBroadMentions,
+  mentionPolicyOf,
+  sanitizeSlackMessage,
+} from './slackFormat.js';
 
 export const SLACK_POST_MESSAGE_URL = 'https://slack.com/api/chat.postMessage';
 
@@ -63,7 +74,23 @@ export function createSlackSender({
     return Math.min(30_000, base * (0.8 + random() * 0.4));
   }
 
-  async function requestOnce(message) {
+  /**
+   * The outbound request body, built field by field so ONLY Slack-supported
+   * fields are transmitted. Internal metadata (the mention-authorization
+   * field) is never copied through, on either method.
+   *
+   * `channel` is always the configured immutable channel ID (`C…`). The
+   * runner performs no channel-name lookup and no Slack discovery call.
+   */
+  function requestBody(message) {
+    return {
+      ...(method === 'bot' ? { channel: config.slackChannelId } : {}),
+      text: message.text,
+      ...(message.blocks ? { blocks: message.blocks } : {}),
+    };
+  }
+
+  async function requestOnce(body) {
     const signal = AbortSignal.timeout(timeoutMs);
     if (method === 'bot') {
       return fetchImpl(SLACK_POST_MESSAGE_URL, {
@@ -74,21 +101,14 @@ export function createSlackSender({
           // Never logged anywhere — see logger secret registration in the CLI.
           Authorization: `Bearer ${config.slackBotToken}`,
         },
-        body: JSON.stringify({
-          channel: config.slackChannelId,
-          text: message.text,
-          ...(message.blocks ? { blocks: message.blocks } : {}),
-        }),
+        body: JSON.stringify(body),
       });
     }
     return fetchImpl(config.slackWebhookUrl, {
       method: 'POST',
       signal,
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        text: message.text,
-        ...(message.blocks ? { blocks: message.blocks } : {}),
-      }),
+      body: JSON.stringify(body),
     });
   }
 
@@ -137,12 +157,44 @@ export function createSlackSender({
      * @throws {SlackPermanentError} permanent failure — do not retry
      * @throws {SlackRetryableError} transient failure after all retries
      */
-    async send(message) {
+    async send(rawMessage) {
+      // Last-mile mention control. A message may keep ONE `<!channel>` only if
+      // it carries the notification pipeline's explicit internal
+      // authorization; every other broad mention — `<!channel>`, `<!here>`,
+      // `<!everyone>` and labeled variants such as `<!channel|channel>` — is
+      // stripped from the text and from every block. Authorization is never
+      // inferred from message content, so an audit-controlled string cannot
+      // buy one, and a payload stored before this change (no authorization
+      // field) is stripped exactly as it was before. The stored notification
+      // row is never rewritten — only what we transmit. The same call removes
+      // the internal field, so it never reaches Slack.
+      const policy = mentionPolicyOf(rawMessage);
+      const message = sanitizeSlackMessage(rawMessage);
+      const body = requestBody(message);
+
+      // Independent confirmation of the final outbound payload, after the
+      // Slack-supported fields have been selected. Exceeding the allowance
+      // means a bug in the sanitizer, so we refuse to transmit rather than
+      // risk paging a channel on every retry. Fewer tokens than allowed is
+      // always safe and is delivered normally.
+      const allowed = policy === CHANNEL_MENTION_MODE ? 1 : 0;
+      const found = countBroadMentions(body);
+      if (found > allowed) {
+        throw new SlackPermanentError(
+          `Refusing to send: outbound payload carries ${found} broad mention(s), at most ${allowed} allowed`,
+        );
+      }
+      if (found === 1) {
+        logger?.debug?.('Delivering an authorized Production critical alert with one <!channel>');
+      } else if (countBroadMentions(rawMessage) > found) {
+        logger?.debug?.('Stripped an unauthorized broad mention from a Slack payload before delivery');
+      }
+
       let lastReason = 'unknown';
       for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
         let outcome;
         try {
-          const res = await requestOnce(message);
+          const res = await requestOnce(body);
           outcome = await classify(res);
         } catch (err) {
           if (err instanceof SlackPermanentError) throw err;

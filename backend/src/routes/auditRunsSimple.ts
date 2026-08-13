@@ -10,6 +10,7 @@ import type { Request, Response } from 'express';
 import type { PoolClient } from 'pg';
 import { getDb } from '../lib/db.js';
 import { normalizeProjectDomain } from '../lib/normalizeProjectDomain.js';
+import { ageInMinutes, staleAuditTimeoutMinutes } from '../lib/staleAuditRuns.js';
 import { runSiteChecks } from '../services/checks/siteChecks.js';
 import { runCanonicalCheck, detectPageType, detectPageTypeWithHtml } from '../services/checks/page/canonicalCheck.js';
 import { runStructuredDataCheck } from '../services/checks/page/structuredDataCheck.js';
@@ -363,10 +364,38 @@ auditRunsRouter.post('/technical-analyzer/run', async (req: Request, res: Respon
         if (!site) throw new Error('Site resolution returned no row');
         const selectedSite = site;
         const isBeta = selectedSite.is_beta === true;
+
+        // ── Stale RUNNING recovery ────────────────────────────────
+        // Still inside the same transaction, holding the same
+        // normalized-domain advisory lock and the same site row lock, so the
+        // lock ordering is unchanged and two concurrent POSTs cannot both
+        // recover the same row. Only RUNNING rows older than the cutoff are
+        // touched — COMPLETED and already-FAILED history is never rewritten.
+        const staleTimeoutMinutes = staleAuditTimeoutMinutes();
+        const recovered = await tx.query<{ id: string; started_at: Date }>(
+          `UPDATE audit_runs
+              SET status = 'FAILED', finished_at = NOW()
+            WHERE site_id = $1
+              AND status = 'RUNNING'
+              AND started_at < NOW() - make_interval(mins => $2::int)
+          RETURNING id, started_at`,
+          [selectedSite.id, staleTimeoutMinutes],
+        );
+        for (const row of recovered.rows) {
+          const age = ageInMinutes(row.started_at);
+          console.warn(
+            `[audit:stale] Recovered stale audit run ${row.id} (site ${selectedSite.id}): ` +
+              `RUNNING for ${age ?? 'an unknown number of'} minute(s), cutoff ${staleTimeoutMinutes} minute(s) — ` +
+              'marked FAILED; a replacement audit is now allowed',
+          );
+        }
+
+        // Authoritative re-check AFTER recovery: a fresh RUNNING row still
+        // wins and this request is still rejected with 409.
         const running = await tx.query<{ id: string }>(
           `SELECT id FROM audit_runs
            WHERE site_id = $1 AND status = 'RUNNING'
-           ORDER BY created_at DESC LIMIT 1`,
+           ORDER BY started_at DESC LIMIT 1`,
           [selectedSite.id],
         );
         if (running.rows.length > 0) {
@@ -452,14 +481,26 @@ auditRunsRouter.post('/technical-analyzer/run', async (req: Request, res: Respon
               }
             }
 
-            await db.query(
-              `UPDATE audit_runs SET status = 'COMPLETED', finished_at = NOW() WHERE id = $1`,
+            // Conditional on RUNNING: if this run was already recovered as
+            // stale (and marked FAILED) while the background work dragged on,
+            // a late completion must NOT resurrect it as COMPLETED. Its
+            // audit_results rows are still written and preserved.
+            const completed = await db.query(
+              `UPDATE audit_runs SET status = 'COMPLETED', finished_at = NOW()
+                WHERE id = $1 AND status = 'RUNNING'`,
               [committedAuditRun.id],
             );
+            if (completed.rowCount === 0) {
+              console.warn(
+                `[audit:stale] Audit run ${committedAuditRun.id} finished after it was already ` +
+                  'recovered or terminated — leaving the recorded terminal status untouched',
+              );
+            }
           } catch (err) {
             console.error('[audit] Background audit error:', err);
             await db.query(
-              `UPDATE audit_runs SET status = 'FAILED', finished_at = NOW() WHERE id = $1`,
+              `UPDATE audit_runs SET status = 'FAILED', finished_at = NOW()
+                WHERE id = $1 AND status = 'RUNNING'`,
               [committedAuditRun.id],
             ).catch(() => {});
           }

@@ -8,6 +8,7 @@
  * Endpoints:
  *   GET    /api/projects                          — list all projects
  *   POST   /api/projects                          — create (201) / update existing (200)
+ *                                                   with create_only:true → create (201) / conflict (409)
  *   GET    /api/projects/:id                      — single project + stats
  *   PATCH  /api/projects/:id                      — update name and/or environment
  *   DELETE /api/projects/:id                      — delete project (cascades)
@@ -24,6 +25,7 @@ import {
   parseProjectFormValues,
   isAutomationReady,
 } from '../lib/projectInput.js';
+import { staleAuditTimeoutMinutes } from '../lib/staleAuditRuns.js';
 
 export const projectsRouter = Router();
 
@@ -91,7 +93,66 @@ projectsRouter.post('/projects', async (req: Request, res: Response) => {
     return;
   }
 
-  const { domain, websiteUrl, projectName, isBeta, formValues } = parsed;
+  const { domain, websiteUrl, projectName, isBeta, formValues, createOnly, withAuditConfig } = parsed;
+
+  // ── create-only contract ────────────────────────────────────────
+  //
+  // A single atomic statement: either this request inserts the row or the row
+  // already existed and nothing happens. There is deliberately no SELECT-then-
+  // INSERT here — a check-then-write would leave a window in which a concurrent
+  // creation turns this call into an update of somebody else's project. There
+  // is equally no create-then-PATCH: the audit configuration, when explicitly
+  // requested, is part of the same INSERT, so a project can never exist in a
+  // half-configured state and a conflict can never lead to a follow-up write.
+  //
+  // ON CONFLICT (domain) DO NOTHING means an existing project is not touched at
+  // all: no UPDATE runs, so project_name, website_url, is_beta,
+  // last_form_values, created_at and updated_at all keep their stored values.
+  //
+  // Without with_audit_config the last_form_values parameter is NULL, so a
+  // created row starts NULL and is never automation-ready.
+  if (createOnly) {
+    const configuredValues = withAuditConfig && formValues ? JSON.stringify(formValues) : null;
+    try {
+      const inserted = await db.query<Record<string, unknown>>(
+        `INSERT INTO sites (domain, project_name, website_url, is_beta, last_form_values, updated_at)
+         VALUES ($1, $2, $3, COALESCE($4::boolean, FALSE), $5::jsonb, NOW())
+         ON CONFLICT (domain) DO NOTHING
+         RETURNING *`,
+        [domain, projectName, websiteUrl, isBeta, configuredValues],
+      );
+
+      if (!inserted.rows.length) {
+        // Read-only lookup so the caller can identify the blocking row. This
+        // runs after the insert attempt, writes nothing, and is deliberately
+        // NOT followed by a PATCH — a conflict ends the request.
+        const existing = await db.query<{ id: string; domain: string }>(
+          'SELECT id, domain FROM sites WHERE domain = $1',
+          [domain],
+        );
+        res.status(409).json({
+          error: `A project already exists for ${domain}`,
+          created: false,
+          conflict: true,
+          domain,
+          existing_project_id: existing.rows[0]?.id ?? null,
+        });
+        return;
+      }
+
+      const project = inserted.rows[0];
+      res.status(201).json({
+        project: withAutomationReady(project),
+        created: true,
+        conflict: false,
+        automation_ready: isAutomationReady(project.last_form_values),
+      });
+    } catch (err) {
+      console.error('POST /api/projects (create_only) error:', err);
+      res.status(500).json({ error: 'Failed to create project' });
+    }
+    return;
+  }
 
   try {
     // `xmax = 0` is true only for a freshly inserted row, so a single
@@ -134,17 +195,33 @@ projectsRouter.get('/projects/:id', async (req: Request, res: Response) => {
   if (!db) return;
 
   try {
+    // `running_count` counts only NON-STALE running audits. The runner uses it
+    // as a pre-flight check and skips the project entirely when it is > 0, so a
+    // crashed row left RUNNING forever would block that project permanently —
+    // POST-side recovery alone could never be reached. This read stays strictly
+    // read-only: nothing is recovered here. Excluding stale rows only lets the
+    // runner proceed to POST, where the authoritative transactional recovery
+    // happens under the existing locks. `stale_running_count` is exposed for
+    // observability.
+    const staleTimeoutMinutes = staleAuditTimeoutMinutes();
     const { rows } = await db.query(
       `SELECT
          s.*,
          COUNT(ar.id)::int                                           AS audit_count,
          COUNT(ar.id) FILTER (WHERE ar.status = 'COMPLETED')::int   AS completed_count,
-         COUNT(ar.id) FILTER (WHERE ar.status = 'RUNNING')::int     AS running_count
+         COUNT(ar.id) FILTER (
+           WHERE ar.status = 'RUNNING'
+             AND ar.started_at >= NOW() - make_interval(mins => $2::int)
+         )::int                                                      AS running_count,
+         COUNT(ar.id) FILTER (
+           WHERE ar.status = 'RUNNING'
+             AND ar.started_at < NOW() - make_interval(mins => $2::int)
+         )::int                                                      AS stale_running_count
        FROM sites s
        LEFT JOIN audit_runs ar ON ar.site_id = s.id
        WHERE s.id = $1
        GROUP BY s.id`,
-      [req.params.id],
+      [req.params.id, staleTimeoutMinutes],
     );
     if (!rows.length) {
       res.status(404).json({ error: 'Project not found' });

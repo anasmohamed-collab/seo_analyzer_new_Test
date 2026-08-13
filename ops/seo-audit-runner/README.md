@@ -102,7 +102,7 @@ SLACK_BOT_TOKEN=
 SLACK_CHANNEL_ID=
 SLACK_WEBHOOK_URL=
 
-SLACK_CRITICAL_MENTION=channel
+SLACK_CRITICAL_MENTION=none
 SLACK_REQUEST_TIMEOUT_MS=15000
 SLACK_MAX_RETRIES=4
 SLACK_MAX_ISSUES_PER_MESSAGE=20
@@ -137,13 +137,21 @@ identity**. Private routing alone is not authentication. Therefore:
 
 ### Preferred: bot token (`chat.postMessage`)
 
+The intended alert channel is **`#seo_analyzer_bot`**. The runner never
+resolves that name: it posts to whatever immutable channel ID
+`SLACK_CHANNEL_ID` holds, and performs **no channel-name lookup and no Slack
+discovery call**. Configuring the ID that corresponds to `#seo_analyzer_bot` is
+an operator responsibility.
+
 1. Create a Slack app for your workspace (api.slack.com → *Create New App*).
 2. Add the **`chat:write`** bot scope and install the app to the workspace.
 3. Copy the **Bot User OAuth Token** (`xoxb-…`) → `SLACK_BOT_TOKEN`.
 4. Use the **channel ID** (e.g. `C0123456789`, from the channel's details
-   page), NOT the channel name → `SLACK_CHANNEL_ID`.
-5. For private channels, **invite the bot** to the channel
-   (`/invite @your-bot`), otherwise Slack returns `not_in_channel`.
+   page), NOT the channel name → `SLACK_CHANNEL_ID`. It must be the ID of
+   `#seo_analyzer_bot`.
+5. **Invite the bot** to `#seo_analyzer_bot` (`/invite @your-bot`); otherwise
+   Slack returns `not_in_channel`. Required for private channels, and the
+   simplest way to guarantee delivery for public ones.
 
 ### Fallback: incoming webhook
 
@@ -162,35 +170,77 @@ without channel ID or vice versa) is always a configuration error.
 | `summary_only` | Project-level counts only, no individual issues. |
 | `disabled` | Never send Slack messages — issue lifecycle state is still updated after successful audits. |
 
-### Critical mentions (`SLACK_CRITICAL_MENTION`)
+### Broad mentions (`SLACK_CRITICAL_MENTION`) — off by default, opt-in for Production P0
 
-| Value | Slack token | Who is notified |
-|---|---|---|
-| `channel` *(default)* | `<!channel>` | **all members of the Slack channel**, online or not |
-| `here` | `<!here>` | only the **currently active** members of the channel |
-| `everyone` | `<!everyone>` | everyone in the workspace — **only appropriate for `#general`** |
-| `none` | *(none)* | disables critical mentions entirely |
+The default is **no mention on any message**. An operator may opt in to a
+single `<!channel>` (`@channel`) on genuine Production critical alerts.
+`<!here>` and `<!everyone>` are never activated, and the literal string `@all`
+is never emitted.
 
-Rules:
+| Value | Effect |
+|---|---|
+| *(omitted)* / `none` *(default)* | no broad mention on any message |
+| `channel` | **opt-in:** one `<!channel>` on a Production critical alert that reports a NEW or REOPENED P0 |
+| `here` / `everyone` | **accepted, then neutralized to `none`** so existing env files keep validating; neither can become active |
+| anything else | **configuration error** — `validate-config` fails rather than guessing |
 
-- The mention is added **only** when the alert contains at least one **new or
-  reopened P0** issue, and then exactly once, in the first line (so it is
-  present in both the plain-text fallback and the first mrkdwn block).
-- **Unchanged-only** and **resolved-only** alerts carry no mention.
-- **Run summaries never contain a broad mention**, and neither do ordinary
-  informational or failure messages.
-- The literal string `@all` is never emitted.
-- An invalid value is a **configuration error** (`validate-config` fails) —
-  the runner never silently falls back to a different mention type. Use
-  `none` to switch mentions off.
-- **Slack workspace permissions may restrict broad mentions.** If the posting
-  identity is not allowed to use `@channel`/`@here`, Slack still delivers the
-  message but renders the mention as plain text without notifying anyone.
+`validate-config` and `status` print the effective value and whether a broad
+value was neutralized, so nothing is silent.
+
+**Exact eligibility.** With `SLACK_CRITICAL_MENTION=channel`, the mention is
+rendered only when **all** of the following hold:
+
+1. the message is a project-level critical SEO alert,
+2. the project is Production (`is_beta !== true`),
+3. the notification-eligible lifecycle contains at least one **NEW** or
+   **REOPENED** P0,
+4. Slack notifications and the project's alert mode already permit the message
+   to be sent.
+
+A message that reports a NEW/REOPENED P0 *and* other lifecycle buckets mentions
+the channel **once** — the mention is authorized by the NEW/REOPENED P0, not by
+the other buckets. Everything else stays mention-free: P1/P2 findings, page
+PASS/WARN/FAIL promotions, **Beta Exposure alerts**, UNCHANGED-only and
+RESOLVED-only alerts, **run summaries**, zero-completed-audit summaries,
+operational and trigger failures, incomplete evidence, timed-out or failed
+audits, skipped/deferred projects, health and doctor output, audit-config
+discovery, notification previews and dry runs, and ordinary runner logs. No
+P0/P1/P2 scoring rule changed to make this work.
+
+**Authorization is data, never text.** The decision travels from configuration
+through the notification pipeline to the formatter as an explicit value; no
+code path grants a mention by searching a rendered message, alert title, or any
+audit-controlled string. The formatter inserts exactly one token at the start
+of the visible header block and deliberately keeps no copy in the top-level
+fallback text, so the payload carries it exactly once in total. Audit-supplied
+content is escaped (`<` → `&lt;`), so an issue title, message, URL, project
+name, recommendation, or fix hint cannot inject one.
+
+**Last-mile control.** Slack delivery re-checks every payload immediately
+before transmitting, on the first send and on every `retry-notifications`
+replay: at most the ONE authorized `<!channel>` survives, and every other broad
+mention — including `<!here>`, `<!everyone>`, and labeled variants such as
+`<!channel|channel>` — is stripped from the top-level text and from every
+mrkdwn block. Authorization is carried by an internal field on the message,
+which is removed before the request is built, so only Slack-supported fields
+are transmitted on both the bot-token and webhook methods.
+
+**Persistence and retry.** The authorization is persisted inside the
+notification payload, so a legitimate retry of an authorized alert still
+delivers exactly one mention. A row stored **before** this change has no
+authorization field and is therefore stripped of every broad mention at
+delivery — old queued messages are never authorized retroactively, and no
+historical row is rewritten. Delivered notifications are still never resent,
+retries never rerun an audit, and retries never modify issue lifecycle state.
+
+**Enabling it is a separate operator action.** Setting
+`SLACK_CRITICAL_MENTION=channel` on a host is a deliberate change made outside
+this repository. **No real Slack validation of the mention has been executed** —
+the behavior above is covered by unit tests with mocked HTTP only.
 
 ### Message format
 
-A critical alert is one short message: header (with the mention when it
-applies), project name (falling back to the normalized domain), P0 counts,
+A critical alert is one short message: header, project name (falling back to the normalized domain), P0 counts,
 **at most 5** issues — each one line of title + page type, the URL, and the
 canonical fix hint capped at 180 characters — a `+ N more critical issues`
 remainder when there are more, a compact technical line
@@ -216,6 +266,7 @@ current-critical-state conclusion was produced.
 ```bash
 seo-audit-runner init                     # explicit state create/migrate (idempotent)
 seo-audit-runner validate-config          # config + state dir + state DB (offline)
+seo-audit-runner version                  # release identity (see below)
 seo-audit-runner list-projects            # read-only listing with dedupe preview
 seo-audit-runner run --all                # audit every eligible, deduplicated project
 seo-audit-runner run --project PROJECT_ID # audit one project
@@ -280,7 +331,7 @@ Full specification: **`docs/CLI_CONTRACT.md`**. In short:
 
 ### Read-only commands
 
-`init`, `validate-config`, `list-projects`, `status`, `health`, `doctor`,
+`init`, `validate-config`, `version`, `list-projects`, `status`, `health`, `doctor`,
 `job list`, `job show`, `schedule list`, `retry-notifications --dry-run`, and
 `run --dry-run` never trigger an audit, send a notification, create a job or
 schedule, or write any row. Tests enforce this by snapshotting row counts and
@@ -507,3 +558,55 @@ real audits are started and no real Slack messages are sent.
 - Fingerprints are versioned (`v2` since Phase 3.1). The v2 change re-bases
   identities once: on the first run after upgrading, previously tracked
   issues resolve and reappear as new in a single transition.
+
+## Release identity and the deployment parity gate
+
+`seo-audit-runner version` answers **which reviewed commit is this runner?** —
+the RUNNER_SHA half of
+
+```
+REPO_SHA == APP_SHA == RUNNER_SHA
+```
+
+```bash
+sudo -u seo-runner seo-audit-runner version
+sudo -u seo-runner seo-audit-runner version --output json
+```
+
+It prints the package version, the **full** Git SHA, the release stamp, the
+release checksum, and the Node version. It loads no env file, no configuration
+and no secret, and creates no state — so it works on a half-configured host.
+
+`.release-stamp` (when it was installed) and `.release-checksum` (what the
+files hash to) are **not** repository identity: two different commits can
+produce byte-identical runner files. `.release-sha`, recorded by the installer,
+is. A different commit therefore produces a **new release** even when the files
+are unchanged, so the recorded identity can never name a stale commit.
+
+**Supplying the SHA**
+
+| Situation | How |
+|---|---|
+| git checkout | automatic — derived from `git rev-parse HEAD` in `--source` |
+| archive / tarball | `install.sh --git-sha <full-sha>` or `upgrade.sh --git-sha <full-sha>` |
+| either | `SEO_RUNNER_GIT_SHA=<full-sha>` in the installing shell |
+
+Only a **full** 40- or 64-character hex SHA is accepted; an abbreviated or
+malformed value is rejected outright rather than recorded. When no SHA is
+available the installer warns, records nothing, and `version` reports
+`unknown` — which fails the gate, by design.
+
+**Verifying all three sides** (every command read-only):
+
+```bash
+git -C <checkout> rev-parse HEAD                                    # REPO_SHA
+curl -s https://<app-host>/api/build-info | jq -r .gitSha           # APP_SHA
+sudo -u seo-runner seo-audit-runner version --output json \
+  | jq -r .data.gitSha                                              # RUNNER_SHA
+```
+
+The application side is injected at build/deploy time via `APP_GIT_SHA`
+(`docker build --build-arg APP_GIT_SHA="$(git rev-parse HEAD)"`, or a runtime
+variable on Nixpacks and similar platforms); common platform-provided variables
+are read automatically. An uninjected value is reported as `gitSha: null`, never
+fabricated.

@@ -10,10 +10,9 @@
  *  - a critical alert is ONE short, scannable message: header, project, P0
  *    counts, at most MAX_VISIBLE_CRITICAL_ISSUES issues, technical checks,
  *    short audit id
- *  - a channel-wide mention is added by the caller ONLY for new/reopened P0
- *    issues, exactly once, in the first line (so it is present both in the
- *    plain-text fallback and in the first mrkdwn section block)
- *  - run summaries NEVER carry a broad mention
+ *  - the ONLY broad mention this module can emit is a single `<!channel>` on a
+ *    Production critical alert that the CALLER explicitly authorized; every
+ *    other token is stripped (see the mention section below)
  *  - presentation-only cleanup: the stored audit finding is never modified
  *  - safe mrkdwn escaping of &, <, > for every value that came from the audit
  *  - blocks always accompany a populated plain-text fallback
@@ -32,24 +31,180 @@ export const MAX_TITLE_CHARACTERS = 160;
 /** Visible prefix length of an audit-run / execution UUID. */
 export const SHORT_ID_LENGTH = 8;
 
-// ── Channel-wide mentions ───────────────────────────────────────────
+// ── Broad mentions: one narrowly authorized token, everything else stripped ──
+//
+// A runner alert may page the whole alert channel in EXACTLY one case: a
+// Production critical alert whose lifecycle contains a notification-eligible
+// NEW or REOPENED P0, when the operator has opted in with
+// `SLACK_CRITICAL_MENTION=channel`. Everything else — Beta exposure alerts,
+// unchanged/resolved-only alerts, run summaries, failure notices — is
+// mention-free, and `<!here>` / `<!everyone>` are never emitted at all.
+//
+// Authorization is DATA, never text. The pipeline decides and stamps the
+// message with an internal `mentionPolicy` field; nothing here (or in the
+// Slack client) ever infers authorization by reading the rendered message,
+// the alert title, or any audit-controlled string. The internal field is
+// removed again by `sanitizeSlackMessage()` before the payload is transmitted.
+//
+// `sanitizeSlackMessage()` is the last-mile control: it keeps at most the ONE
+// authorized `<!channel>` and strips every other broad-mention token, in every
+// form Slack accepts, from the top-level text and from every block. A payload
+// serialized into SQLite before this change carries no `mentionPolicy`, so a
+// `retry-notifications` replay of it is stripped exactly as before.
 
+/** Accepted values of SLACK_CRITICAL_MENTION. */
 export const SLACK_CRITICAL_MENTION_MODES = Object.freeze(['channel', 'here', 'everyone', 'none']);
+/** Values naming a broad mention (`channel` is the only honored one). */
+export const BROAD_MENTION_MODES = Object.freeze(['channel', 'here', 'everyone']);
+/** Broad values that stay neutralized to `none` — never activated. */
+export const NEUTRALIZED_MENTION_MODES = Object.freeze(['here', 'everyone']);
+/** No broad mention. The default, and the effect of every unlisted value. */
+export const NO_MENTION_MODE = 'none';
+/** The one opt-in mention mode the runner honors. */
+export const CHANNEL_MENTION_MODE = 'channel';
+/** Values `loadConfig()` may return for `slackCriticalMention`. */
+export const HONORED_MENTION_MODES = Object.freeze([CHANNEL_MENTION_MODE, NO_MENTION_MODE]);
 
-const MENTION_TOKENS = Object.freeze({
-  channel: '<!channel>',
-  here: '<!here>',
-  everyone: '<!everyone>',
-  none: null,
-});
+/** The exact token sent to Slack — `@channel`, never `@everyone`/`@here`. */
+export const AUTHORIZED_CHANNEL_MENTION = '<!channel>';
 
 /**
- * Slack token for a configured mention mode, or null when no mention applies.
- * An unknown mode yields null (no mention) — configuration validation rejects
- * unknown values up front, so this never silently substitutes another mention.
+ * Internal, non-Slack field carrying the pipeline's mention authorization on a
+ * message object. It is persisted with the notification payload so a retry of
+ * an authorized message stays authorized, and it is deleted before the payload
+ * is handed to Slack.
  */
-export function criticalMentionToken(mode) {
-  return MENTION_TOKENS[String(mode ?? '').trim().toLowerCase()] ?? null;
+export const MENTION_POLICY_FIELD = 'mentionPolicy';
+
+/**
+ * Slack's broad-mention tokens, in every form Slack itself accepts:
+ * `<!channel>`, `<!here|here>`, `<!everyone>`, …
+ *
+ * Non-global on purpose so `.test()` callers cannot trip over `lastIndex`.
+ */
+export const BROAD_MENTION_PATTERN = /<!(?:channel|here|everyone)(?:\|[^>]*)?>/i;
+
+// Global variant plus the horizontal whitespace around the token, so removing
+// a leading `<!channel> ` does not leave the line indented by one space.
+const BROAD_MENTION_WITH_PADDING = /[ \t]*<!(?:channel|here|everyone)(?:\|[^>]*)?>[ \t]*/gi;
+
+// Global, padding-free variant used only for counting.
+const BROAD_MENTION_GLOBAL = /<!(?:channel|here|everyone)(?:\|[^>]*)?>/gi;
+
+/**
+ * The mention authorization a message object carries, defaulting to `none`.
+ * Anything other than the exact internal `channel` marker means no mention —
+ * a legacy stored payload has no field at all and so is never authorized.
+ */
+export function mentionPolicyOf(message) {
+  return message && typeof message === 'object' && message[MENTION_POLICY_FIELD] === CHANNEL_MENTION_MODE
+    ? CHANNEL_MENTION_MODE
+    : NO_MENTION_MODE;
+}
+
+/** Total broad-mention tokens in an arbitrary value (used by delivery guards). */
+export function countBroadMentions(value) {
+  if (value == null) return 0;
+  const text = typeof value === 'string' ? value : JSON.stringify(value) ?? '';
+  return text.match(BROAD_MENTION_GLOBAL)?.length ?? 0;
+}
+
+/** A budget of authorized tokens, shared across one message's text and blocks. */
+function createMentionAllowance(policy) {
+  return { remaining: policy === CHANNEL_MENTION_MODE ? 1 : 0 };
+}
+
+/**
+ * Enforce a mention allowance over one text: keep the first exact
+ * `<!channel>` while the allowance lasts, remove every other broad-mention
+ * token and close the gap it leaves.
+ *
+ * Only lines from which a token was actually removed are re-trimmed, so
+ * intentional indentation elsewhere in the message is preserved, and a kept
+ * token keeps its original spacing. Newlines are never eaten.
+ */
+function enforceBroadMentions(text, allowance) {
+  if (typeof text !== 'string' || !text) return text;
+  if (!BROAD_MENTION_PATTERN.test(text)) return text;
+  return text
+    .split('\n')
+    .map((line) => {
+      if (!BROAD_MENTION_PATTERN.test(line)) return line;
+      let removed = false;
+      const next = line.replace(BROAD_MENTION_WITH_PADDING, (match) => {
+        // Only the exact, unlabeled, lower-case token can ever be authorized;
+        // `<!channel|channel>` and `<!CHANNEL>` are treated as unauthorized.
+        if (allowance.remaining > 0 && match.trim() === AUTHORIZED_CHANNEL_MENTION) {
+          allowance.remaining--;
+          return match;
+        }
+        removed = true;
+        return ' ';
+      });
+      return removed ? next.replace(/^[ \t]+/, '').replace(/[ \t]+$/, '') : next;
+    })
+    .join('\n');
+}
+
+/**
+ * Remove every broad-mention token from a text, closing the gap it leaves.
+ * Unconditional — used for audit-controlled content, which can never carry an
+ * authorized mention.
+ */
+export function stripBroadMentions(text) {
+  return enforceBroadMentions(text, createMentionAllowance(NO_MENTION_MODE));
+}
+
+/**
+ * Return the outbound copy of a Slack message: at most the one `<!channel>`
+ * the message was explicitly authorized to carry, every other broad mention
+ * removed from the top-level text and from all mrkdwn block texts, and the
+ * internal authorization field deleted so only Slack-supported fields remain.
+ *
+ * The input is never mutated — stored notification history stays exactly as it
+ * was written, and a retry re-derives the same outbound payload from it.
+ */
+export function sanitizeSlackMessage(message) {
+  if (!message || typeof message !== 'object') return message;
+
+  const policy = mentionPolicyOf(message);
+  const allowance = createMentionAllowance(policy);
+
+  // Text first, then blocks in order, so the surviving token is deterministic.
+  const text = enforceBroadMentions(message.text, allowance);
+  const blocks = Array.isArray(message.blocks)
+    ? message.blocks.map((block) => {
+        if (!block || typeof block !== 'object') return block;
+        let next = block;
+        if (block.text && typeof block.text === 'object' && typeof block.text.text === 'string') {
+          const cleaned = enforceBroadMentions(block.text.text, allowance);
+          if (cleaned !== block.text.text) next = { ...next, text: { ...block.text, text: cleaned } };
+        }
+        if (Array.isArray(block.elements)) {
+          const elements = block.elements.map((el) =>
+            el && typeof el === 'object' && typeof el.text === 'string'
+              ? { ...el, text: enforceBroadMentions(el.text, allowance) }
+              : el,
+          );
+          if (elements.some((el, i) => el !== block.elements[i])) next = { ...next, elements };
+        }
+        return next;
+      })
+    : message.blocks;
+
+  const textChanged = text !== message.text;
+  const blocksChanged = Array.isArray(message.blocks) && blocks.some((b, i) => b !== message.blocks[i]);
+  const carriesPolicy = Object.hasOwn(message, MENTION_POLICY_FIELD);
+  if (!textChanged && !blocksChanged && !carriesPolicy) return message;
+
+  const outbound = {
+    ...message,
+    ...(textChanged ? { text } : {}),
+    ...(blocksChanged ? { blocks } : {}),
+  };
+  // Internal metadata never reaches Slack, on either delivery method.
+  delete outbound[MENTION_POLICY_FIELD];
+  return outbound;
 }
 
 // ── Technical checks (robots.txt / XML sitemap / News sitemap) ──────
@@ -327,16 +482,17 @@ function displayDomain(domain) {
  * When nothing is listed the line states the current state explicitly, so a
  * resolved-only alert can never be read as "N open critical issues".
  */
-function countsLine(counts, mode) {
+function countsLine(counts, mode, { isBeta = false } = {}) {
   const parts = [];
   if (counts.new > 0) parts.push(`${counts.new} new`);
   if (counts.reopened > 0) parts.push(`${counts.reopened} reopened`);
   if (mode === 'all_current' && counts.unchanged > 0) parts.push(`${counts.unchanged} unchanged`);
 
   let line;
-  if (parts.length > 0) line = `*P0:* ${parts.join(', ')}`;
-  else if (counts.current > 0) line = `*P0:* ${counts.current} current`;
-  else line = '*P0:* none currently open';
+  const label = isBeta ? 'Exposure findings' : 'P0';
+  if (parts.length > 0) line = `*${label}:* ${parts.join(', ')}`;
+  else if (counts.current > 0) line = `*${label}:* ${counts.current} current`;
+  else line = `*${label}:* none currently open`;
 
   if (counts.resolved > 0) line += ` | *Resolved:* ${counts.resolved}`;
   return line;
@@ -382,9 +538,11 @@ function enforceCharacterBudget(text, maxMessageCharacters) {
  * @param mode 'new_or_regressed' | 'all_current' | 'summary_only'
  * @param lifecycle {{ new: [], reopened: [], unchanged: [], resolved: [] }}
  * @param siteChecks `siteChecks` from the COMPLETED audit result (never fetched here)
- * @param mention Slack mention token, or null — the caller decides whether the
- *                notification qualifies (new / reopened P0 only)
- * @returns array of { text, blocks } messages (exactly 1)
+ * @param mentionPolicy caller's explicit authorization: 'channel' | 'none'.
+ *        Honored only for a NON-Beta alert that actually lists a NEW or
+ *        REOPENED finding — the caller's decision is re-checked here against
+ *        structured lifecycle data, never against the rendered text.
+ * @returns array of { text, blocks, mentionPolicy? } messages (exactly 1)
  */
 export function buildProjectMessages({
   projectName,
@@ -396,7 +554,8 @@ export function buildProjectMessages({
   lifecycle,
   mode,
   siteChecks = null,
-  mention = null,
+  isBeta = false,
+  mentionPolicy = NO_MENTION_MODE,
   maxIssuesPerMessage = MAX_VISIBLE_CRITICAL_ISSUES,
   maxMessageCharacters = 30_000,
 }) {
@@ -426,10 +585,10 @@ export function buildProjectMessages({
   const shownDomain = displayDomain(domain);
 
   const lines = [
-    `:rotating_light: ${mention ? `${mention} ` : ''}*Critical SEO Alert*`,
+    `${isBeta ? ':warning:' : ':rotating_light:'} *${isBeta ? 'Beta SEO Exposure Alert' : 'Critical SEO Alert'}*`,
     '',
     `*${escapeSlack(label)}*${shownDomain && shownDomain !== label ? ` — \`${escapeSlack(shownDomain)}\`` : ''}`,
-    countsLine(counts, mode),
+    countsLine(counts, mode, { isBeta }),
   ];
 
   if (visible.length > 0) {
@@ -453,8 +612,30 @@ export function buildProjectMessages({
   if (dashboardUrl) auditParts.push(escapeSlack(dashboardUrl));
   lines.push(auditParts.join(' | '));
 
-  const text = enforceCharacterBudget(lines.join('\n'), maxMessageCharacters);
-  return [{ text, blocks: textToBlocks(text) }];
+  // Audit-controlled values are already escaped (`<` → `&lt;`), so no finding
+  // can spell a mention token. Stripping the assembled body unconditionally is
+  // belt-and-braces: whatever happens above, the ONLY token in the outgoing
+  // message is the one this function adds on the next lines.
+  const text = stripBroadMentions(enforceCharacterBudget(lines.join('\n'), maxMessageCharacters));
+  const blocks = textToBlocks(text);
+
+  // Re-check the caller's authorization against structured lifecycle data, not
+  // against the rendered message: Production only, and only when a
+  // notification-eligible NEW or REOPENED finding is actually being reported.
+  const mentionAuthorized =
+    mentionPolicy === CHANNEL_MENTION_MODE && isBeta !== true && counts.new + counts.reopened > 0;
+  if (!mentionAuthorized) return [{ text, blocks }];
+
+  // Exactly one token, at the start of the visible header. `text` is the
+  // notification fallback and deliberately keeps no copy of it, so the payload
+  // Slack receives carries the token exactly once in total. The header block
+  // stays within Slack's 3000-character section limit: chunks are cut at
+  // BLOCK_TEXT_LIMIT (2900) and the token adds 11 characters.
+  blocks[0] = {
+    ...blocks[0],
+    text: { ...blocks[0].text, text: `${AUTHORIZED_CHANNEL_MENTION} ${blocks[0].text.text}` },
+  };
+  return [{ text, blocks, [MENTION_POLICY_FIELD]: CHANNEL_MENTION_MODE }];
 }
 
 // ── Run summary ─────────────────────────────────────────────────────
@@ -486,7 +667,8 @@ function technicalSummaryLines(technical, completedAudits) {
 /**
  * Build the end-of-execution run summary message.
  *
- * Never contains a broad mention. Zero-valued operational counters are omitted
+ * Never contains a broad mention — there is no mention parameter here, and no
+ * summary is ever stamped as authorized. Zero-valued operational counters are omitted
  * unless they matter, and a run in which NO audit completed gets an explicit
  * "no audits completed" summary rather than a wall of zeros that reads like a
  * clean result.
@@ -502,34 +684,74 @@ export function buildRunSummaryMessage({
   const completed = num(t.completed);
   const deferred = num(t.deferred ?? t.skippedAlreadyRunning);
   const skipped = num(t.skipped ?? t.skippedMissingConfig);
+  const failed = num(t.failed);
+  const triggerFailed = num(t.triggerFailed);
+  const timedOut = num(t.timedOut);
   const triggerUnknown = num(t.triggerOutcomeUnknown);
   const eligible = num(t.eligible ?? t.selected);
   const attempted = num(
-    t.attempted ?? (completed + num(t.failed) + num(t.timedOut) + triggerUnknown),
+    t.attempted ?? (completed + failed + timedOut + triggerUnknown),
   );
+  const totalTriggerFailure =
+    attempted > 0 &&
+    completed === 0 &&
+    triggerFailed === attempted &&
+    failed === attempted &&
+    timedOut === 0 &&
+    triggerUnknown === 0;
+
+  if (totalTriggerFailure) {
+    const lines = [
+      ':rotating_light: *SEO Audit Runner Failure*',
+      '',
+      `${triggerFailed}/${attempted} audit triggers failed.`,
+      'No SEO audits completed.',
+    ];
+
+    const reason = String(t.commonFailureReason ?? '').trim();
+    if (reason) lines.push('', `*Reason:* ${escapeSlack(reason)}`);
+
+    const domains = Array.from(
+      new Set(
+        (Array.isArray(t.failedDomains) ? t.failedDomains : [])
+          .map((domain) => displayDomain(domain))
+          .filter(Boolean),
+      ),
+    );
+    if (domains.length > 0) {
+      const visible = domains.slice(0, MAX_VISIBLE_CRITICAL_ISSUES);
+      let affected = visible.map((domain) => `\`${escapeSlack(domain)}\``).join(', ');
+      if (domains.length > visible.length) affected += `, + ${domains.length - visible.length} more`;
+      lines.push(`*Affected:* ${affected}`);
+    }
+
+    if (deferred + skipped > 0) lines.push(`Deferred/Skipped: ${deferred + skipped}`);
+    if (num(t.notificationFailures) > 0) {
+      lines.push(`Failed Slack notifications: ${num(t.notificationFailures)}`);
+    }
+    lines.push('', `Duration: ${formatDuration(durationMs)} | Execution: \`${escapeSlack(shortId(runnerExecutionId))}\``);
+
+    const text = lines.join('\n');
+    return { text, blocks: textToBlocks(text) };
+  }
 
   const lines = [':clipboard: *SEO Audit Summary*', ''];
 
-  lines.push(
-    `Discovered: ${num(t.discovered)} | Eligible: ${eligible} | Attempted: ${attempted}`,
-  );
-  lines.push(
-    `Completed: ${completed} | Deferred: ${deferred} | Skipped: ${skipped} | ` +
-      `Failed: ${num(t.failed)} | Timed out: ${num(t.timedOut)} | ` +
-      `Trigger unknown: ${triggerUnknown}`,
-  );
+  lines.push(`Discovered: ${num(t.discovered)} | Eligible: ${eligible} | Attempted: ${attempted}`);
 
   if (completed === 0) {
     // No completed audit means no current critical-state conclusion exists —
     // the critical and technical sections are omitted, not printed as zeros.
-    lines.push('', 'No audits completed in this cycle.');
+    lines.push('', attempted === 0 && eligible === 0
+      ? 'No eligible projects were audited.'
+      : 'No audits completed in this cycle.');
   } else {
-    lines.push('');
-    let critical =
-      `Critical projects: ${num(t.projectsWithCritical)} | P0: ${num(t.currentP0)} | ` +
-      `New: ${num(t.newIssues)}`;
-    if (num(t.reopenedIssues) > 0) critical += ` | Reopened: ${num(t.reopenedIssues)}`;
-    critical += ` | Resolved: ${num(t.resolvedIssues)}`;
+    lines.push(`Audited: ${completed}/${attempted} completed`);
+    let critical = `Critical projects: ${num(t.projectsWithCritical)}`;
+    if (num(t.currentP0) > 0) critical += ` | Current P0: ${num(t.currentP0)}`;
+    if (num(t.newIssues) > 0) critical += ` | New P0: ${num(t.newIssues)}`;
+    if (num(t.reopenedIssues) > 0) critical += ` | Reopened P0: ${num(t.reopenedIssues)}`;
+    if (num(t.resolvedIssues) > 0) critical += ` | Resolved P0: ${num(t.resolvedIssues)}`;
     lines.push(critical);
 
     const technical = technicalSummaryLines(t.technical, completed);
@@ -537,6 +759,10 @@ export function buildRunSummaryMessage({
   }
 
   const extras = [];
+  if (deferred + skipped > 0) extras.push(`Deferred/Skipped: ${deferred + skipped}`);
+  if (failed > 0) extras.push(`Failed: ${failed}`);
+  if (timedOut > 0) extras.push(`Timed out: ${timedOut}`);
+  if (triggerUnknown > 0) extras.push(`Trigger unknown: ${triggerUnknown}`);
   if (num(t.deduplicated) > 0) extras.push(`Duplicates skipped: ${num(t.deduplicated)}`);
   if (num(t.notificationFailures) > 0) extras.push(`Failed Slack notifications: ${num(t.notificationFailures)}`);
   if (extras.length > 0) lines.push('', ...extras);

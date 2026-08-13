@@ -47,10 +47,17 @@ RUNNER_REQUIRE_STORED_CONFIG=true
 ```
 
 `RUNNER_EXCLUDE_NONPRODUCTION=true` excludes exact environment labels
-`beta`, `next`, `staging`, `stage`, `dev`, `development`, `test`, `testing`,
-`preview`, `demo`, `sandbox`, `qa`, and `uat`. The project-ID include list is
-the explicit pilot allow-list; the label filter is an additional guard, not a
-replacement for it.
+`beta`, `new`, `next`, `staging`, `stage`, `dev`, `development`, `test`,
+`testing`, `preview`, `demo`, `sandbox`, `qa`, and `uat`. Matching is on whole
+hostname labels, never substrings — `new.example.com` is excluded while
+`newtimes.co.rw` is not. This list matches the GSC sync and audit-config
+discovery classifiers.
+
+A project with a persisted `is_beta=true` is exempt from this filter: an
+explicit classification is authoritative, and Beta projects still run scheduled
+audits (their alerting is narrowed to Critical Exposure findings instead). The
+project-ID include list is the explicit pilot allow-list; the label filter is
+an additional guard, not a replacement for it.
 
 Run `validate-config` after every configuration edit. Record redacted command
 output, the git commit, TEST API origin, project IDs, operator, and timestamp in

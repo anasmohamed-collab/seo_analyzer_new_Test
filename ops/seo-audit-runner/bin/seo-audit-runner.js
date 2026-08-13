@@ -9,7 +9,7 @@
  *   run --all | --project <id> [--dry-run] [--max-concurrency <n>]
  *       [--no-notifications] [--fail-on-critical]
  *   retry-notifications [--limit <n>] [--project <id>] [--dry-run]
- *   status | health | doctor | worker --once | job … | schedule …
+ *   version | status | health | doctor | worker --once | job … | schedule …
  *
  * Exit codes (precedence: 4 > 1 > 3 > 2 > 0):
  *   0  completed successfully
@@ -41,6 +41,7 @@ import {
   formatTextReport,
   summarize,
   EXIT_CODES,
+  OUTCOME,
 } from '../src/report.js';
 import { dedupeProjects } from '../src/dedupe.js';
 import { evaluateProjectEligibility } from '../src/eligibility.js';
@@ -58,6 +59,7 @@ import {
   DEFAULT_LIST_LIMIT,
 } from '../src/cli/manage.js';
 import { createOutput, resolveOutputMode, OutputModeError, ERROR_CODES } from '../src/cli/output.js';
+import { formatReleaseIdentity, readReleaseIdentity } from '../src/releaseIdentity.js';
 
 const USAGE = `Usage: seo-audit-runner <command> [options]
 
@@ -70,6 +72,9 @@ Commands:
   retry-notifications       Retry queued/failed Slack notifications (manual;
                             the tick does this automatically)
   status                    Show runner-owned state (no audits triggered)
+  version                   Print release identity: package version, full Git
+                            SHA, release stamp, release checksum, Node version
+                            (read-only: no config, no secrets, no state)
   health                    Fast health check   (exit 0 healthy / 1 unhealthy / 2 degraded)
   doctor                    Deep diagnostics    (adds integrity, disk, systemd checks)
   worker --once             One scheduler tick: recover, enqueue due schedules,
@@ -193,6 +198,15 @@ async function main() {
     return EXIT_CODES.RUNNER_FAILURE;
   }
 
+  // `version` is answered BEFORE any env file is read, any configuration is
+  // loaded, or any state directory is touched: it must be safe to run on a
+  // half-configured host, and it must never surface a secret.
+  if (command === 'version') {
+    const identity = readReleaseIdentity();
+    out.ok(identity, formatReleaseIdentity(identity));
+    return EXIT_CODES.OK;
+  }
+
   loadEnvFile(values['env-file'] ?? path.join(PACKAGE_ROOT, '.env'));
 
   let config;
@@ -290,8 +304,12 @@ function validateConfigCommand(config, logger, out) {
     `  NOTIFICATIONS_ENABLED   = ${config.notificationsEnabled}`,
     `  Alert mode              = ${config.alertMode}`,
     `  Send run summary        = ${config.sendRunSummary}`,
-    `  SLACK_CRITICAL_MENTION  = ${config.slackCriticalMention} ` +
-      '(new/reopened P0 alerts only; never on run summaries)',
+    `  SLACK_CRITICAL_MENTION  = ${config.slackCriticalMention}` +
+      (config.slackCriticalMentionNeutralized
+        ? ' (here/everyone are neutralized to none — never activated)'
+        : config.slackCriticalMention === 'channel'
+          ? ' (<!channel> on Production critical alerts reporting a NEW or REOPENED P0 only)'
+          : ' (no broad mention on any message)'),
   ];
 
   // Never print configured Slack values — only whether they are set.
@@ -538,6 +556,12 @@ async function runCommand(config, logger, values, out) {
     // ── Run summary notification + automation-run record ─────────
     if (!dryRun && pipeline && stateStore) {
       const s = summarize(report);
+      const triggerFailureEntries = report.entries.filter(
+        (entry) => entry.outcome === OUTCOME.TRIGGER_FAILED,
+      );
+      const triggerFailureReasons = Array.from(
+        new Set(triggerFailureEntries.map((entry) => String(entry.detail ?? '').trim()).filter(Boolean)),
+      );
       const totals = {
         discovered: s.discovered,
         eligible: s.eligible,
@@ -548,6 +572,9 @@ async function runCommand(config, logger, values, out) {
         deferred: s.deferred,
         skipped: s.skipped,
         failed: s.failed,
+        triggerFailed: s.counts[OUTCOME.TRIGGER_FAILED] ?? 0,
+        commonFailureReason: triggerFailureReasons.length === 1 ? triggerFailureReasons[0] : null,
+        failedDomains: triggerFailureEntries.map((entry) => entry.domain).filter(Boolean),
         timedOut: s.timedOut,
         triggerOutcomeUnknown: s.triggerUnknown,
         projectsWithCritical: pipeline.lifecycleTotals.projectsWithCritical,
