@@ -1,10 +1,38 @@
 # Operational Rollout Checklist — SEO audit automation gap fixes
 
-Status: **not executed.** Every step below is an operator action requiring
-separate explicit authorization. Nothing in this checklist was performed while
-the code changes were made: no production data was read or written, no project
-was patched, no audit was triggered, no Slack message was sent, no timer was
-enabled, and nothing was deployed.
+Status: **partially executed — read-only Production preflight only.** Every
+remaining step below is an operator action requiring separate explicit
+authorization. No Production write, project mutation, audit trigger, Slack
+message, timer change, or deployment was performed by the preflight.
+
+## Execution log
+
+### 2026-08-13 — authorized read-only Production preflight
+
+- Target: `https://seo-analyzer.layoutworkflows.com`.
+- `GET /health`, `GET /api/health`, and `GET /api/build-info` returned HTTP 200.
+- Two live `GET /api/projects` captures returned 13 projects and matched
+  exactly. Full snapshots remain outside the repository because they contain
+  operational project data.
+- One `GET /api/projects/:id` read per project found zero active and zero stale
+  `RUNNING` audits at the capture instant.
+- All 13 current projects were automation-ready. Recent completed-audit
+  timestamps formed a two-minute sequence through `2026-08-13T10:05:23Z`, so
+  the runner must be treated as actively scheduled until IT proves the systemd
+  timer inactive.
+- The live `/api/build-info` response contained no `gitSha` and reported build
+  time `2026-08-12T05:20:20.744Z`. This predates the reviewed create-only work
+  merged on 2026-08-13, so the atomic `create_only` contract is not proven on
+  Production.
+- A validated Search Console evidence set contained 38 high-confidence project
+  inputs. Six canonical websites already exist in Production and are protected
+  from writes; 32 are absent and remain pending.
+- **No POST, PATCH, DELETE, audit trigger, notification, deployment, or runner
+  control command was sent.** The import stopped at the deployment and runner
+  pause gates.
+
+The sanitized handoff and IT request are recorded in
+`PRODUCTION_PROJECT_IMPORT_HANDOFF.md` and `IT_PRODUCTION_DEPLOYMENT_REQUEST.md`.
 
 This document exists because the repository does **not** contain the facts the
 work needs: current production project rows, the real article URL for
