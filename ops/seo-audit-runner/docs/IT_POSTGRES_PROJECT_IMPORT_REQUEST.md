@@ -4,6 +4,11 @@ Use this only as a controlled alternative to the application import. **Do not
 replace or restore the whole Production database.** The supplied SQL inserts
 the reviewed missing projects and does not update or delete existing rows.
 
+If `public.sites` does not exist, stop: this file is connected to an empty or
+wrong database. Follow `IT_EMPTY_DATABASE_BOOTSTRAP_REQUEST.md` to verify the
+database identity. Use `PRODUCTION_FULL_BOOTSTRAP.sql` only when IT confirms the
+connection is the intentional new, empty application database.
+
 ## Copy/paste request to IT
 
 Please import the 32 reviewed SEO Analyzer projects using
