@@ -150,12 +150,64 @@ Nothing in this part modifies anything.
 
 - [ ] **G1.** Run a mixed batch: 3 Production + 2 Beta projects.
 - [ ] **G2.** Only then reuse the import tooling, in this order:
-      1. `smacient:gsc-sync --dry-run`
-      2. review the output
-      3. import valid **Production** projects
-      4. `audit-config:discover`
-      5. review the real article URLs (Part A4 rules still apply)
-      6. apply
+      1. capture every `gsc_list_sites` page from the Smacient MCP tool
+         `query-web-performance` into a `{"pages":[…]}` file, **outside the
+         repository** — it is raw third-party data
+      2. capture the A1a project inventory into a file (or point `--api` at a
+         non-production target)
+      3. `smacient:gsc-sync --dry-run --create-only --input <pages> --existing-projects <inventory> --json <report>`
+      4. review the report: the create list, the proposed updates create-only
+         will ignore, and every non-production / ambiguous / unparsable
+         property with its stated reason
+      5. `smacient:gsc-sync --apply --create-only …` — creates missing
+         **Production** projects only. Each write is a single
+         `INSERT … ON CONFLICT (domain) DO NOTHING`, so an existing project is
+         never modified and a project that appeared since step 3 returns 409
+         and halts the run. Confirm the run reports
+         `Existing-project preservation VERIFIED`.
+      6. `audit-config:discover`
+      7. review the real article URLs (Part A4 rules still apply)
+      8. apply the audit configuration
+
+      **`--apply` on its own now fails.** It requires an explicit write mode:
+      `--create-only` (safe) or `--allow-updates` (the legacy upsert, which can
+      rewrite `project_name` and `website_url` on existing projects). Proposed
+      updates are never written in create-only mode — review them separately.
+      Non-production and ambiguous properties are never created automatically;
+      a hostname is not evidence (A2/A3).
+
+      **`--apply --existing-projects` is rejected.** A captured inventory is a
+      dry-run planning input only. Every apply reads `GET /api/projects` from
+      the real target immediately before the first write and again immediately
+      after the last one, and compares those two live snapshots. Re-reading a
+      static file would report "unchanged" no matter what the apply did.
+
+- [ ] **G2b. `--with-audit-config` — AUTOMATION-READY imports.**
+      Adding `--with-audit-config` to a create-only run resolves and validates a
+      `homeUrl` + `articleUrl` pair per website (Search Console page performance
+      first, then the sitemap / news-sitemap / RSS / homepage walk) and stores it
+      in the same atomic INSERT. Only a complete, high-confidence pair is
+      eligible; everything else is created identity-only and reported with its
+      reason.
+
+      **A project with a complete pair is automation-ready and the scheduled
+      runner will pick it up on its next tick.** Before a Production apply with
+      this flag, obtain separate explicit authorization naming the exact target
+      and the exact configured-create count, and record proof of all of:
+
+      1. the scheduled runner/timer is disabled, **or** the exact new project IDs
+         are excluded until they are explicitly enabled;
+      2. `NOTIFICATIONS_ENABLED=false`;
+      3. no audit is being triggered by the import itself (the command never
+         triggers one, but the runner may act on the rows it creates);
+      4. the operator understands the new rows are automation-ready.
+
+      **Open operational prerequisite:** the runner has no documented
+      per-project pause or exclusion switch. Until one exists, the only
+      supported way to satisfy (1) is to disable the runner timer for the
+      duration and re-enable it after the new projects have been reviewed. Do
+      not invent a workaround. The import command never disables a timer and
+      never changes an environment variable.
 - [ ] **G3.** Expand to the full fleet only after monitoring shows: complete
       evidence, no duplicate projects, no false alerts, no stale jobs,
       acceptable WAF failure rate, and acceptable audit duration.

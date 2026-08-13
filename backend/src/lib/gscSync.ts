@@ -61,6 +61,21 @@ export interface ExistingProject {
   audit_count?: number;
 }
 
+/**
+ * The full row shape captured from GET /api/projects before and after an apply.
+ * Every field the list endpoint exposes is compared, so an unexpected write to
+ * any of them is detectable rather than merely unlikely.
+ */
+export interface ProjectInventoryRecord extends ExistingProject {
+  is_beta?: boolean | null;
+  last_form_values?: unknown;
+  created_at?: string | null;
+  updated_at?: string | null;
+  last_audit_at?: string | null;
+  completed_count?: number;
+  automation_ready?: boolean;
+}
+
 // ── environment classification ────────────────────────────────────
 
 /**
@@ -135,6 +150,229 @@ export function nextPageToken(payload: SmacientPayload | null | undefined): stri
   if (!payload || Array.isArray(payload) || typeof payload !== 'object') return null;
   const token = (payload as { next_page_token?: string | null }).next_page_token;
   return typeof token === 'string' && token.trim() ? token : null;
+}
+
+// ── fail-closed pagination collection ─────────────────────────────
+
+/** A collection problem that must stop the run rather than shrink the result. */
+export class GscCollectionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'GscCollectionError';
+  }
+}
+
+export interface CollectedGscProperties {
+  /** Unique properties, first occurrence order preserved. */
+  sites: SmacientSite[];
+  pageCount: number;
+  /** Every entry across every page, duplicates and malformed rows included. */
+  rawEntryCount: number;
+  /** Entries carrying a non-empty `site_url` string. */
+  usableEntryCount: number;
+  /** Entries with no usable `site_url` — always fatal, but always counted first. */
+  malformedEntryCount: number;
+  malformedEntries: string[];
+  /**
+   * Alias of `rawEntryCount`, kept because the report and the operational
+   * checklist both speak of "raw properties".
+   */
+  rawPropertyCount: number;
+  /** How many usable entries were exact repeats of an earlier property. */
+  exactDuplicateCount: number;
+  uniquePropertyCount: number;
+  /** The `next_page_token` observed on each page, in order. */
+  pageTokens: (string | null)[];
+  /** Per-page entry counts, so a short page is visible in the report. */
+  entriesPerPage: number[];
+  /** rawEntryCount === usable + malformed, and usable === unique + duplicates. */
+  reconciled: boolean;
+}
+
+export interface CollectOptions {
+  /**
+   * The number of unique properties the operator expects. A mismatch is an
+   * unexplained count difference and fails the run — the previous import
+   * reported two different totals for one collection, and nothing in the code
+   * could tell which was right.
+   */
+  expectedUniqueProperties?: number | null;
+  /** The number of raw entries the operator expects, if they counted those. */
+  expectedRawEntries?: number | null;
+}
+
+interface RawPage {
+  sites?: unknown;
+  next_page_token?: unknown;
+  error?: unknown;
+}
+
+/**
+ * Read a captured `{ "pages": [...] }` envelope of `gsc_list_sites` responses
+ * and fail closed on any sign the collection is incomplete.
+ *
+ * A shortened property list is the one failure mode that silently turns an
+ * import into an under-count, so every ambiguity here is an error:
+ *
+ *  - no `pages` envelope, or an empty one
+ *  - a page that is not an object, carries an `error`, or has no `sites` array
+ *  - the same `next_page_token` seen twice (a pagination loop)
+ *  - the final page still carrying a `next_page_token` (collection stopped early)
+ *  - zero properties in total
+ *
+ * Exact duplicate properties across pages are counted and collapsed; they are
+ * the normal consequence of overlapping pages, not a failure.
+ *
+ * Every raw entry is accounted for before anything is rejected:
+ *   rawEntryCount === usableEntryCount + malformedEntryCount
+ *   usableEntryCount === uniquePropertyCount + exactDuplicateCount
+ * Both identities are asserted, so a count can never be quietly lost between
+ * reading the response and reporting a total.
+ */
+export function collectGscProperties(
+  payload: unknown,
+  options: CollectOptions = {},
+): CollectedGscProperties {
+  const envelope = payload as { pages?: unknown } | unknown[] | null | undefined;
+  const rawPages: unknown[] = Array.isArray(envelope)
+    ? envelope
+    : envelope && typeof envelope === 'object' && Array.isArray((envelope as { pages?: unknown }).pages)
+      ? ((envelope as { pages: unknown[] }).pages)
+      : [];
+
+  if (!rawPages.length) {
+    throw new GscCollectionError(
+      'no gsc_list_sites pages found — expected a { "pages": [ … ] } envelope with at least one captured page',
+    );
+  }
+
+  const sites: SmacientSite[] = [];
+  const seen = new Set<string>();
+  const pageTokens: (string | null)[] = [];
+  const entriesPerPage: number[] = [];
+  const seenTokens = new Set<string>();
+  const malformedEntries: string[] = [];
+  let rawEntryCount = 0;
+  let usableEntryCount = 0;
+  let exactDuplicateCount = 0;
+
+  rawPages.forEach((page, index) => {
+    const label = `page ${index + 1} of ${rawPages.length}`;
+    if (!page || typeof page !== 'object' || Array.isArray(page)) {
+      throw new GscCollectionError(`${label} is not a gsc_list_sites response object`);
+    }
+    const typed = page as RawPage;
+
+    if (typed.error !== undefined && typed.error !== null) {
+      throw new GscCollectionError(
+        `${label} reports an error (${String(typed.error)}) — the property list is incomplete`,
+      );
+    }
+    if (!Array.isArray(typed.sites)) {
+      throw new GscCollectionError(
+        `${label} carries no sites array — the property list is incomplete`,
+      );
+    }
+
+    entriesPerPage.push((typed.sites as unknown[]).length);
+    for (const entry of typed.sites as unknown[]) {
+      rawEntryCount++;
+      const siteUrl =
+        entry && typeof entry === 'object' && typeof (entry as SmacientSite).site_url === 'string'
+          ? (entry as SmacientSite).site_url.trim()
+          : '';
+      if (!siteUrl) {
+        // Counted before it is rejected, so the totals still add up in the
+        // error the operator reads.
+        malformedEntries.push(`${label} entry ${rawEntryCount}: ${JSON.stringify(entry)}`);
+        continue;
+      }
+      usableEntryCount++;
+      if (seen.has(siteUrl)) {
+        exactDuplicateCount++;
+        continue;
+      }
+      seen.add(siteUrl);
+      sites.push(entry as SmacientSite);
+    }
+
+    const token = typeof typed.next_page_token === 'string' && typed.next_page_token.trim()
+      ? typed.next_page_token.trim()
+      : null;
+    pageTokens.push(token);
+
+    if (token) {
+      if (seenTokens.has(token)) {
+        throw new GscCollectionError(
+          `${label} repeats a pagination token already seen — refusing to loop over gsc_list_sites`,
+        );
+      }
+      seenTokens.add(token);
+      if (index === rawPages.length - 1) {
+        throw new GscCollectionError(
+          `${label} is the last captured page but still carries a next_page_token — ` +
+            'collection stopped before Google ran out of properties',
+        );
+      }
+    }
+  });
+
+  if (malformedEntries.length) {
+    throw new GscCollectionError(
+      `${malformedEntries.length} of ${rawEntryCount} entries have no usable site_url — ` +
+        `the property list is not trustworthy: ${malformedEntries.slice(0, 5).join('; ')}`,
+    );
+  }
+  if (!sites.length) {
+    throw new GscCollectionError(
+      'gsc_list_sites returned zero Google Search Console properties — ' +
+        'this requires verification and is NOT a signal to remove existing projects',
+    );
+  }
+
+  // Both identities must hold or an entry was lost between reading and counting.
+  const reconciled =
+    rawEntryCount === usableEntryCount + malformedEntries.length &&
+    usableEntryCount === sites.length + exactDuplicateCount;
+  if (!reconciled) {
+    throw new GscCollectionError(
+      `entry accounting does not reconcile: ${rawEntryCount} raw entries != ` +
+        `${usableEntryCount} usable + ${malformedEntries.length} malformed, or ` +
+        `${usableEntryCount} usable != ${sites.length} unique + ${exactDuplicateCount} duplicates`,
+    );
+  }
+
+  // An operator-declared total that does not match is an unexplained count
+  // difference. It stops the run rather than being reported alongside a
+  // different number, which is exactly how 77-vs-76 survived the last import.
+  const { expectedUniqueProperties, expectedRawEntries } = options;
+  if (typeof expectedRawEntries === 'number' && expectedRawEntries !== rawEntryCount) {
+    throw new GscCollectionError(
+      `expected ${expectedRawEntries} raw gsc_list_sites entries but collected ${rawEntryCount} — ` +
+        'the difference is unexplained; recount the source before importing',
+    );
+  }
+  if (typeof expectedUniqueProperties === 'number' && expectedUniqueProperties !== sites.length) {
+    throw new GscCollectionError(
+      `expected ${expectedUniqueProperties} unique GSC properties but collected ${sites.length} — ` +
+        'the difference is unexplained; recount the source before importing',
+    );
+  }
+
+  return {
+    sites,
+    pageCount: rawPages.length,
+    rawEntryCount,
+    usableEntryCount,
+    malformedEntryCount: malformedEntries.length,
+    malformedEntries,
+    rawPropertyCount: rawEntryCount,
+    exactDuplicateCount,
+    uniquePropertyCount: sites.length,
+    pageTokens,
+    entriesPerPage,
+    reconciled,
+  };
 }
 
 // ── parsing a single property ─────────────────────────────────────
@@ -599,4 +837,154 @@ export function buildUpsertBody(entry: PlanEntry): { project_name: string; websi
     throw new Error(`entry for ${entry.domain} is not applyable`);
   }
   return { project_name: entry.proposedProjectName, website_url: entry.proposedWebsiteUrl };
+}
+
+/**
+ * The request body for one create-only POST /api/projects call.
+ *
+ * `create_only: true` selects the insert-or-409 contract, so this request can
+ * only ever add a row. Only the minimum project identity is sent: no audit
+ * configuration, and no `is_beta` — a hostname is not evidence of a
+ * non-production environment, so the classification is left at its default and
+ * decided by a human later.
+ *
+ * Refuses any entry the planner did not classify as a safe creation, so a
+ * caller cannot smuggle an update, a non-production host or an ambiguous
+ * property into the create path.
+ */
+export interface CreateOnlyAuditConfig {
+  homeUrl: string;
+  articleUrl: string;
+}
+
+export interface CreateOnlyBody {
+  project_name: string;
+  website_url: string;
+  create_only: true;
+  with_audit_config?: true;
+  homeUrl?: string;
+  articleUrl?: string;
+}
+
+export function buildCreateOnlyBody(
+  entry: PlanEntry,
+  config?: CreateOnlyAuditConfig | null,
+): CreateOnlyBody {
+  if (entry.action !== 'create') {
+    throw new Error(
+      `entry for ${entry.domain} has action "${entry.action}" — only "create" entries may be applied in create-only mode`,
+    );
+  }
+  if (entry.existingProjectId) {
+    throw new Error(`entry for ${entry.domain} already maps to project ${entry.existingProjectId}`);
+  }
+  if (!entry.proposedWebsiteUrl || !entry.proposedProjectName) {
+    throw new Error(`entry for ${entry.domain} is not applyable`);
+  }
+
+  const body: CreateOnlyBody = {
+    project_name: entry.proposedProjectName,
+    website_url: entry.proposedWebsiteUrl,
+    create_only: true,
+  };
+  if (!config) return body;
+
+  // A half pair would be rejected by the route anyway; refusing it here means
+  // the request is never even built, so a partially-resolved project cannot be
+  // sent by mistake.
+  if (!config.homeUrl || !config.articleUrl) {
+    throw new Error(
+      `entry for ${entry.domain} has an incomplete audit configuration ` +
+        `(homeUrl ${config.homeUrl ? 'present' : 'missing'}, articleUrl ${config.articleUrl ? 'present' : 'missing'})`,
+    );
+  }
+  for (const [field, value] of [['homeUrl', config.homeUrl], ['articleUrl', config.articleUrl]] as const) {
+    if (normalizeProjectDomain(value) !== entry.domain) {
+      throw new Error(
+        `entry for ${entry.domain} has a ${field} on a different domain (${value}) — refusing to configure it`,
+      );
+    }
+  }
+
+  body.with_audit_config = true;
+  body.homeUrl = config.homeUrl;
+  body.articleUrl = config.articleUrl;
+  return body;
+}
+
+// ── existing-project preservation proof ───────────────────────────
+
+/** Every inventory field compared before and after an apply. */
+export const INVENTORY_FIELDS = [
+  'domain', 'project_name', 'website_url', 'is_beta', 'last_form_values',
+  'created_at', 'updated_at', 'last_audit_at', 'audit_count', 'completed_count',
+  'automation_ready',
+] as const;
+
+export interface InventoryFieldDiff {
+  id: string;
+  field: string;
+  before: unknown;
+  after: unknown;
+}
+
+export interface InventoryComparison {
+  /** Pre-existing project IDs whose every compared field is identical. */
+  unchangedIds: string[];
+  /** Field-level differences on pre-existing projects — must always be empty. */
+  changed: InventoryFieldDiff[];
+  /** Pre-existing project IDs missing afterwards — must always be empty. */
+  missingIds: string[];
+  /** IDs present only afterwards, i.e. the rows this run created. */
+  addedIds: string[];
+  preserved: boolean;
+}
+
+function stable(value: unknown): string {
+  return value === undefined ? 'undefined' : JSON.stringify(value ?? null);
+}
+
+/**
+ * Prove that every project that existed before the apply is byte-for-byte
+ * identical afterwards. Newly added IDs are reported separately and are the
+ * only difference a create-only apply may produce.
+ */
+export function compareInventories(
+  before: ProjectInventoryRecord[],
+  after: ProjectInventoryRecord[],
+): InventoryComparison {
+  const afterById = new Map(after.map((p) => [p.id, p]));
+  const beforeIds = new Set(before.map((p) => p.id));
+
+  const changed: InventoryFieldDiff[] = [];
+  const missingIds: string[] = [];
+  const unchangedIds: string[] = [];
+
+  for (const prior of before) {
+    const current = afterById.get(prior.id);
+    if (!current) {
+      missingIds.push(prior.id);
+      continue;
+    }
+    const before1 = prior as unknown as Record<string, unknown>;
+    const after1 = current as unknown as Record<string, unknown>;
+    let dirty = false;
+    for (const field of INVENTORY_FIELDS) {
+      if (stable(before1[field]) !== stable(after1[field])) {
+        changed.push({ id: prior.id, field, before: before1[field] ?? null, after: after1[field] ?? null });
+        dirty = true;
+      }
+    }
+    if (!dirty) unchangedIds.push(prior.id);
+  }
+
+  const addedIds = after.map((p) => p.id).filter((id) => !beforeIds.has(id));
+
+  return {
+    unchangedIds,
+    changed,
+    missingIds,
+    addedIds,
+    preserved: changed.length === 0 && missingIds.length === 0,
+  };
 }
