@@ -30,7 +30,8 @@ production observations are not reusable as current evidence.
 ## Gate 1 — Current local baseline
 
 - Record branch, exact base commit, upstream divergence, working-tree status,
-  frontend/backend typechecks, main tests, runner tests, and build.
+  frontend/backend typechecks, main tests, runner tests, and build. The exact
+  base commit is the REPO_SHA the Gate 6 parity check compares against.
 - Do not contact any live health endpoint or project API to establish this
   gate. Production inventory and health require a later, separately authorized
   operational verification.
@@ -105,6 +106,23 @@ verified and approved under a separate production-contact authorization.
 No current live project-count claim is made from this repository review.
 
 When unblocked, the sequence is strict and manual:
+0. **Deployment parity gate — `REPO_SHA == APP_SHA == RUNNER_SHA`.**
+   All three must print the SAME full 40-character SHA before anything else
+   proceeds. All three commands are read-only:
+
+   ```bash
+   git -C <checkout> rev-parse HEAD                                     # REPO_SHA
+   curl -s https://<app-host>/api/build-info | jq -r .gitSha            # APP_SHA
+   sudo -u seo-runner seo-audit-runner version --output json \
+     | jq -r .data.gitSha                                               # RUNNER_SHA
+   ```
+
+   `null` or a mismatch on ANY side FAILS this gate — an unknown SHA means
+   nobody can prove which reviewed commit is deployed. Fix the injection
+   (`APP_GIT_SHA` build arg / runtime variable for the application;
+   `install.sh --git-sha` / `upgrade.sh --git-sha` for the runner) and re-verify
+   before continuing. Never substitute the release stamp, the release checksum,
+   or the package version: none of those is repository identity.
 1. Record live app health (`/health`, `/api/health`, `/api/build-info`).
 2. Take a state backup (even if state is empty — proves the path works).
 3. Install WITHOUT enabling any timer.

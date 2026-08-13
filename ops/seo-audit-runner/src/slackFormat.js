@@ -10,10 +10,9 @@
  *  - a critical alert is ONE short, scannable message: header, project, P0
  *    counts, at most MAX_VISIBLE_CRITICAL_ISSUES issues, technical checks,
  *    short audit id
- *  - a channel-wide mention is added by the caller ONLY for new/reopened P0
- *    issues, exactly once, in the first line (so it is present both in the
- *    plain-text fallback and in the first mrkdwn section block)
- *  - run summaries NEVER carry a broad mention
+ *  - NO message ever carries a broad mention (<!channel>/<!here>/<!everyone>);
+ *    there is no code path that generates one, and `sanitizeSlackMessage()`
+ *    strips any that survives in a legacy stored payload
  *  - presentation-only cleanup: the stored audit finding is never modified
  *  - safe mrkdwn escaping of &, <, > for every value that came from the audit
  *  - blocks always accompany a populated plain-text fallback
@@ -32,24 +31,89 @@ export const MAX_TITLE_CHARACTERS = 160;
 /** Visible prefix length of an audit-run / execution UUID. */
 export const SHORT_ID_LENGTH = 8;
 
-// ── Channel-wide mentions ───────────────────────────────────────────
+// ── Broad mentions: removed, and actively stripped ──────────────────
+//
+// No runner alert may page a whole channel. There is no code path that
+// GENERATES <!channel>, <!here> or <!everyone> any more: the formatter has no
+// mention parameter, and the notification pipeline has no mention argument.
+//
+// `SLACK_CRITICAL_MENTION` survives only as accepted configuration vocabulary
+// so existing env files keep validating; config.js neutralizes every broad
+// value to `none` (see there). `stripBroadMentions()` is the last-mile guard
+// for payloads that were serialized into SQLite BEFORE this change and are
+// replayed by `retry-notifications`.
 
+/** Accepted values of SLACK_CRITICAL_MENTION (broad values are neutralized). */
 export const SLACK_CRITICAL_MENTION_MODES = Object.freeze(['channel', 'here', 'everyone', 'none']);
-
-const MENTION_TOKENS = Object.freeze({
-  channel: '<!channel>',
-  here: '<!here>',
-  everyone: '<!everyone>',
-  none: null,
-});
+/** Values that would have paged a whole channel — never honored. */
+export const BROAD_MENTION_MODES = Object.freeze(['channel', 'here', 'everyone']);
+/** The only mention mode the runner will ever operate in. */
+export const NO_MENTION_MODE = 'none';
 
 /**
- * Slack token for a configured mention mode, or null when no mention applies.
- * An unknown mode yields null (no mention) — configuration validation rejects
- * unknown values up front, so this never silently substitutes another mention.
+ * Slack's broad-mention tokens, in every form Slack itself accepts:
+ * `<!channel>`, `<!here|here>`, `<!everyone>`, …
+ *
+ * Non-global on purpose so `.test()` callers cannot trip over `lastIndex`.
  */
-export function criticalMentionToken(mode) {
-  return MENTION_TOKENS[String(mode ?? '').trim().toLowerCase()] ?? null;
+export const BROAD_MENTION_PATTERN = /<!(?:channel|here|everyone)(?:\|[^>]*)?>/i;
+
+// Global variant plus the horizontal whitespace around the token, so removing
+// a leading `<!channel> ` does not leave the line indented by one space.
+const BROAD_MENTION_WITH_PADDING = /[ \t]*<!(?:channel|here|everyone)(?:\|[^>]*)?>[ \t]*/gi;
+
+/**
+ * Remove every broad-mention token from a text, closing the gap it leaves.
+ * Only lines that actually carried a mention are re-trimmed, so intentional
+ * indentation elsewhere in the message is preserved. Newlines are never eaten.
+ */
+export function stripBroadMentions(text) {
+  if (typeof text !== 'string' || !text) return text;
+  if (!BROAD_MENTION_PATTERN.test(text)) return text;
+  return text
+    .split('\n')
+    .map((line) =>
+      BROAD_MENTION_PATTERN.test(line)
+        ? line.replace(BROAD_MENTION_WITH_PADDING, ' ').replace(/^[ \t]+/, '').replace(/[ \t]+$/, '')
+        : line,
+    )
+    .join('\n');
+}
+
+/**
+ * Return a copy of a Slack message with every broad mention removed from the
+ * top-level text and from all mrkdwn block texts. The input is never mutated —
+ * stored notification history stays exactly as it was written.
+ */
+export function sanitizeSlackMessage(message) {
+  if (!message || typeof message !== 'object') return message;
+
+  const text = stripBroadMentions(message.text);
+  const blocks = Array.isArray(message.blocks)
+    ? message.blocks.map((block) => {
+        if (!block || typeof block !== 'object') return block;
+        let next = block;
+        if (block.text && typeof block.text === 'object' && typeof block.text.text === 'string') {
+          const cleaned = stripBroadMentions(block.text.text);
+          if (cleaned !== block.text.text) next = { ...next, text: { ...block.text, text: cleaned } };
+        }
+        if (Array.isArray(block.elements)) {
+          const elements = block.elements.map((el) =>
+            el && typeof el === 'object' && typeof el.text === 'string'
+              ? { ...el, text: stripBroadMentions(el.text) }
+              : el,
+          );
+          if (elements.some((el, i) => el !== block.elements[i])) next = { ...next, elements };
+        }
+        return next;
+      })
+    : message.blocks;
+
+  const textChanged = text !== message.text;
+  const blocksChanged = Array.isArray(message.blocks) && blocks.some((b, i) => b !== message.blocks[i]);
+  if (!textChanged && !blocksChanged) return message;
+
+  return { ...message, ...(textChanged ? { text } : {}), ...(blocksChanged ? { blocks } : {}) };
 }
 
 // ── Technical checks (robots.txt / XML sitemap / News sitemap) ──────
@@ -383,8 +447,6 @@ function enforceCharacterBudget(text, maxMessageCharacters) {
  * @param mode 'new_or_regressed' | 'all_current' | 'summary_only'
  * @param lifecycle {{ new: [], reopened: [], unchanged: [], resolved: [] }}
  * @param siteChecks `siteChecks` from the COMPLETED audit result (never fetched here)
- * @param mention Slack mention token, or null — the caller decides whether the
- *                notification qualifies (new / reopened P0 only)
  * @returns array of { text, blocks } messages (exactly 1)
  */
 export function buildProjectMessages({
@@ -398,7 +460,6 @@ export function buildProjectMessages({
   mode,
   siteChecks = null,
   isBeta = false,
-  mention = null,
   maxIssuesPerMessage = MAX_VISIBLE_CRITICAL_ISSUES,
   maxMessageCharacters = 30_000,
 }) {
@@ -428,7 +489,7 @@ export function buildProjectMessages({
   const shownDomain = displayDomain(domain);
 
   const lines = [
-    `${isBeta ? ':warning:' : ':rotating_light:'} ${mention ? `${mention} ` : ''}*${isBeta ? 'Beta SEO Exposure Alert' : 'Critical SEO Alert'}*`,
+    `${isBeta ? ':warning:' : ':rotating_light:'} *${isBeta ? 'Beta SEO Exposure Alert' : 'Critical SEO Alert'}*`,
     '',
     `*${escapeSlack(label)}*${shownDomain && shownDomain !== label ? ` — \`${escapeSlack(shownDomain)}\`` : ''}`,
     countsLine(counts, mode, { isBeta }),

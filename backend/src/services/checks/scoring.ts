@@ -462,9 +462,14 @@ export function scoreResult(data: CheckData, options: ScoringOptions = {}): Scor
       !data.contentMeta.robotsMeta.noindex &&
       !data.contentMeta.xRobotsTag?.noindex
     ) {
-      escalate('WARN');
+      // Critical Exposure: a Beta/Staging environment that search engines may
+      // index is a P0 incident, not a warning. The message is deliberately
+      // byte-identical to the previous P1 wording — the runner's issue
+      // fingerprint excludes priority, so promoting it must not create a
+      // NEW + RESOLVED churn pair in the notification lifecycle.
+      escalate('FAIL');
       recs.push({
-        priority: 'P1', area: 'meta',
+        priority: 'P0', area: 'meta',
         message: 'Beta/Staging seed URL is indexable (no noindex directive detected)',
         fixHint: 'Add a meta robots noindex directive or an X-Robots-Tag noindex header before exposing the Beta/Staging site.',
       });
@@ -560,7 +565,14 @@ interface SiteChecksData {
   robots?: {
     status: string;
     notes?: string[];
+    /** Absolute http(s) Sitemap: directives — what general discovery probes. */
     sitemapsFound?: string[];
+    /**
+     * Every Sitemap: directive exactly as declared, including root-relative
+     * ones. A superset of `sitemapsFound`; absent on payloads stored before
+     * this field existed.
+     */
+    sitemapDirectives?: string[];
     rules?: { userAgent: string; disallow: string[]; allow: string[] }[];
   };
   sitemap?: {
@@ -584,6 +596,28 @@ interface SiteChecksData {
     urlCount: number;
     notes?: string[];
   };
+}
+
+/**
+ * How many `Sitemap:` directives did robots.txt actually declare?
+ *
+ * `sitemapDirectives` is authoritative when present: it carries every raw
+ * declaration, including root-relative ones like `Sitemap: /news_sitemap.xml`
+ * that `sitemapsFound` (absolute-only, the input to general sitemap discovery)
+ * deliberately omits. Judging declaration presence on `sitemapsFound` reports
+ * "no Sitemap declared" for a site that declared one.
+ *
+ * Falls back to `sitemapsFound` for audit payloads stored before
+ * `sitemapDirectives` existed, so historical results score exactly as before.
+ */
+export function declaredSitemapDirectiveCount(robots: {
+  sitemapsFound?: string[];
+  sitemapDirectives?: string[];
+} | null | undefined): number {
+  if (Array.isArray(robots?.sitemapDirectives)) return robots.sitemapDirectives.length;
+  if (Array.isArray(robots?.sitemapsFound)) return robots.sitemapsFound.length;
+  // Neither field present: nothing is known, so claim nothing.
+  return -1;
 }
 
 export function scoreSiteChecks(data: SiteChecksData | null, options: ScoringOptions = {}): Recommendation[] {
@@ -649,8 +683,10 @@ export function scoreSiteChecks(data: SiteChecksData | null, options: ScoringOpt
             !googleBlocked ? 'Googlebot' : null,
             !newsBlocked ? 'Googlebot-News' : null,
           ].filter(Boolean).join(' and ');
+          // Critical Exposure — see the seed-URL note above: P0 severity,
+          // unchanged wording so the stored issue identity survives.
           recs.push({
-            priority: 'P1', area: 'robots',
+            priority: 'P0', area: 'robots',
             message: `Beta/Staging site is crawlable by ${exposed}`,
             fixHint: 'Block search crawlers on the Beta/Staging environment (for example with an environment-specific robots.txt) until it is ready for Production.',
           });
@@ -668,11 +704,10 @@ export function scoreSiteChecks(data: SiteChecksData | null, options: ScoringOpt
     }
 
     // Sitemap not declared in robots.txt — add recommendation when robots.txt
-    // is accessible (FOUND) but has no Sitemap: directives.
+    // is accessible (FOUND) but has no Sitemap: directives at all.
     if (
       data.robots.status === 'FOUND' &&
-      Array.isArray(data.robots.sitemapsFound) &&
-      data.robots.sitemapsFound.length === 0
+      declaredSitemapDirectiveCount(data.robots) === 0
     ) {
       recs.push({
         priority: 'P1', area: 'sitemap',

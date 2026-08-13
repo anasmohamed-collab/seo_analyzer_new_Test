@@ -46,13 +46,14 @@ esac
 
 DESTDIR=
 SOURCE_DIR=
+GIT_SHA=${SEO_RUNNER_GIT_SHA:-}
 NODE_BIN=
 SKIP_BACKUP=0
 
 usage() {
   cat <<'EOF'
 Usage: upgrade.sh --source <new-checkout-dir> [--node <path>] [--destdir <dir>]
-                  [--skip-backup]
+                  [--git-sha <sha>] [--skip-backup]
 
 Upgrades /opt/seo-audit-runner to the code in --source. A state backup is
 taken first (use --skip-backup ONLY when the state database does not exist
@@ -72,6 +73,8 @@ while [ "$#" -gt 0 ]; do
     --node=*)   NODE_BIN=${1#*=}; shift ;;
     --destdir)  [ "$#" -ge 2 ] || fail "--destdir requires a value"; DESTDIR=$2; shift 2 ;;
     --destdir=*) DESTDIR=${1#*=}; shift ;;
+    --git-sha)  [ "$#" -ge 2 ] || fail "--git-sha requires a value";  GIT_SHA=$2; shift 2 ;;
+    --git-sha=*) GIT_SHA=${1#*=}; shift ;;
     --skip-backup) SKIP_BACKUP=1; shift ;;
     *) printf 'upgrade.sh: unknown option: %s\n' "$1" >&2; exit 1 ;;
   esac
@@ -106,6 +109,9 @@ fi
 
 # ── 2+3. Install new release; automatic code rollback on failure ───
 install_args=(--source "$SOURCE_DIR")
+# The reviewed repository SHA travels with the upgrade so the new release
+# records the commit that was actually reviewed and deployed.
+[ -n "$GIT_SHA" ] && install_args+=(--git-sha "$GIT_SHA")
 [ -n "$NODE_BIN" ] && install_args+=(--node "$NODE_BIN")
 [ -n "$DESTDIR" ] && install_args+=(--destdir "$DESTDIR")
 

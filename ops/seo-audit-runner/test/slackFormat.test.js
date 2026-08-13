@@ -12,7 +12,8 @@ import {
   buildRunSummaryMessage,
   escapeSlack,
   cleanRecommendation,
-  criticalMentionToken,
+  sanitizeSlackMessage,
+  stripBroadMentions,
   technicalStatusCategory,
   readTechnicalChecks,
   createTechnicalAggregate,
@@ -59,80 +60,102 @@ const lc = (over = {}) => ({ new: [], reopened: [], unchanged: [], resolved: [],
 
 const count = (haystack, needle) => haystack.split(needle).length - 1;
 
-// ── Mentions ────────────────────────────────────────────────────────
+// ── Broad mentions: never generated, always stripped ────────────────
 
-test('mention modes map to the correct Slack tokens', () => {
-  assert.equal(criticalMentionToken('channel'), '<!channel>');
-  assert.equal(criticalMentionToken('here'), '<!here>');
-  assert.equal(criticalMentionToken('everyone'), '<!everyone>');
-  assert.equal(criticalMentionToken('none'), null);
-  assert.equal(criticalMentionToken(undefined), null, 'unknown never substitutes another mention');
-  assert.equal(criticalMentionToken('CHANNEL'), '<!channel>', 'case-insensitive');
-});
+const BROAD = /<!(channel|here|everyone)(\|[^>]*)?>/;
 
-test('a new-P0 alert carries exactly one <!channel> — in the text and the first block', () => {
-  const [message] = buildProjectMessages(
-    baseArgs(lc({ new: [mkIssue(1)] }), { mention: '<!channel>' }),
-  );
-  assert.equal(count(message.text, '<!channel>'), 1);
-  assert.equal(
-    message.blocks.reduce((n, b) => n + count(b.text.text, '<!channel>'), 0),
-    1,
-    'the mention must appear once across the blocks too',
-  );
-  assert.match(message.blocks[0].text.text, /<!channel>/, 'first mrkdwn section carries the mention');
-  assert.ok(!message.text.includes('@all'), 'never a literal @all');
-  assert.ok(!message.text.includes('@channel'), 'never a literal @channel');
-});
-
-test('a reopened-P0 alert carries exactly one <!channel>', () => {
-  const [message] = buildProjectMessages(
-    baseArgs(lc({ reopened: [mkIssue(2)] }), { mention: '<!channel>' }),
-  );
-  assert.equal(count(message.text, '<!channel>'), 1);
-  assert.match(message.text, /\*P0:\* 1 reopened/);
-});
-
-test('here and everyone render their own tokens, once', () => {
-  for (const token of ['<!here>', '<!everyone>']) {
-    const [message] = buildProjectMessages(baseArgs(lc({ new: [mkIssue(1)] }), { mention: token }));
-    assert.equal(count(message.text, token), 1);
+test('the formatter has no way to emit a broad mention', () => {
+  // `mention` is not a parameter any more — passing one must change nothing.
+  for (const lifecycle of [
+    lc({ new: [mkIssue(1)] }),
+    lc({ reopened: [mkIssue(2)] }),
+    lc({ unchanged: [mkIssue(3)] }),
+    lc({ resolved: [mkIssue(4)] }),
+  ]) {
+    const [message] = buildProjectMessages(
+      baseArgs(lifecycle, { mode: 'all_current', mention: '<!channel>' }),
+    );
+    assert.ok(!BROAD.test(message.text), 'no broad mention in the text');
+    assert.ok(
+      message.blocks.every((b) => !BROAD.test(b.text.text)),
+      'no broad mention in any block',
+    );
+    assert.ok(!message.text.includes('@all'), 'never a literal @all');
+    assert.ok(!message.text.includes('@channel'), 'never a literal @channel');
   }
 });
 
-test('no mention is rendered when the caller passes none', () => {
-  const [message] = buildProjectMessages(
-    baseArgs(lc({ new: [mkIssue(1)] }), { mention: criticalMentionToken('none') }),
-  );
-  assert.ok(!/<!(channel|here|everyone)>/.test(message.text), 'SLACK_CRITICAL_MENTION=none disables it');
-  assert.match(message.text, /:rotating_light: \*Critical SEO Alert\*/);
+test('a new-P0 alert renders its header without any mention', () => {
+  const [message] = buildProjectMessages(baseArgs(lc({ new: [mkIssue(1)] })));
+  assert.match(message.text, /^:rotating_light: \*Critical SEO Alert\*/);
+  assert.match(message.text, /\*P0:\* 1 new/);
+  assert.ok(!BROAD.test(message.text));
+});
+
+test('a reopened-P0 alert renders without any mention', () => {
+  const [message] = buildProjectMessages(baseArgs(lc({ reopened: [mkIssue(2)] })));
+  assert.match(message.text, /\*P0:\* 1 reopened/);
+  assert.ok(!BROAD.test(message.text));
 });
 
 test('unchanged-only and resolved-only alerts carry no broad mention', () => {
   const unchanged = buildProjectMessages(
-    baseArgs(lc({ unchanged: [mkIssue(3)] }), { mode: 'all_current', mention: null }),
+    baseArgs(lc({ unchanged: [mkIssue(3)] }), { mode: 'all_current' }),
   )[0];
-  assert.ok(!/<!(channel|here|everyone)>/.test(unchanged.text));
+  assert.ok(!BROAD.test(unchanged.text));
 
-  const resolved = buildProjectMessages(baseArgs(lc({ resolved: [mkIssue(4)] }), { mention: null }))[0];
-  assert.ok(!/<!(channel|here|everyone)>/.test(resolved.text));
+  const resolved = buildProjectMessages(baseArgs(lc({ resolved: [mkIssue(4)] })))[0];
+  assert.ok(!BROAD.test(resolved.text));
   assert.match(resolved.text, /\*P0:\* none currently open \| \*Resolved:\* 1/);
 });
 
-test('Beta exposure alerts are distinct, preserve P1, and never carry a broad mention', () => {
+test('Beta exposure alerts are distinct and never carry a broad mention', () => {
   const exposure = mkIssue(1, {
-    priority: 'P1',
+    priority: 'P0',
     message: 'Beta/Staging seed URL is indexable (no noindex directive detected)',
   });
-  const [message] = buildProjectMessages(
-    baseArgs(lc({ new: [exposure] }), { isBeta: true, mention: null }),
-  );
+  const [message] = buildProjectMessages(baseArgs(lc({ new: [exposure] }), { isBeta: true }));
 
   assert.match(message.text, /^:warning: \*Beta SEO Exposure Alert\*/);
   assert.match(message.text, /\*Exposure findings:\* 1 new/);
   assert.match(message.text, /Beta\/Staging seed URL is indexable/);
-  assert.ok(!/<!(channel|here|everyone)>/.test(message.text));
+  assert.ok(!BROAD.test(message.text));
   assert.ok(!/\*P0:\*/.test(message.text));
+});
+
+test('stripBroadMentions removes every token form and leaves other text alone', () => {
+  assert.equal(stripBroadMentions('<!channel> alert'), 'alert');
+  assert.equal(stripBroadMentions('<!here|here> alert'), 'alert');
+  assert.equal(stripBroadMentions('<!everyone> alert'), 'alert');
+  assert.equal(stripBroadMentions('<!CHANNEL> alert'), 'alert');
+  assert.equal(stripBroadMentions('a <!channel> b'), 'a b');
+  assert.equal(stripBroadMentions('plain text'), 'plain text');
+  assert.equal(stripBroadMentions('<@U123> direct mention'), '<@U123> direct mention');
+  assert.equal(stripBroadMentions(''), '');
+  assert.equal(stripBroadMentions(null), null);
+});
+
+test('sanitizeSlackMessage cleans text and mrkdwn blocks without mutating the input', () => {
+  const legacy = {
+    text: ':rotating_light: <!channel> *Critical SEO Alert*',
+    blocks: [
+      { type: 'section', text: { type: 'mrkdwn', text: ':rotating_light: <!channel> *Critical SEO Alert*' } },
+      { type: 'section', text: { type: 'mrkdwn', text: 'second block <!here>' } },
+      { type: 'context', elements: [{ type: 'mrkdwn', text: 'ctx <!everyone>' }] },
+    ],
+  };
+  const before = JSON.parse(JSON.stringify(legacy));
+
+  const clean = sanitizeSlackMessage(legacy);
+  assert.ok(!BROAD.test(clean.text));
+  assert.ok(clean.blocks.every((b) => !BROAD.test(JSON.stringify(b))));
+  assert.match(clean.text, /\*Critical SEO Alert\*/, 'the rest of the message survives');
+  assert.deepEqual(legacy, before, 'the stored payload is never mutated');
+});
+
+test('sanitizeSlackMessage returns the same object when nothing needs stripping', () => {
+  const message = { text: 'clean', blocks: [{ type: 'section', text: { type: 'mrkdwn', text: 'clean' } }] };
+  assert.equal(sanitizeSlackMessage(message), message);
 });
 
 // ── Compact critical format ─────────────────────────────────────────
@@ -150,11 +173,11 @@ test('the critical alert is compact, scannable, and free of ID noise', () => {
           }),
         ],
       }),
-      { projectName: 'Arab Times', domain: 'arabtimesonline.com', mention: '<!channel>' },
+      { projectName: 'Arab Times', domain: 'arabtimesonline.com' },
     ),
   );
   const text = message.text;
-  assert.match(text, /^:rotating_light: <!channel> \*Critical SEO Alert\*/);
+  assert.match(text, /^:rotating_light: \*Critical SEO Alert\*/);
   assert.match(text, /\*Arab Times\* — `arabtimesonline.com`/);
   assert.match(text, /\*P0:\* 1 new/);
   assert.match(text, /• \*Missing H1 tag\* — Home/);

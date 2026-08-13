@@ -48,8 +48,8 @@ test('include and exclude lists are enforced and exclusion wins', () => {
   assert.match(both.reason, /explicitly excluded/);
 });
 
-test('obvious beta and next environment labels are excluded by default', () => {
-  for (const label of ['beta', 'next']) {
+test('obvious beta, new and next environment labels are excluded by default', () => {
+  for (const label of ['beta', 'new', 'next']) {
     const domain = `${label}.example.com`;
     const decision = evaluateProjectEligibility(
       project({
@@ -62,6 +62,53 @@ test('obvious beta and next environment labels are excluded by default', () => {
     assert.equal(decision.eligible, false, label);
     assert.match(decision.reason, /non-production/);
   }
+});
+
+test('an unclassified new.* host is treated as non-production by the runner', () => {
+  const decision = evaluateProjectEligibility(
+    project({
+      domain: 'new.example.com',
+      website_url: 'https://new.example.com',
+      last_form_values: {
+        homeUrl: 'https://new.example.com',
+        articleUrl: 'https://new.example.com/a',
+      },
+    }),
+    config(),
+  );
+  assert.equal(decision.eligible, false);
+  assert.match(decision.reason, /non-production/);
+});
+
+test('label matching is exact — newtimes.co.rw is a Production site', () => {
+  for (const domain of ['newtimes.co.rw', 'newsroom.example.com', 'renew.example.com']) {
+    const decision = evaluateProjectEligibility(
+      project({
+        domain,
+        website_url: `https://${domain}`,
+        last_form_values: { homeUrl: `https://${domain}`, articleUrl: `https://${domain}/a` },
+      }),
+      config(),
+    );
+    assert.equal(decision.eligible, true, `${domain} must stay eligible`);
+  }
+});
+
+test('new.* with a persisted is_beta=true stays eligible for scheduled monitoring', () => {
+  const decision = evaluateProjectEligibility(
+    project({
+      domain: 'new.example.com',
+      website_url: 'https://new.example.com',
+      is_beta: true,
+      last_form_values: {
+        homeUrl: 'https://new.example.com',
+        articleUrl: 'https://new.example.com/a',
+      },
+    }),
+    config(),
+  );
+  assert.equal(decision.eligible, true, 'an explicit Beta classification is authoritative');
+  assert.equal(decision.source, 'last_form_values');
 });
 
 test('explicit Beta classification remains eligible for auditing despite the domain label', () => {

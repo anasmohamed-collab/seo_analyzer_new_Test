@@ -32,6 +32,8 @@ const client = {
       }
       return { rows: [site] };
     }
+    // Stale recovery runs before the RUNNING re-check; nothing is stale here.
+    if (/UPDATE audit_runs[\s\S]*status = 'FAILED'/i.test(sql)) return { rows: [], rowCount: 0 };
     if (/FROM audit_runs[\s\S]*status = 'RUNNING'/i.test(sql)) {
       return { rows: runningAuditId ? [{ id: runningAuditId }] : [] };
     }

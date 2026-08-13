@@ -33,6 +33,7 @@ test('smoke test passes against a freshly staged installation', { skip }, () => 
   assert.match(r.stdout, /PASS {2}the single tick timer and service are installed/);
   assert.match(r.stdout, /PASS {2}no superseded \(multi-timer\) unit files present/);
   assert.match(r.stdout, /PASS {2}backup command produced a validated archive/);
+  assert.match(r.stdout, /PASS {2}release git SHA recorded \([0-9a-f]{40}\)/);
   assert.ok(!/^FAIL/m.test(r.stdout), `unexpected FAIL lines:\n${r.stdout}`);
 });
 
@@ -73,4 +74,16 @@ test('smoke test never prints secret values from runner.env', { skip }, () => {
   const r = runScript(SMOKE_SH, ['--destdir', toPosix(fx.destdir)]);
   assert.equal(r.status, 0, r.output);
   assert.ok(!r.output.includes(secret), 'secret leaked into smoke-test output');
+});
+
+test('smoke test fails the parity gate when the release git SHA is unknown', { skip }, () => {
+  const fx = installedFixture();
+  const current = fs.realpathSync(path.join(fx.destdir, 'opt', 'seo-audit-runner', 'current'));
+  fs.rmSync(path.join(current, '.release-sha'), { force: true });
+
+  const r = runScript(SMOKE_SH, ['--destdir', toPosix(fx.destdir)]);
+  assert.equal(r.status, 1, r.output);
+  assert.match(r.stdout, /RESULT: FAIL/);
+  assert.match(r.stdout, /FAIL {2}release git SHA .*unknown/);
+  assert.match(r.stdout, /REPO_SHA == APP_SHA == RUNNER_SHA gate cannot pass/);
 });

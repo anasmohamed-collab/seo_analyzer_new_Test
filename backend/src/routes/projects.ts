@@ -24,6 +24,7 @@ import {
   parseProjectFormValues,
   isAutomationReady,
 } from '../lib/projectInput.js';
+import { staleAuditTimeoutMinutes } from '../lib/staleAuditRuns.js';
 
 export const projectsRouter = Router();
 
@@ -134,17 +135,33 @@ projectsRouter.get('/projects/:id', async (req: Request, res: Response) => {
   if (!db) return;
 
   try {
+    // `running_count` counts only NON-STALE running audits. The runner uses it
+    // as a pre-flight check and skips the project entirely when it is > 0, so a
+    // crashed row left RUNNING forever would block that project permanently —
+    // POST-side recovery alone could never be reached. This read stays strictly
+    // read-only: nothing is recovered here. Excluding stale rows only lets the
+    // runner proceed to POST, where the authoritative transactional recovery
+    // happens under the existing locks. `stale_running_count` is exposed for
+    // observability.
+    const staleTimeoutMinutes = staleAuditTimeoutMinutes();
     const { rows } = await db.query(
       `SELECT
          s.*,
          COUNT(ar.id)::int                                           AS audit_count,
          COUNT(ar.id) FILTER (WHERE ar.status = 'COMPLETED')::int   AS completed_count,
-         COUNT(ar.id) FILTER (WHERE ar.status = 'RUNNING')::int     AS running_count
+         COUNT(ar.id) FILTER (
+           WHERE ar.status = 'RUNNING'
+             AND ar.started_at >= NOW() - make_interval(mins => $2::int)
+         )::int                                                      AS running_count,
+         COUNT(ar.id) FILTER (
+           WHERE ar.status = 'RUNNING'
+             AND ar.started_at < NOW() - make_interval(mins => $2::int)
+         )::int                                                      AS stale_running_count
        FROM sites s
        LEFT JOIN audit_runs ar ON ar.site_id = s.id
        WHERE s.id = $1
        GROUP BY s.id`,
-      [req.params.id],
+      [req.params.id, staleTimeoutMinutes],
     );
     if (!rows.length) {
       res.status(404).json({ error: 'Project not found' });

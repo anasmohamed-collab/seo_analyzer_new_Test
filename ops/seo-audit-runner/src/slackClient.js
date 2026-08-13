@@ -14,6 +14,7 @@
  */
 
 import { setTimeout as sleepDefault } from 'node:timers/promises';
+import { sanitizeSlackMessage } from './slackFormat.js';
 
 export const SLACK_POST_MESSAGE_URL = 'https://slack.com/api/chat.postMessage';
 
@@ -137,7 +138,15 @@ export function createSlackSender({
      * @throws {SlackPermanentError} permanent failure — do not retry
      * @throws {SlackRetryableError} transient failure after all retries
      */
-    async send(message) {
+    async send(rawMessage) {
+      // Last-mile guard. Payloads written to SQLite before broad mentions were
+      // removed are replayed verbatim by `retry-notifications`; stripping here
+      // means no queued legacy payload can page a channel on its way out. The
+      // stored notification row is never rewritten — only what we transmit.
+      const message = sanitizeSlackMessage(rawMessage);
+      if (message !== rawMessage) {
+        logger?.debug?.('Stripped a broad mention from a stored Slack payload before delivery');
+      }
       let lastReason = 'unknown';
       for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
         let outcome;

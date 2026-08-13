@@ -119,10 +119,10 @@ NOTIFICATIONS_ENABLED=true
 SLACK_BOT_TOKEN=<xoxb-your-bot-token>
 SLACK_CHANNEL_ID=<C0XXXXXXXXX>
 
-# channel | here | everyone | none  (default: channel)
-# Adds <!channel> to alerts that contain a NEW or REOPENED P0 issue only.
-# Run summaries never contain a broad mention. Use `none` to switch it off.
-SLACK_CRITICAL_MENTION=channel
+# Broad channel mentions are permanently disabled — no runner message emits
+# <!channel>, <!here> or <!everyone>. `none` is the default and the only
+# effective value; a legacy broad value is accepted and neutralized.
+SLACK_CRITICAL_MENTION=none
 ```
 
 **Secret handling:** `runner.env` is the ONLY place secrets live

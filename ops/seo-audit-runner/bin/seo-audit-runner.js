@@ -9,7 +9,7 @@
  *   run --all | --project <id> [--dry-run] [--max-concurrency <n>]
  *       [--no-notifications] [--fail-on-critical]
  *   retry-notifications [--limit <n>] [--project <id>] [--dry-run]
- *   status | health | doctor | worker --once | job … | schedule …
+ *   version | status | health | doctor | worker --once | job … | schedule …
  *
  * Exit codes (precedence: 4 > 1 > 3 > 2 > 0):
  *   0  completed successfully
@@ -59,6 +59,7 @@ import {
   DEFAULT_LIST_LIMIT,
 } from '../src/cli/manage.js';
 import { createOutput, resolveOutputMode, OutputModeError, ERROR_CODES } from '../src/cli/output.js';
+import { formatReleaseIdentity, readReleaseIdentity } from '../src/releaseIdentity.js';
 
 const USAGE = `Usage: seo-audit-runner <command> [options]
 
@@ -71,6 +72,9 @@ Commands:
   retry-notifications       Retry queued/failed Slack notifications (manual;
                             the tick does this automatically)
   status                    Show runner-owned state (no audits triggered)
+  version                   Print release identity: package version, full Git
+                            SHA, release stamp, release checksum, Node version
+                            (read-only: no config, no secrets, no state)
   health                    Fast health check   (exit 0 healthy / 1 unhealthy / 2 degraded)
   doctor                    Deep diagnostics    (adds integrity, disk, systemd checks)
   worker --once             One scheduler tick: recover, enqueue due schedules,
@@ -194,6 +198,15 @@ async function main() {
     return EXIT_CODES.RUNNER_FAILURE;
   }
 
+  // `version` is answered BEFORE any env file is read, any configuration is
+  // loaded, or any state directory is touched: it must be safe to run on a
+  // half-configured host, and it must never surface a secret.
+  if (command === 'version') {
+    const identity = readReleaseIdentity();
+    out.ok(identity, formatReleaseIdentity(identity));
+    return EXIT_CODES.OK;
+  }
+
   loadEnvFile(values['env-file'] ?? path.join(PACKAGE_ROOT, '.env'));
 
   let config;
@@ -291,8 +304,10 @@ function validateConfigCommand(config, logger, out) {
     `  NOTIFICATIONS_ENABLED   = ${config.notificationsEnabled}`,
     `  Alert mode              = ${config.alertMode}`,
     `  Send run summary        = ${config.sendRunSummary}`,
-    `  SLACK_CRITICAL_MENTION  = ${config.slackCriticalMention} ` +
-      '(new/reopened P0 alerts only; never on run summaries)',
+    `  SLACK_CRITICAL_MENTION  = ${config.slackCriticalMention}` +
+      (config.slackCriticalMentionNeutralized
+        ? ' (configured broad mention neutralized — runner alerts never mention a channel)'
+        : ' (broad channel mentions are permanently disabled)'),
   ];
 
   // Never print configured Slack values — only whether they are set.
