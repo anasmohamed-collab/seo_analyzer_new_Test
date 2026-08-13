@@ -53,6 +53,11 @@ export type ParsedCreateProject =
       isBeta: boolean | null;
       /** null when the request supplied no audit configuration at all */
       formValues: FormValues | null;
+      /**
+       * true when the caller asked for the create-only contract: insert a new
+       * project or fail with a conflict, never update an existing row.
+       */
+      createOnly: boolean;
     }
   | { ok: false; error: string };
 
@@ -63,6 +68,13 @@ function cleanString(value: unknown): string | null {
 function parseOptionalBeta(input: Record<string, unknown>): boolean | null | undefined {
   const value = input.is_beta ?? input.isBeta;
   if (value === undefined) return null;
+  return typeof value === 'boolean' ? value : undefined;
+}
+
+/** `undefined` means the value was supplied but is not a boolean. */
+function parseCreateOnly(input: Record<string, unknown>): boolean | undefined {
+  const value = input.create_only ?? input.createOnly;
+  if (value === undefined) return false;
   return typeof value === 'boolean' ? value : undefined;
 }
 
@@ -167,6 +179,11 @@ export function parseProjectFormValues(
  * homeUrl and articleUrl, because a half-configured project is silently skipped
  * by the runner. Supplying none is fine — the project is simply not yet
  * automation-ready.
+ *
+ * `create_only: true` selects the insert-or-conflict contract. It additionally
+ * refuses audit configuration: a create-only import establishes project
+ * identity and nothing else, so it can never write a fabricated homeUrl or
+ * articleUrl and can never make a brand new project automation-ready.
  */
 export function parseCreateProjectBody(body: unknown): ParsedCreateProject {
   const input =
@@ -183,6 +200,11 @@ export function parseCreateProjectBody(body: unknown): ParsedCreateProject {
     return { ok: false, error: 'is_beta must be a boolean when supplied' };
   }
 
+  const createOnly = parseCreateOnly(input);
+  if (createOnly === undefined) {
+    return { ok: false, error: 'create_only must be a boolean when supplied' };
+  }
+
   const site = normalizeWebsiteUrl(input.website_url);
   if (!site.ok) {
     return { ok: false, error: describeUrlRejection('website_url', site.reason) };
@@ -191,14 +213,13 @@ export function parseCreateProjectBody(body: unknown): ParsedCreateProject {
   const parsedFormValues = parseProjectFormValues(input, site.domain);
   if (!parsedFormValues.ok) return parsedFormValues;
 
-  if (parsedFormValues.formValues === null) {
+  if (createOnly && parsedFormValues.formValues !== null) {
     return {
-      ok: true,
-      domain: site.domain,
-      websiteUrl: site.websiteUrl,
-      projectName: cleanString(input.project_name) ?? site.domain,
-      isBeta,
-      formValues: null,
+      ok: false,
+      error:
+        'create_only requests must not carry audit configuration — ' +
+        `remove ${Object.keys(parsedFormValues.formValues).sort().join(', ')} ` +
+        'and configure the project separately once it exists',
     };
   }
 
@@ -209,5 +230,6 @@ export function parseCreateProjectBody(body: unknown): ParsedCreateProject {
     projectName: cleanString(input.project_name) ?? site.domain,
     isBeta,
     formValues: parsedFormValues.formValues,
+    createOnly,
   };
 }

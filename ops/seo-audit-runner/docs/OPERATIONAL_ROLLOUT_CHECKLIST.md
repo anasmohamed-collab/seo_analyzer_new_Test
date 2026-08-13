@@ -150,12 +150,31 @@ Nothing in this part modifies anything.
 
 - [ ] **G1.** Run a mixed batch: 3 Production + 2 Beta projects.
 - [ ] **G2.** Only then reuse the import tooling, in this order:
-      1. `smacient:gsc-sync --dry-run`
-      2. review the output
-      3. import valid **Production** projects
-      4. `audit-config:discover`
-      5. review the real article URLs (Part A4 rules still apply)
-      6. apply
+      1. capture every `gsc_list_sites` page from the Smacient MCP tool
+         `query-web-performance` into a `{"pages":[…]}` file, **outside the
+         repository** — it is raw third-party data
+      2. capture the A1a project inventory into a file (or point `--api` at a
+         non-production target)
+      3. `smacient:gsc-sync --dry-run --create-only --input <pages> --existing-projects <inventory> --json <report>`
+      4. review the report: the create list, the proposed updates create-only
+         will ignore, and every non-production / ambiguous / unparsable
+         property with its stated reason
+      5. `smacient:gsc-sync --apply --create-only …` — creates missing
+         **Production** projects only. Each write is a single
+         `INSERT … ON CONFLICT (domain) DO NOTHING`, so an existing project is
+         never modified and a project that appeared since step 3 returns 409
+         and halts the run. Confirm the run reports
+         `Existing-project preservation VERIFIED`.
+      6. `audit-config:discover`
+      7. review the real article URLs (Part A4 rules still apply)
+      8. apply the audit configuration
+
+      **`--apply` on its own now fails.** It requires an explicit write mode:
+      `--create-only` (safe) or `--allow-updates` (the legacy upsert, which can
+      rewrite `project_name` and `website_url` on existing projects). Proposed
+      updates are never written in create-only mode — review them separately.
+      Non-production and ambiguous properties are never created automatically;
+      a hostname is not evidence (A2/A3).
 - [ ] **G3.** Expand to the full fleet only after monitoring shows: complete
       evidence, no duplicate projects, no false alerts, no stale jobs,
       acceptable WAF failure rate, and acceptable audit duration.

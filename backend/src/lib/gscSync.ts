@@ -61,6 +61,21 @@ export interface ExistingProject {
   audit_count?: number;
 }
 
+/**
+ * The full row shape captured from GET /api/projects before and after an apply.
+ * Every field the list endpoint exposes is compared, so an unexpected write to
+ * any of them is detectable rather than merely unlikely.
+ */
+export interface ProjectInventoryRecord extends ExistingProject {
+  is_beta?: boolean | null;
+  last_form_values?: unknown;
+  created_at?: string | null;
+  updated_at?: string | null;
+  last_audit_at?: string | null;
+  completed_count?: number;
+  automation_ready?: boolean;
+}
+
 // ── environment classification ────────────────────────────────────
 
 /**
@@ -135,6 +150,145 @@ export function nextPageToken(payload: SmacientPayload | null | undefined): stri
   if (!payload || Array.isArray(payload) || typeof payload !== 'object') return null;
   const token = (payload as { next_page_token?: string | null }).next_page_token;
   return typeof token === 'string' && token.trim() ? token : null;
+}
+
+// ── fail-closed pagination collection ─────────────────────────────
+
+/** A collection problem that must stop the run rather than shrink the result. */
+export class GscCollectionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'GscCollectionError';
+  }
+}
+
+export interface CollectedGscProperties {
+  /** Unique properties, first occurrence order preserved. */
+  sites: SmacientSite[];
+  pageCount: number;
+  /** Every `site_url` entry across every page, duplicates included. */
+  rawPropertyCount: number;
+  /** How many raw entries were exact repeats of an earlier property. */
+  exactDuplicateCount: number;
+  uniquePropertyCount: number;
+  /** The `next_page_token` observed on each page, in order. */
+  pageTokens: (string | null)[];
+}
+
+interface RawPage {
+  sites?: unknown;
+  next_page_token?: unknown;
+  error?: unknown;
+}
+
+/**
+ * Read a captured `{ "pages": [...] }` envelope of `gsc_list_sites` responses
+ * and fail closed on any sign the collection is incomplete.
+ *
+ * A shortened property list is the one failure mode that silently turns an
+ * import into an under-count, so every ambiguity here is an error:
+ *
+ *  - no `pages` envelope, or an empty one
+ *  - a page that is not an object, carries an `error`, or has no `sites` array
+ *  - the same `next_page_token` seen twice (a pagination loop)
+ *  - the final page still carrying a `next_page_token` (collection stopped early)
+ *  - zero properties in total
+ *
+ * Exact duplicate properties across pages are counted and collapsed; they are
+ * the normal consequence of overlapping pages, not a failure.
+ */
+export function collectGscProperties(payload: unknown): CollectedGscProperties {
+  const envelope = payload as { pages?: unknown } | unknown[] | null | undefined;
+  const rawPages: unknown[] = Array.isArray(envelope)
+    ? envelope
+    : envelope && typeof envelope === 'object' && Array.isArray((envelope as { pages?: unknown }).pages)
+      ? ((envelope as { pages: unknown[] }).pages)
+      : [];
+
+  if (!rawPages.length) {
+    throw new GscCollectionError(
+      'no gsc_list_sites pages found — expected a { "pages": [ … ] } envelope with at least one captured page',
+    );
+  }
+
+  const sites: SmacientSite[] = [];
+  const seen = new Set<string>();
+  const pageTokens: (string | null)[] = [];
+  const seenTokens = new Set<string>();
+  let rawPropertyCount = 0;
+  let exactDuplicateCount = 0;
+
+  rawPages.forEach((page, index) => {
+    const label = `page ${index + 1} of ${rawPages.length}`;
+    if (!page || typeof page !== 'object' || Array.isArray(page)) {
+      throw new GscCollectionError(`${label} is not a gsc_list_sites response object`);
+    }
+    const typed = page as RawPage;
+
+    if (typed.error !== undefined && typed.error !== null) {
+      throw new GscCollectionError(
+        `${label} reports an error (${String(typed.error)}) — the property list is incomplete`,
+      );
+    }
+    if (!Array.isArray(typed.sites)) {
+      throw new GscCollectionError(
+        `${label} carries no sites array — the property list is incomplete`,
+      );
+    }
+
+    for (const entry of typed.sites as unknown[]) {
+      const siteUrl =
+        entry && typeof entry === 'object' && typeof (entry as SmacientSite).site_url === 'string'
+          ? (entry as SmacientSite).site_url.trim()
+          : '';
+      if (!siteUrl) {
+        throw new GscCollectionError(`${label} contains an entry with no site_url`);
+      }
+      rawPropertyCount++;
+      if (seen.has(siteUrl)) {
+        exactDuplicateCount++;
+        continue;
+      }
+      seen.add(siteUrl);
+      sites.push(entry as SmacientSite);
+    }
+
+    const token = typeof typed.next_page_token === 'string' && typed.next_page_token.trim()
+      ? typed.next_page_token.trim()
+      : null;
+    pageTokens.push(token);
+
+    if (token) {
+      if (seenTokens.has(token)) {
+        throw new GscCollectionError(
+          `${label} repeats a pagination token already seen — refusing to loop over gsc_list_sites`,
+        );
+      }
+      seenTokens.add(token);
+      if (index === rawPages.length - 1) {
+        throw new GscCollectionError(
+          `${label} is the last captured page but still carries a next_page_token — ` +
+            'collection stopped before Google ran out of properties',
+        );
+      }
+    }
+  });
+
+  if (!sites.length) {
+    throw new GscCollectionError(
+      'gsc_list_sites returned zero Google Search Console properties — ' +
+        'this requires verification and is NOT a signal to remove existing projects',
+    );
+  }
+
+  return {
+    sites,
+    pageCount: rawPages.length,
+    rawPropertyCount,
+    exactDuplicateCount,
+    uniquePropertyCount: sites.length,
+    pageTokens,
+  };
 }
 
 // ── parsing a single property ─────────────────────────────────────
@@ -599,4 +753,117 @@ export function buildUpsertBody(entry: PlanEntry): { project_name: string; websi
     throw new Error(`entry for ${entry.domain} is not applyable`);
   }
   return { project_name: entry.proposedProjectName, website_url: entry.proposedWebsiteUrl };
+}
+
+/**
+ * The request body for one create-only POST /api/projects call.
+ *
+ * `create_only: true` selects the insert-or-409 contract, so this request can
+ * only ever add a row. Only the minimum project identity is sent: no audit
+ * configuration, and no `is_beta` — a hostname is not evidence of a
+ * non-production environment, so the classification is left at its default and
+ * decided by a human later.
+ *
+ * Refuses any entry the planner did not classify as a safe creation, so a
+ * caller cannot smuggle an update, a non-production host or an ambiguous
+ * property into the create path.
+ */
+export function buildCreateOnlyBody(entry: PlanEntry): {
+  project_name: string;
+  website_url: string;
+  create_only: true;
+} {
+  if (entry.action !== 'create') {
+    throw new Error(
+      `entry for ${entry.domain} has action "${entry.action}" — only "create" entries may be applied in create-only mode`,
+    );
+  }
+  if (entry.existingProjectId) {
+    throw new Error(`entry for ${entry.domain} already maps to project ${entry.existingProjectId}`);
+  }
+  if (!entry.proposedWebsiteUrl || !entry.proposedProjectName) {
+    throw new Error(`entry for ${entry.domain} is not applyable`);
+  }
+  return {
+    project_name: entry.proposedProjectName,
+    website_url: entry.proposedWebsiteUrl,
+    create_only: true,
+  };
+}
+
+// ── existing-project preservation proof ───────────────────────────
+
+/** Every inventory field compared before and after an apply. */
+export const INVENTORY_FIELDS = [
+  'domain', 'project_name', 'website_url', 'is_beta', 'last_form_values',
+  'created_at', 'updated_at', 'last_audit_at', 'audit_count', 'completed_count',
+  'automation_ready',
+] as const;
+
+export interface InventoryFieldDiff {
+  id: string;
+  field: string;
+  before: unknown;
+  after: unknown;
+}
+
+export interface InventoryComparison {
+  /** Pre-existing project IDs whose every compared field is identical. */
+  unchangedIds: string[];
+  /** Field-level differences on pre-existing projects — must always be empty. */
+  changed: InventoryFieldDiff[];
+  /** Pre-existing project IDs missing afterwards — must always be empty. */
+  missingIds: string[];
+  /** IDs present only afterwards, i.e. the rows this run created. */
+  addedIds: string[];
+  preserved: boolean;
+}
+
+function stable(value: unknown): string {
+  return value === undefined ? 'undefined' : JSON.stringify(value ?? null);
+}
+
+/**
+ * Prove that every project that existed before the apply is byte-for-byte
+ * identical afterwards. Newly added IDs are reported separately and are the
+ * only difference a create-only apply may produce.
+ */
+export function compareInventories(
+  before: ProjectInventoryRecord[],
+  after: ProjectInventoryRecord[],
+): InventoryComparison {
+  const afterById = new Map(after.map((p) => [p.id, p]));
+  const beforeIds = new Set(before.map((p) => p.id));
+
+  const changed: InventoryFieldDiff[] = [];
+  const missingIds: string[] = [];
+  const unchangedIds: string[] = [];
+
+  for (const prior of before) {
+    const current = afterById.get(prior.id);
+    if (!current) {
+      missingIds.push(prior.id);
+      continue;
+    }
+    const before1 = prior as unknown as Record<string, unknown>;
+    const after1 = current as unknown as Record<string, unknown>;
+    let dirty = false;
+    for (const field of INVENTORY_FIELDS) {
+      if (stable(before1[field]) !== stable(after1[field])) {
+        changed.push({ id: prior.id, field, before: before1[field] ?? null, after: after1[field] ?? null });
+        dirty = true;
+      }
+    }
+    if (!dirty) unchangedIds.push(prior.id);
+  }
+
+  const addedIds = after.map((p) => p.id).filter((id) => !beforeIds.has(id));
+
+  return {
+    unchangedIds,
+    changed,
+    missingIds,
+    addedIds,
+    preserved: changed.length === 0 && missingIds.length === 0,
+  };
 }

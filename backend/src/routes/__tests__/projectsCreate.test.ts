@@ -1,106 +1,27 @@
 /**
  * Route-level tests for POST /api/projects and the GET /api/projects ordering.
  *
- * The pg pool is replaced by a small fake that emulates the documented upsert
- * semantics of the statement in projects.ts (ON CONFLICT (domain) DO UPDATE,
- * COALESCE on last_form_values, `xmax = 0` as the created flag). The fake lets
- * us assert the HTTP contract without a live database; the SQL text itself is
- * asserted separately so the fake cannot drift from the real statement.
+ * The pg pool is replaced by a shared fake that emulates the documented
+ * semantics of both statements in projects.ts — the legacy upsert
+ * (ON CONFLICT (domain) DO UPDATE, COALESCE on last_form_values, `xmax = 0` as
+ * the created flag) and the create-only insert (ON CONFLICT (domain) DO
+ * NOTHING). The fake lets us assert the HTTP contract without a live database;
+ * the SQL text itself is asserted separately so the fake cannot drift from the
+ * real statements.
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import express from 'express';
 import type { AddressInfo } from 'node:net';
 
-// ── Fake pg pool ──────────────────────────────────────────────────
+import { createFakeSitesDb, type SiteRow } from './fakeSitesDb.js';
 
-interface SiteRow {
-  id: string;
-  domain: string;
-  project_name: string | null;
-  website_url: string | null;
-  is_beta: boolean;
-  last_form_values: Record<string, string> | null;
-  created_at: string;
-  last_audit_at: string | null;
-}
-
-const sites: SiteRow[] = [];
-const executedSql: string[] = [];
-let nextId = 1;
-
-function fakeQuery(sql: string, params: unknown[] = []) {
-  executedSql.push(sql);
-
-  if (/SELECT id, domain FROM sites WHERE id/i.test(sql)) {
-    const row = sites.find((s) => s.id === String(params[0]));
-    return Promise.resolve({ rows: row ? [{ id: row.id, domain: row.domain }] : [] });
-  }
-
-  if (/UPDATE sites[\s\S]*SET last_form_values/i.test(sql)) {
-    const [formValues, id] = params as [string, string];
-    const row = sites.find((s) => s.id === id);
-    if (!row) return Promise.resolve({ rows: [] });
-    row.last_form_values = JSON.parse(formValues);
-    return Promise.resolve({ rows: [{ ...row }] });
-  }
-
-  if (/INSERT INTO sites/i.test(sql)) {
-    const [domain, projectName, websiteUrl, formValues, isBeta] = params as [
-      string,
-      string,
-      string,
-      string | null,
-      boolean | null,
-    ];
-    const existing = sites.find((s) => s.domain === domain);
-
-    if (existing) {
-      existing.project_name = projectName;
-      existing.website_url = websiteUrl;
-      // COALESCE(EXCLUDED.last_form_values, sites.last_form_values)
-      if (formValues !== null) existing.last_form_values = JSON.parse(formValues);
-      // Omission preserves the existing classification.
-      if (isBeta !== null) existing.is_beta = isBeta;
-      return Promise.resolve({ rows: [{ ...existing, created: false }] });
-    }
-
-    const row: SiteRow = {
-      id: `site-${nextId++}`,
-      domain,
-      project_name: projectName,
-      website_url: websiteUrl,
-      is_beta: isBeta ?? false,
-      last_form_values: formValues === null ? null : JSON.parse(formValues),
-      created_at: new Date().toISOString(),
-      last_audit_at: null,
-    };
-    sites.push(row);
-    return Promise.resolve({ rows: [{ ...row, created: true }] });
-  }
-
-  if (/^\s*UPDATE sites/i.test(sql)) {
-    const [projectName, isBeta, id] = params as [string | null, boolean | null, string];
-    const existing = sites.find((s) => s.id === id);
-    if (!existing) return Promise.resolve({ rows: [] });
-    if (projectName !== null) existing.project_name = projectName;
-    if (isBeta !== null) existing.is_beta = isBeta;
-    return Promise.resolve({ rows: [{ ...existing }] });
-  }
-
-  if (/FROM sites s/i.test(sql)) {
-    return Promise.resolve({
-      rows: sites.map((s) => ({ ...s, audit_count: 0, completed_count: 0 })),
-    });
-  }
-
-  return Promise.resolve({ rows: [] });
-}
-
-let dbAvailable = true;
+const db = createFakeSitesDb();
+const sites = db.sites;
+const executedSql = db.executedSql;
 
 vi.mock('../../lib/db.js', () => ({
-  getDb: () => (dbAvailable ? { query: fakeQuery } : null),
+  getDb: () => (db.available ? { query: db.query } : null),
 }));
 
 // Imported after the mock is registered.
@@ -162,10 +83,7 @@ async function createProject(body: unknown): Promise<CreateResponse> {
 }
 
 beforeEach(() => {
-  sites.length = 0;
-  executedSql.length = 0;
-  nextId = 1;
-  dbAvailable = true;
+  db.reset();
 });
 
 // ── Tests ─────────────────────────────────────────────────────────
@@ -393,9 +311,142 @@ describe('PATCH /api/projects/:id/form-values', () => {
   });
 });
 
+// ── create-only contract ──────────────────────────────────────────
+
+describe('POST /api/projects — create_only contract', () => {
+  const createOnly = (body: Record<string, unknown>) =>
+    postProject({ ...body, create_only: true });
+
+  it('uses an atomic ON CONFLICT (domain) DO NOTHING insert, never an UPDATE', async () => {
+    await createOnly({ website_url: 'https://example.com' });
+    const sql = executedSql.find((s) => /INSERT INTO sites/i.test(s)) ?? '';
+
+    expect(sql).toMatch(/ON CONFLICT \(domain\)\s+DO NOTHING/i);
+    expect(sql).toMatch(/RETURNING \*/i);
+    expect(sql).not.toMatch(/DO UPDATE/i);
+    // A check-then-write would need a prior SELECT on the domain.
+    expect(executedSql.filter((s) => /SELECT/i.test(s))).toHaveLength(0);
+  });
+
+  it('returns 201 with created:true for a new domain', async () => {
+    const res = await createOnly({ website_url: 'https://example.com' });
+    expect(res.status).toBe(201);
+
+    const body = await json<CreateResponse & { conflict: boolean }>(res);
+    expect(body.created).toBe(true);
+    expect(body.conflict).toBe(false);
+    expect(body.project.domain).toBe('example.com');
+  });
+
+  it('creates only the minimum project identity — no audit configuration, no beta guess', async () => {
+    const body = await json<CreateResponse>(
+      await createOnly({ website_url: 'https://beta-looking.example.com', project_name: 'Example' }),
+    );
+
+    expect(body.project.last_form_values).toBeNull();
+    expect(body.automation_ready).toBe(false);
+    expect(body.project.is_beta).toBe(false);
+    expect(body.project.last_audit_at).toBeNull();
+
+    type ListedProject = SiteRow & {
+      audit_count: number;
+      completed_count: number;
+      automation_ready: boolean;
+    };
+    const listed = await json<{ projects: ListedProject[] }>(await fetch(`${base}/api/projects`));
+    const created = listed.projects.find((p) => p.domain === 'beta-looking.example.com')!;
+    expect(created.audit_count).toBe(0);
+    expect(created.completed_count).toBe(0);
+    expect(created.automation_ready).toBe(false);
+  });
+
+  it('returns 409 and leaves every field of the existing project untouched', async () => {
+    const existing = db.seed({
+      domain: 'example.com',
+      project_name: 'Hand-Curated Name',
+      website_url: 'https://example.com/',
+      is_beta: true,
+      last_form_values: { homeUrl: 'https://example.com/', articleUrl: 'https://example.com/story' },
+    });
+    const before = db.snapshot();
+
+    const res = await createOnly({ website_url: 'https://example.com', project_name: 'Imported Name' });
+    expect(res.status).toBe(409);
+
+    const body = await json<{ conflict: boolean; created: boolean; existing_project_id: string }>(res);
+    expect(body.conflict).toBe(true);
+    expect(body.created).toBe(false);
+    expect(body.existing_project_id).toBe(existing.id);
+
+    // Byte-for-byte identical, including updated_at.
+    expect(db.snapshot()).toEqual(before);
+    expect(executedSql.some((s) => /DO UPDATE/i.test(s))).toBe(false);
+  });
+
+  it('treats a www variant as the same canonical project and conflicts', async () => {
+    await createOnly({ website_url: 'https://example.com' });
+    const before = db.snapshot();
+
+    const res = await createOnly({ website_url: 'https://www.example.com' });
+    expect(res.status).toBe(409);
+    expect(sites).toHaveLength(1);
+    expect(db.snapshot()).toEqual(before);
+  });
+
+  it('is idempotent — a repeated create-only request changes nothing', async () => {
+    expect((await createOnly({ website_url: 'https://example.com' })).status).toBe(201);
+    const after1 = db.snapshot();
+
+    expect((await createOnly({ website_url: 'https://example.com' })).status).toBe(409);
+    expect((await createOnly({ website_url: 'https://example.com' })).status).toBe(409);
+    expect(db.snapshot()).toEqual(after1);
+  });
+
+  it('rejects audit configuration with 400 and writes nothing', async () => {
+    const res = await createOnly({
+      website_url: 'https://example.com',
+      homeUrl: 'https://example.com/',
+      articleUrl: 'https://example.com/a-story',
+    });
+
+    expect(res.status).toBe(400);
+    expect((await json<ErrorResponse>(res)).error).toContain('must not carry audit configuration');
+    expect(sites).toHaveLength(0);
+  });
+
+  it('rejects a non-boolean create_only with 400', async () => {
+    const res = await postProject({ website_url: 'https://example.com', create_only: 'yes' });
+    expect(res.status).toBe(400);
+    expect((await json<ErrorResponse>(res)).error).toContain('create_only must be a boolean');
+    expect(sites).toHaveLength(0);
+  });
+
+  it('leaves the legacy upsert behavior unchanged for callers that omit create_only', async () => {
+    await postProject({ website_url: 'https://example.com', project_name: 'First' });
+    const res = await postProject({ website_url: 'https://example.com', project_name: 'Second' });
+
+    expect(res.status).toBe(200);
+    const body = await json<CreateResponse>(res);
+    expect(body.created).toBe(false);
+    expect(body.project.project_name).toBe('Second');
+  });
+
+  it('honours an explicit create_only:false as the legacy upsert', async () => {
+    await postProject({ website_url: 'https://example.com', project_name: 'First' });
+    const res = await postProject({
+      website_url: 'https://example.com',
+      project_name: 'Second',
+      create_only: false,
+    });
+
+    expect(res.status).toBe(200);
+    expect((await json<CreateResponse>(res)).project.project_name).toBe('Second');
+  });
+});
+
 describe('no database configured', () => {
   it('returns 501 from POST /api/projects', async () => {
-    dbAvailable = false;
+    db.available = false;
     const res = await postProject({ website_url: 'https://example.com' });
 
     expect(res.status).toBe(501);
@@ -403,7 +454,7 @@ describe('no database configured', () => {
   });
 
   it('returns 501 from GET /api/projects', async () => {
-    dbAvailable = false;
+    db.available = false;
     expect((await fetch(`${base}/api/projects`)).status).toBe(501);
   });
 });

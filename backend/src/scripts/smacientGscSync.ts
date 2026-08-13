@@ -2,122 +2,68 @@
  * smacient:gsc-sync — synchronize SEO Analyzer projects with the Google
  * Search Console properties reported by Smacient MCP.
  *
- *   npm run smacient:gsc-sync -- --dry-run
- *   npm run smacient:gsc-sync -- --apply
+ *   npm run smacient:gsc-sync -- --dry-run --create-only
+ *   npm run smacient:gsc-sync -- --apply   --create-only
  *
  * The property list always originates from the Smacient MCP tool
  * `query-web-performance`, action `gsc_list_sites`. This command never calls
  * Google directly, never creates credentials, and never infers the property
- * list from the database. The verbatim MCP response is supplied via --input;
- * capture it with the MCP tool and hand the file to this command.
+ * list from the database. The verbatim MCP responses are supplied via --input
+ * as a `{ "pages": [ … ] }` envelope containing every collected page.
  *
- * Dry run is the default and performs zero writes. Apply mode may only create
- * missing production projects and correct website_url / unusable names. It
- * never deletes, never merges, never triggers an audit, and never touches
- * audit history or audit configuration.
+ * Dry run is the default and performs zero writes.
+ *
+ * Apply requires an explicit mode:
+ *
+ *   --create-only    the safe import path. Only `plan.create` is written, and
+ *                    each write uses the POST /api/projects `create_only:true`
+ *                    contract, which is a single atomic
+ *                    INSERT … ON CONFLICT (domain) DO NOTHING. An existing
+ *                    project is never updated, and a project that appears
+ *                    between planning and the write returns 409 and halts the
+ *                    run instead of being overwritten.
+ *
+ *   --allow-updates  the legacy upsert path, kept for callers that genuinely
+ *                    want website_url / project_name corrections applied. It
+ *                    can modify existing projects and must be chosen
+ *                    deliberately.
+ *
+ * Neither mode ever deletes, merges, PATCHes, triggers an audit, sends a
+ * notification, enables a schedule, or reclassifies an environment.
  */
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import process from 'node:process';
 
 import {
-  buildUpsertBody,
+  buildCreateOnlyBody,
+  collectGscProperties,
+  compareInventories,
+  GscCollectionError,
   groupByCanonicalDomain,
   parseProperties,
   planSync,
-  readSmacientSites,
-  type ExistingProject,
+  type CollectedGscProperties,
+  type InventoryComparison,
   type LiveCheck,
-  type PlanEntry,
+  type ProjectInventoryRecord,
   type SyncPlan,
 } from '../lib/gscSync.js';
+import { applyPlan, fetchInventory } from '../lib/gscSyncApply.js';
+import {
+  assertAllowedTarget,
+  buildCoverage,
+  collapsedPropertyGroups,
+  extractSiteName,
+  modeLabel,
+  parseArgs,
+  sanitize,
+  UsageError,
+  type CoverageReport,
+  type Options,
+} from '../lib/gscSyncCli.js';
 
-/** Never contact the production deployment from this tool. */
-const FORBIDDEN_HOSTS = ['seo-analyzer.layoutworkflows.com'];
-
-const DEFAULT_API = process.env.SEO_API_BASE_URL ?? 'http://localhost:3000';
 const USER_AGENT = 'seo-analyzer-smacient-gsc-sync/1.0';
-
-interface Options {
-  apply: boolean;
-  input: string | null;
-  apiBase: string;
-  jsonOut: string | null;
-  liveCheck: boolean;
-  concurrency: number;
-}
-
-function parseArgs(argv: string[]): Options {
-  const opts: Options = {
-    apply: false,
-    input: null,
-    apiBase: DEFAULT_API,
-    jsonOut: null,
-    liveCheck: true,
-    concurrency: 6,
-  };
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i];
-    switch (arg) {
-      case '--apply': opts.apply = true; break;
-      case '--dry-run': opts.apply = false; break;
-      case '--no-live-check': opts.liveCheck = false; break;
-      case '--input': opts.input = argv[++i] ?? null; break;
-      case '--api': opts.apiBase = argv[++i] ?? DEFAULT_API; break;
-      case '--json': opts.jsonOut = argv[++i] ?? null; break;
-      case '--concurrency': opts.concurrency = Math.max(1, Number(argv[++i]) || 6); break;
-      default:
-        if (arg.startsWith('--')) throw new Error(`Unknown flag: ${arg}`);
-    }
-  }
-  return opts;
-}
-
-/** Redact anything that looks like a token before it can reach a log line. */
-function sanitize(message: string): string {
-  return message
-    .replace(/(bearer\s+)[A-Za-z0-9._-]+/gi, '$1[redacted]')
-    .replace(/([?&](?:key|token|access_token|api_key)=)[^&\s]+/gi, '$1[redacted]')
-    .replace(/\/\/[^/\s:@]+:[^/\s@]+@/g, '//[redacted]@');
-}
-
-function assertAllowedTarget(apiBase: string): void {
-  let host: string;
-  try {
-    host = new URL(apiBase).hostname.toLowerCase();
-  } catch {
-    throw new Error(`Invalid --api base URL: ${apiBase}`);
-  }
-  if (FORBIDDEN_HOSTS.includes(host)) {
-    throw new Error(`Refusing to target the production host ${host}`);
-  }
-}
-
-// ── HTML helpers ──────────────────────────────────────────────────
-
-const ENTITIES: Record<string, string> = {
-  '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;': "'", '&apos;': "'",
-};
-
-function decodeEntities(value: string): string {
-  return value.replace(/&(amp|lt|gt|quot|#39|apos);/g, (m) => ENTITIES[m] ?? m);
-}
-
-/**
- * Read og:site_name. The content value is delimited with a backreference so a
- * name containing an apostrophe (`Pouvoirs d'Afrique`) is not truncated.
- */
-export function extractSiteName(html: string): string {
-  const patterns = [
-    /<meta[^>]+?property=["']og:site_name["'][^>]*?content=(["'])([\s\S]*?)\1/i,
-    /<meta[^>]+?content=(["'])([\s\S]*?)\1[^>]*?property=["']og:site_name["']/i,
-  ];
-  for (const re of patterns) {
-    const m = html.match(re);
-    if (m?.[2]?.trim()) return decodeEntities(m[2].trim()).replace(/\s+/g, ' ');
-  }
-  return '';
-}
 
 // ── live check ────────────────────────────────────────────────────
 
@@ -164,89 +110,77 @@ async function runPool<T>(items: T[], limit: number, fn: (item: T) => Promise<vo
   await Promise.all(workers);
 }
 
-// ── application API (read + guarded write) ────────────────────────
+// ── captured inventory input ──────────────────────────────────────
 
-async function fetchExistingProjects(apiBase: string): Promise<ExistingProject[]> {
-  const res = await fetch(`${apiBase.replace(/\/$/, '')}/api/projects`, {
-    headers: { Accept: 'application/json', 'User-Agent': USER_AGENT },
-    signal: AbortSignal.timeout(30_000),
-  });
-  if (!res.ok) throw new Error(`GET /api/projects returned HTTP ${res.status}`);
-  const body = (await res.json()) as { projects?: ExistingProject[] };
-  if (!Array.isArray(body.projects)) throw new Error('GET /api/projects returned no projects array');
-  return body.projects;
-}
-
-interface UpsertResult {
-  domain: string;
-  httpStatus: number;
-  created: boolean;
-  automationReady: boolean;
-  projectId: string | null;
-}
-
-async function upsertProject(apiBase: string, entry: PlanEntry): Promise<UpsertResult> {
-  const res = await fetch(`${apiBase.replace(/\/$/, '')}/api/projects`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-      'User-Agent': USER_AGENT,
-    },
-    body: JSON.stringify(buildUpsertBody(entry)),
-    signal: AbortSignal.timeout(30_000),
-  });
-  const body = (await res.json().catch(() => ({}))) as {
-    created?: boolean;
-    automation_ready?: boolean;
-    project?: { id?: string };
-    error?: string;
-  };
-  if (!res.ok && res.status !== 200 && res.status !== 201) {
-    throw new Error(`POST /api/projects for ${entry.domain} returned HTTP ${res.status}: ${body.error ?? ''}`);
+/** Read a previously captured GET /api/projects response from disk. */
+function readInventoryFile(path: string): ProjectInventoryRecord[] {
+  const parsed = JSON.parse(readFileSync(path, 'utf8')) as
+    | { projects?: ProjectInventoryRecord[] }
+    | ProjectInventoryRecord[];
+  const projects = Array.isArray(parsed) ? parsed : parsed.projects;
+  if (!Array.isArray(projects)) {
+    throw new Error(`${path} contains no projects array`);
   }
-  return {
-    domain: entry.domain,
-    httpStatus: res.status,
-    created: Boolean(body.created),
-    automationReady: Boolean(body.automation_ready),
-    projectId: body.project?.id ?? null,
-  };
+  for (const project of projects) {
+    if (!project || typeof project.id !== 'string' || typeof project.domain !== 'string') {
+      throw new Error(`${path} contains a project row with no id/domain`);
+    }
+  }
+  return projects;
 }
 
 // ── console report ────────────────────────────────────────────────
 
-function printReport(plan: SyncPlan, opts: Options): void {
+function printReport(
+  plan: SyncPlan,
+  collected: CollectedGscProperties,
+  coverage: CoverageReport,
+  opts: Options,
+): void {
   const t = plan.totals;
   const log = console.log;
   log('');
   log('Smacient GSC → SEO Analyzer sync');
-  log(`  mode                  ${opts.apply ? 'APPLY' : 'DRY RUN (no writes)'}`);
+  log(`  mode                  ${modeLabel(opts)}`);
   log(`  target                ${opts.apiBase}`);
-  log(`  source                Smacient MCP query-web-performance / gsc_list_sites`);
+  log('  source                Smacient MCP query-web-performance / gsc_list_sites');
   log('');
-  log(`  properties returned   ${t.totalProperties}  (domain ${t.domainProperties}, url-prefix ${t.urlPrefixProperties})`);
+  log(`  pages collected       ${collected.pageCount}`);
+  log(`  raw properties        ${collected.rawPropertyCount}`);
+  log(`  exact duplicates      ${collected.exactDuplicateCount}`);
+  log(`  unique properties     ${collected.uniquePropertyCount}  (domain ${t.domainProperties}, url-prefix ${t.urlPrefixProperties})`);
+  log(`  unique canonical webs ${t.uniqueDomains}`);
   if (t.unparsableProperties) log(`  unparsable            ${t.unparsableProperties}`);
-  log(`  unique domains        ${t.uniqueDomains}`);
   log(`  existing projects     ${t.existingProjects}`);
   log('');
-  log(`  create                ${t.toCreate}`);
-  log(`  update                ${t.toUpdate}`);
-  log(`  unchanged             ${t.unchanged}`);
+  log(`  already represented   ${t.unchanged + t.toUpdate}`);
+  log(`  safe to create        ${t.toCreate}`);
+  log(`  proposed updates      ${t.toUpdate}${opts.createOnly ? '  (reported only — create-only never writes these)' : ''}`);
   log(`  non-production        ${t.nonProduction}`);
-  log(`  duplicates            ${t.duplicates}`);
-  log(`  in DB, not in GSC     ${t.notInGsc}`);
   log(`  ambiguous             ${t.ambiguous}`);
+  log(`  database duplicates   ${t.duplicates}`);
+  log(`  in DB, not in GSC     ${t.notInGsc}`);
   log(`  projects after apply  ${t.expectedProjectsAfterApply}`);
+  log('');
+  log(`  coverage              ${coverage.accountedProperties}/${coverage.uniqueProperties} properties categorized — ${coverage.complete ? 'COMPLETE' : 'INCOMPLETE'}`);
   log('');
 
   if (plan.create.length) {
-    log('CREATE');
-    for (const e of plan.create) log(`  + ${e.domain.padEnd(32)} ${e.proposedWebsiteUrl}  "${e.proposedProjectName}"  [${e.confidence}]`);
+    log('CREATE (safe canonical websites)');
+    for (const e of plan.create) {
+      log(`  + ${e.domain}`);
+      log(`      properties     ${e.gscProperties.join(', ')}`);
+      log(`      permission     ${e.permissionLevels.map((p) => p ?? 'unknown').join(', ')}`);
+      log(`      website_url    ${e.proposedWebsiteUrl}`);
+      log(`      project_name   "${e.proposedProjectName}"`);
+      log(`      confidence     ${e.confidence} — ${e.reason}`);
+    }
     log('');
   }
   if (plan.update.length) {
-    log('UPDATE');
+    log(opts.createOnly
+      ? 'PROPOSED UPDATES (create-only ignores these — review separately)'
+      : 'UPDATE');
     for (const e of plan.update) {
       log(`  ~ ${e.domain}  (project ${e.existingProjectId})`);
       for (const c of e.changes) log(`      ${c.field}: ${c.before ?? 'null'}  ->  ${c.after}`);
@@ -254,12 +188,17 @@ function printReport(plan: SyncPlan, opts: Options): void {
     log('');
   }
   if (plan.nonProduction.length) {
-    log('NON-PRODUCTION (classified only — never created, never deleted)');
+    log('NON-PRODUCTION (manual classification — never created, never deleted)');
     for (const e of plan.nonProduction) log(`  ! ${e.domain.padEnd(32)} ${e.reason}`);
     log('');
   }
+  if (plan.ambiguous.length) {
+    log('AMBIGUOUS (manual review — no action)');
+    for (const e of plan.ambiguous) log(`  ? ${e.domain.padEnd(32)} ${e.reason}`);
+    log('');
+  }
   if (plan.duplicates.length) {
-    log('DUPLICATES (reported only — never merged)');
+    log('DATABASE DUPLICATES (reported only — never merged)');
     for (const d of plan.duplicates) log(`  = ${d.domain}: ${d.rows.map((r) => `${r.id} (${r.auditCount} audits)`).join(', ')}`);
     log('');
   }
@@ -268,9 +207,9 @@ function printReport(plan: SyncPlan, opts: Options): void {
     for (const e of plan.notInGsc) log(`  ? ${e.domain.padEnd(32)} ${e.reason}`);
     log('');
   }
-  if (plan.ambiguous.length) {
-    log('AMBIGUOUS (manual review — no action)');
-    for (const e of plan.ambiguous) log(`  ? ${e.domain.padEnd(32)} ${e.reason}`);
+  if (!coverage.complete) {
+    log('COVERAGE FAILURE — these properties are not categorized exactly once:');
+    for (const line of coverage.unaccounted) log(`  ! ${line}`);
     log('');
   }
 }
@@ -278,16 +217,25 @@ function printReport(plan: SyncPlan, opts: Options): void {
 // ── main ──────────────────────────────────────────────────────────
 
 async function main(): Promise<number> {
-  const opts = parseArgs(process.argv.slice(2));
+  let opts: Options;
+  try {
+    opts = parseArgs(process.argv.slice(2));
+  } catch (err) {
+    if (err instanceof UsageError) {
+      console.error(`error: ${err.message}`);
+      return 2;
+    }
+    throw err;
+  }
   assertAllowedTarget(opts.apiBase);
 
   if (!opts.input) {
     console.error(
       'error: --input <file> is required.\n' +
-        '       Capture the Smacient MCP response first:\n' +
+        '       Capture every Smacient MCP page first:\n' +
         '         tool   query-web-performance\n' +
         '         action gsc_list_sites\n' +
-        '       and save the verbatim JSON to a file.',
+        '       and save them verbatim as {"pages":[<page1>,<page2>,…]}.',
     );
     return 1;
   }
@@ -300,23 +248,26 @@ async function main(): Promise<number> {
     return 1;
   }
 
-  const sites = readSmacientSites(payload as never);
-  if (sites.length === 0) {
-    // An empty result is a state to verify, never permission to remove projects.
-    console.error(
-      'error: Smacient MCP returned zero Google Search Console properties.\n' +
-        '       This requires verification — it is NOT a signal to remove existing projects.\n' +
-        '       Attempted: query-web-performance / gsc_list_sites',
-    );
-    return 1;
+  // Fail closed: an incomplete or looping collection must never be planned on.
+  let collected: CollectedGscProperties;
+  try {
+    collected = collectGscProperties(payload);
+  } catch (err) {
+    if (err instanceof GscCollectionError) {
+      console.error(`error: ${err.message}`);
+      return 1;
+    }
+    throw err;
   }
 
-  const { properties, unparsable } = parseProperties(sites);
-  for (const bad of unparsable) console.error(`warning: unparsable GSC property skipped: ${bad}`);
+  const { properties, unparsable } = parseProperties(collected.sites);
+  for (const bad of unparsable) console.error(`warning: unparsable GSC property reported, not created: ${bad}`);
 
-  let existingProjects: ExistingProject[];
+  let inventoryBefore: ProjectInventoryRecord[];
   try {
-    existingProjects = await fetchExistingProjects(opts.apiBase);
+    inventoryBefore = opts.existingProjects
+      ? readInventoryFile(opts.existingProjects)
+      : await fetchInventory(opts.apiBase);
   } catch (err) {
     console.error(`error: cannot read existing projects: ${sanitize(String((err as Error).message))}`);
     return 1;
@@ -330,90 +281,151 @@ async function main(): Promise<number> {
     });
   }
 
-  const plan = planSync({ properties, unparsable, existingProjects, liveChecks });
-  printReport(plan, opts);
+  const plan = planSync({
+    properties,
+    unparsable,
+    existingProjects: inventoryBefore,
+    liveChecks,
+  });
+  const coverage = buildCoverage(collected, plan, unparsable);
+  printReport(plan, collected, coverage, opts);
 
+  const alreadyRepresented = [...plan.unchanged, ...plan.update];
   const summary: Record<string, unknown> = {
     mode: opts.apply ? 'apply' : 'dry-run',
+    writeMode: opts.createOnly ? 'create-only' : opts.allowUpdates ? 'legacy-upsert' : 'none',
     source: { provider: 'Smacient MCP', tool: 'query-web-performance', action: 'gsc_list_sites' },
     target: opts.apiBase,
+    existingProjectsSource: opts.existingProjects
+      ? { kind: 'captured-file', path: opts.existingProjects }
+      : { kind: 'GET /api/projects', target: opts.apiBase },
+    collection: {
+      pagesCollected: collected.pageCount,
+      pageTokens: collected.pageTokens,
+      rawPropertyCount: collected.rawPropertyCount,
+      exactDuplicatePropertyCount: collected.exactDuplicateCount,
+      uniquePropertyCount: collected.uniquePropertyCount,
+      uniqueCanonicalWebsiteCount: plan.totals.uniqueDomains,
+    },
+    coverage,
     totals: plan.totals,
-    create: plan.create,
-    update: plan.update,
-    unchanged: plan.unchanged,
-    nonProduction: plan.nonProduction,
-    duplicates: plan.duplicates,
-    notInGsc: plan.notInGsc,
-    ambiguous: plan.ambiguous,
-    writes: { attempted: 0, created: 0, updated: 0, conflicts: 0, failed: 0 },
+    existingCanonicalProjects: alreadyRepresented,
+    safeProjectsProposedForCreation: plan.create.map((e) => ({
+      canonicalDomain: e.domain,
+      gscProperties: e.gscProperties,
+      gscPropertyTypes: e.gscPropertyTypes,
+      permissionLevels: e.permissionLevels,
+      proposedWebsiteUrl: e.proposedWebsiteUrl,
+      proposedProjectName: e.proposedProjectName,
+      confidence: e.confidence,
+      evidence: e.reason,
+      requestBody: buildCreateOnlyBody(e),
+    })),
+    proposedUpdatesIgnoredByCreateOnly: opts.createOnly ? plan.update : [],
+    proposedUpdates: plan.update,
+    collapsedDuplicateProperties: collapsedPropertyGroups(plan),
+    nonProductionProperties: plan.nonProduction,
+    ambiguousProperties: plan.ambiguous,
+    unparsableProperties: unparsable,
+    databaseDuplicates: plan.duplicates,
+    inDatabaseNotInGsc: plan.notInGsc,
+    expectedProjectCountAfterCreateOnlyApply: inventoryBefore.length + plan.create.length,
+    writesPerformed: 0,
     auditsTriggered: 0,
+    projectsUpdated: 0,
     projectsDeleted: 0,
-    auditsDeleted: 0,
+    projectsMerged: 0,
+    notificationsSent: 0,
   };
 
-  if (!opts.apply) {
+  const writeSummary = (): void => {
     if (opts.jsonOut) writeFileSync(opts.jsonOut, JSON.stringify(summary, null, 2), 'utf8');
-    console.log('Dry run complete — 0 writes performed.');
+  };
+
+  if (!coverage.complete) {
+    summary.halted = 'coverage incomplete — some GSC properties are not categorized exactly once';
+    writeSummary();
+    console.error('error: coverage is incomplete; refusing to continue. No writes were performed.');
+    return 1;
+  }
+
+  if (!opts.apply) {
+    writeSummary();
+    console.log('Dry run complete — 0 writes performed, 0 audits triggered, 0 projects updated or deleted.');
     return 0;
   }
 
   // ── apply ───────────────────────────────────────────────────────
-  const applyable = [...plan.create, ...plan.update];
-  const results: UpsertResult[] = [];
-  let failed = 0;
-  let created = 0;
-  let updated = 0;
-  let conflicts = 0;
-  let attempted = 0;
-  let halted: string | null = null;
+  //
+  // In create-only mode `plan.update` is deliberately not part of this list.
+  // Proposed updates were printed above and written to the JSON report; they
+  // are never sent.
+  const applyable = opts.createOnly ? plan.create : [...plan.create, ...plan.update];
+  const outcome = await applyPlan(opts.apiBase, applyable, {
+    createOnly: opts.createOnly,
+    log: (m) => console.log(m),
+    error: (m) => console.error(m),
+  });
 
-  for (const entry of applyable) {
-    attempted++;
-    try {
-      const result = await upsertProject(opts.apiBase, entry);
-      results.push(result);
-
-      // The endpoint upserts, so a planned create that comes back with
-      // created:false means the row already existed — the plan was stale.
-      // Stop rather than write further rows against a stale picture.
-      if (entry.action === 'create' && !result.created) {
-        conflicts++;
-        halted =
-          `conflict on ${entry.domain}: expected HTTP 201 with created:true, ` +
-          `got HTTP ${result.httpStatus} with created:false`;
-        console.error(`  CONFLICT ${entry.domain}  HTTP ${result.httpStatus} created:false — halting`);
-        break;
-      }
-
-      if (entry.action === 'create') created++;
-      else updated++;
-      console.log(`  ${result.created ? 'created' : 'updated'}  ${entry.domain}  HTTP ${result.httpStatus}`);
-    } catch (err) {
-      failed++;
-      halted = `request failed for ${entry.domain}: ${sanitize(String((err as Error).message))}`;
-      console.error(`  FAILED   ${entry.domain}: ${sanitize(String((err as Error).message))} — halting`);
-      break;
-    }
-  }
-
-  if (halted) {
+  if (outcome.halted) {
     console.error('');
-    console.error(`Apply halted after ${attempted} of ${applyable.length} planned writes.`);
+    console.error(`Apply halted after ${outcome.attempted} of ${applyable.length} planned writes.`);
     console.error('Successful writes above are preserved; no further writes were attempted.');
   }
-  summary.writes = { attempted, created, updated, conflicts, failed };
-  summary.halted = halted;
+
+  // ── prove every pre-existing project survived unchanged ─────────
+  let inventoryAfter: ProjectInventoryRecord[] | null = null;
+  let comparison: InventoryComparison | null = null;
+  try {
+    inventoryAfter = opts.existingProjects
+      ? readInventoryFile(opts.existingProjects)
+      : await fetchInventory(opts.apiBase);
+    comparison = compareInventories(inventoryBefore, inventoryAfter);
+  } catch (err) {
+    console.error(`error: cannot re-read projects to verify preservation: ${sanitize(String((err as Error).message))}`);
+  }
+
+  summary.writes = {
+    attempted: outcome.attempted,
+    created: outcome.created,
+    updated: outcome.updated,
+    conflicts: outcome.conflicts,
+    failed: outcome.failed,
+  };
+  summary.writesPerformed = outcome.created + outcome.updated;
+  summary.projectsUpdated = outcome.updated;
+  summary.halted = outcome.halted;
   summary.plannedWrites = applyable.length;
-  summary.results = results;
-  if (opts.jsonOut) writeFileSync(opts.jsonOut, JSON.stringify(summary, null, 2), 'utf8');
+  summary.results = outcome.results;
+  summary.inventoryBeforeCount = inventoryBefore.length;
+  summary.inventoryAfterCount = inventoryAfter?.length ?? null;
+  summary.existingProjectPreservation = comparison;
+  writeSummary();
 
   console.log('');
   console.log(
-    `Apply ${halted ? 'HALTED' : 'complete'} — created ${created}, updated ${updated}, ` +
-      `conflicts ${conflicts}, failed ${failed}.`,
+    `Apply ${outcome.halted ? 'HALTED' : 'complete'} — created ${outcome.created}, ` +
+      `updated ${outcome.updated}, conflicts ${outcome.conflicts}, failed ${outcome.failed}.`,
   );
-  console.log('No audit was triggered. No project or audit was deleted.');
-  return failed > 0 || conflicts > 0 ? 1 : 0;
+  if (comparison) {
+    console.log(
+      comparison.preserved
+        ? `Existing-project preservation VERIFIED — ${comparison.unchangedIds.length} pre-existing projects unchanged, ${comparison.addedIds.length} added.`
+        : 'Existing-project preservation FAILED — see existingProjectPreservation in the JSON report.',
+    );
+    for (const diff of comparison.changed) {
+      console.error(`  CHANGED  project ${diff.id} ${diff.field}: ${stringify(diff.before)} -> ${stringify(diff.after)}`);
+    }
+    for (const id of comparison.missingIds) console.error(`  MISSING  project ${id}`);
+  }
+  console.log('No audit was triggered. No project or audit was deleted or merged.');
+
+  const preservationFailed = comparison ? !comparison.preserved : true;
+  return outcome.failed > 0 || outcome.conflicts > 0 || preservationFailed ? 1 : 0;
+}
+
+function stringify(value: unknown): string {
+  return value === null || value === undefined ? 'null' : JSON.stringify(value);
 }
 
 main()

@@ -8,6 +8,7 @@
  * Endpoints:
  *   GET    /api/projects                          — list all projects
  *   POST   /api/projects                          — create (201) / update existing (200)
+ *                                                   with create_only:true → create (201) / conflict (409)
  *   GET    /api/projects/:id                      — single project + stats
  *   PATCH  /api/projects/:id                      — update name and/or environment
  *   DELETE /api/projects/:id                      — delete project (cascades)
@@ -92,7 +93,60 @@ projectsRouter.post('/projects', async (req: Request, res: Response) => {
     return;
   }
 
-  const { domain, websiteUrl, projectName, isBeta, formValues } = parsed;
+  const { domain, websiteUrl, projectName, isBeta, formValues, createOnly } = parsed;
+
+  // ── create-only contract ────────────────────────────────────────
+  //
+  // A single atomic statement: either this request inserts the row or the row
+  // already existed and nothing happens. There is deliberately no SELECT-then-
+  // INSERT here — a check-then-write would leave a window in which a concurrent
+  // creation turns this call into an update of somebody else's project.
+  //
+  // ON CONFLICT (domain) DO NOTHING means an existing project is not touched at
+  // all: no UPDATE runs, so project_name, website_url, is_beta,
+  // last_form_values, created_at and updated_at all keep their stored values.
+  // last_form_values is not even in the column list, so a newly created row
+  // starts NULL and is therefore never automation-ready.
+  if (createOnly) {
+    try {
+      const inserted = await db.query<Record<string, unknown>>(
+        `INSERT INTO sites (domain, project_name, website_url, is_beta, updated_at)
+         VALUES ($1, $2, $3, COALESCE($4::boolean, FALSE), NOW())
+         ON CONFLICT (domain) DO NOTHING
+         RETURNING *`,
+        [domain, projectName, websiteUrl, isBeta],
+      );
+
+      if (!inserted.rows.length) {
+        // Read-only lookup so the caller can identify the blocking row. This
+        // runs after the insert attempt and writes nothing.
+        const existing = await db.query<{ id: string; domain: string }>(
+          'SELECT id, domain FROM sites WHERE domain = $1',
+          [domain],
+        );
+        res.status(409).json({
+          error: `A project already exists for ${domain}`,
+          created: false,
+          conflict: true,
+          domain,
+          existing_project_id: existing.rows[0]?.id ?? null,
+        });
+        return;
+      }
+
+      const project = inserted.rows[0];
+      res.status(201).json({
+        project: withAutomationReady(project),
+        created: true,
+        conflict: false,
+        automation_ready: isAutomationReady(project.last_form_values),
+      });
+    } catch (err) {
+      console.error('POST /api/projects (create_only) error:', err);
+      res.status(500).json({ error: 'Failed to create project' });
+    }
+    return;
+  }
 
   try {
     // `xmax = 0` is true only for a freshly inserted row, so a single
