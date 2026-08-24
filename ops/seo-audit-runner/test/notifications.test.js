@@ -829,6 +829,51 @@ test('an opted-in Production REOPENED P0 alert carries exactly one <!channel>', 
   db.close();
 });
 
+test('every real Production P0 condition pages on NEW and REOPENED only', async () => {
+  const productionP0s = [
+    { area: 'sitemap', message: 'No valid sitemap found after testing all priority paths', source: 'site' },
+    { area: 'robots', message: 'robots.txt blocks all crawling with Disallow: /', source: 'site' },
+    { area: 'robots', message: 'robots.txt blocks Googlebot from crawling entire site', source: 'site' },
+    { area: 'robots', message: 'robots.txt blocks Googlebot-News from crawling entire site', source: 'site' },
+    { area: 'meta', message: 'Page has noindex directive on a seed URL', source: 'page' },
+  ];
+
+  for (const [index, condition] of productionP0s.entries()) {
+    const { db, store } = freshStore();
+    const sender = mockSender();
+    const pipeline = pipelineWith(store, sender, { slackCriticalMention: 'channel' });
+    const issue = {
+      ...critical(index + 1),
+      ...condition,
+      pageUrl: condition.source === 'page' ? submittedUrls.homeUrl : null,
+    };
+
+    const first = await pipeline.handleProjectCompleted({
+      project, auditRunId: `condition-${index}-new`, results: results(), criticalIssues: [issue],
+    });
+    const unchanged = await pipeline.handleProjectCompleted({
+      project, auditRunId: `condition-${index}-unchanged`, results: results(), criticalIssues: [issue],
+    });
+    const resolved = await pipeline.handleProjectCompleted({
+      project, auditRunId: `condition-${index}-resolved`, results: results(), criticalIssues: [],
+    });
+    const reopened = await pipeline.handleProjectCompleted({
+      project, auditRunId: `condition-${index}-reopened`, results: results(), criticalIssues: [issue],
+    });
+
+    assert.equal(first.lifecycleCounts.new, 1, `${condition.message}: NEW`);
+    assert.equal(unchanged.lifecycleCounts.unchanged, 1, `${condition.message}: UNCHANGED`);
+    assert.equal(unchanged.notificationStatus, 'not-required', `${condition.message}: suppressed repeat`);
+    assert.equal(resolved.lifecycleCounts.resolved, 1, `${condition.message}: RESOLVED`);
+    assert.equal(reopened.lifecycleCounts.reopened, 1, `${condition.message}: REOPENED`);
+    assert.equal(sender.sent.length, 3, `${condition.message}: NEW, RESOLVED, and REOPENED messages`);
+    assert.equal(mentions(sender.sent[0]), 1, `${condition.message}: NEW pages exactly once`);
+    assert.equal(mentions(sender.sent[1]), 0, `${condition.message}: RESOLVED never pages`);
+    assert.equal(mentions(sender.sent[2]), 1, `${condition.message}: REOPENED pages exactly once`);
+    db.close();
+  }
+});
+
 test('a NEW and a REOPENED P0 in one alert still page the channel only once', async () => {
   const { db, store } = freshStore();
   const sender = mockSender();
