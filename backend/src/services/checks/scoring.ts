@@ -656,11 +656,19 @@ export function scoreSiteChecks(data: SiteChecksData | null, options: ScoringOpt
     // Robots.txt rule analysis
     if (data.robots.rules) {
       const wildcardRule = data.robots.rules.find(r => r.userAgent === '*');
+      const googleRule = data.robots.rules.find(r => r.userAgent.toLowerCase() === 'googlebot');
       if (!isBeta && wildcardRule?.disallow.includes('/')) {
         recs.push({
           priority: 'P0', area: 'robots',
           message: 'robots.txt blocks all crawling with Disallow: /',
           fixHint: 'Remove "Disallow: /" under User-agent: * to allow search engines to crawl your site.',
+        });
+      }
+      if (!isBeta && !wildcardRule?.disallow.includes('/') && googleRule?.disallow.includes('/')) {
+        recs.push({
+          priority: 'P0', area: 'robots',
+          message: 'robots.txt blocks Googlebot from crawling entire site',
+          fixHint: 'Remove "Disallow: /" under User-agent: Googlebot to allow Google to crawl your site.',
         });
       }
       // Check for Googlebot-News blocked
@@ -674,7 +682,6 @@ export function scoreSiteChecks(data: SiteChecksData | null, options: ScoringOpt
       }
 
       if (isBeta && (data.robots.status === 'FOUND' || data.robots.status === 'NOT_FOUND')) {
-        const googleRule = data.robots.rules.find(r => r.userAgent.toLowerCase() === 'googlebot');
         const fullyBlocks = (rule: typeof wildcardRule): boolean => Boolean(rule?.disallow.includes('/'));
         const googleBlocked = fullyBlocks(googleRule ?? wildcardRule);
         const newsBlocked = fullyBlocks(newsRule ?? googleRule ?? wildcardRule);
