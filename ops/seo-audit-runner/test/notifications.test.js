@@ -801,7 +801,11 @@ test('an opted-in Production NEW P0 alert carries exactly one <!channel>', async
 
   const message = sender.sent[0];
   assert.equal(mentions(message), 1, 'exactly one token across text and blocks');
-  assert.match(message.blocks[0].text.text, /^<!channel> :rotating_light: \*Critical SEO Alert\*/);
+  assert.match(
+    message.blocks[0].text.text,
+    /^<!channel> :rotating_light: \*Total Critical Issues: 1\*/,
+  );
+  assert.match(message.blocks[0].text.text, /:rotating_light: \*Critical SEO Alert\*/);
   assert.ok(!/<!/.test(message.text), 'the fallback keeps no duplicate copy');
   assert.match(message.text, /\*P0:\* 1 new/, 'the alert itself is unchanged');
   assert.ok(!message.text.includes('@all'), 'never a literal @all');

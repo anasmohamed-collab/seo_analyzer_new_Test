@@ -77,11 +77,12 @@ test('a Production NEW P0 alert carries exactly one <!channel> when authorized',
   assert.equal(message.mentionPolicy, 'channel', 'the message is stamped as authorized');
   assert.match(
     message.blocks[0].text.text,
-    /^<!channel> :rotating_light: \*Critical SEO Alert\*/,
+    /^<!channel> :rotating_light: \*Total Critical Issues: 1\*/,
     'the token opens the visible header',
   );
   assert.ok(!BROAD.test(message.text), 'the top-level fallback keeps no duplicate copy');
-  assert.match(message.text, /^:rotating_light: \*Critical SEO Alert\*/, 'the fallback is still meaningful');
+  assert.match(message.text, /^:rotating_light: \*Total Critical Issues: 1\*/, 'the fallback starts with the total');
+  assert.match(message.text, /:rotating_light: \*Critical SEO Alert\*/, 'the existing alert header remains');
   assert.match(message.text, /\*P0:\* 1 new/);
 });
 
@@ -174,7 +175,8 @@ test('Beta exposure alerts are distinct and never carry a broad mention', () => 
     baseArgs(lc({ new: [exposure] }), { isBeta: true, mentionPolicy: 'channel' }),
   );
 
-  assert.match(message.text, /^:warning: \*Beta SEO Exposure Alert\*/);
+  assert.match(message.text, /^:warning: \*Total Critical Issues: 1\*/);
+  assert.match(message.text, /:warning: \*Beta SEO Exposure Alert\*/);
   assert.match(message.text, /\*Exposure findings:\* 1 new/);
   assert.match(message.text, /Beta\/Staging seed URL is indexable/);
   assert.equal(mentionsIn(message), 0);
@@ -309,7 +311,8 @@ test('the critical alert is compact, scannable, and free of ID noise', () => {
     ),
   );
   const text = message.text;
-  assert.match(text, /^:rotating_light: \*Critical SEO Alert\*/);
+  assert.match(text, /^:rotating_light: \*Total Critical Issues: 1\*/);
+  assert.match(text, /:rotating_light: \*Critical SEO Alert\*/);
   assert.match(text, /\*Arab Times\* — `arabtimesonline.com`/);
   assert.match(text, /\*P0:\* 1 new/);
   assert.match(text, /• \*Missing H1 tag\* — Home/);
@@ -320,6 +323,36 @@ test('the critical alert is compact, scannable, and free of ID noise', () => {
   assert.ok(!text.includes('7f3a9c21-0000-4000-8000-000000000001'), 'no raw project UUID');
   assert.ok(!text.includes('77830569-1111'), 'only the short audit id is visible');
   assert.ok(text.split('\n').length < 15, 'the alert stays short');
+});
+
+test('the leading total counts every current P0 lifecycle issue, including issues beyond the visible list', () => {
+  const current = Array.from({ length: 7 }, (_, i) => mkIssue(i + 1, { priority: 'P0' }));
+  const [message] = buildProjectMessages(
+    baseArgs(lc({
+      new: current.slice(0, 3),
+      reopened: current.slice(3, 5),
+      unchanged: current.slice(5),
+      resolved: [mkIssue(8, { priority: 'P0' })],
+    }), { mode: 'all_current' }),
+  );
+
+  assert.match(message.text, /^:rotating_light: \*Total Critical Issues: 7\*/);
+  assert.match(message.text, /\*P0:\* 3 new, 2 reopened, 2 unchanged \| \*Resolved:\* 1/);
+  assert.equal(
+    message.text.split('\n').filter((line) => line.startsWith('• ')).length,
+    MAX_VISIBLE_CRITICAL_ISSUES,
+    'the total is independent of the five-item presentation cap',
+  );
+  assert.match(message.text, /\+ 2 more critical issues/);
+});
+
+test('a resolved-only alert reports zero currently open Critical Issues', () => {
+  const [message] = buildProjectMessages(
+    baseArgs(lc({ resolved: [mkIssue(1, { priority: 'P0' })] })),
+  );
+
+  assert.match(message.text, /^:rotating_light: \*Total Critical Issues: 0\*/);
+  assert.match(message.text, /\*P0:\* none currently open \| \*Resolved:\* 1/);
 });
 
 test('project label falls back to the normalized domain, then the project id', () => {

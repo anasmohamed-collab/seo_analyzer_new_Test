@@ -7,9 +7,9 @@
  * robots.txt or a sitemap itself).
  *
  * Design rules:
- *  - a critical alert is ONE short, scannable message: header, project, P0
- *    counts, at most MAX_VISIBLE_CRITICAL_ISSUES issues, technical checks,
- *    short audit id
+ *  - a critical alert is ONE short, scannable message: open P0 total, header,
+ *    project, lifecycle counts, at most MAX_VISIBLE_CRITICAL_ISSUES issues,
+ *    technical checks, short audit id
  *  - the ONLY broad mention this module can emit is a single `<!channel>` on a
  *    Production critical alert that the CALLER explicitly authorized; every
  *    other token is stripped (see the mention section below)
@@ -585,6 +585,7 @@ export function buildProjectMessages({
   const shownDomain = displayDomain(domain);
 
   const lines = [
+    `${isBeta ? ':warning:' : ':rotating_light:'} *Total Critical Issues: ${counts.current}*`,
     `${isBeta ? ':warning:' : ':rotating_light:'} *${isBeta ? 'Beta SEO Exposure Alert' : 'Critical SEO Alert'}*`,
     '',
     `*${escapeSlack(label)}*${shownDomain && shownDomain !== label ? ` — \`${escapeSlack(shownDomain)}\`` : ''}`,

@@ -87,6 +87,11 @@ export function createSlackSender({
       ...(method === 'bot' ? { channel: config.slackChannelId } : {}),
       text: message.text,
       ...(message.blocks ? { blocks: message.blocks } : {}),
+      // Supported by both chat.postMessage and Incoming Webhooks. Keep URLs
+      // clickable in the message while preventing Slack from expanding them
+      // into text or media previews.
+      unfurl_links: false,
+      unfurl_media: false,
     };
   }
 
