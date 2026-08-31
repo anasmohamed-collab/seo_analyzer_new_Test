@@ -120,12 +120,11 @@ SLACK_BOT_TOKEN=<xoxb-your-bot-token>
 # The immutable channel ID of #seo_analyzer_bot — the ID, never the name.
 SLACK_CHANNEL_ID=<C0XXXXXXXXX>
 
-# Broad channel mention on critical alerts. `none` is the default: no message
-# pages the channel. Set `channel` ONLY as a deliberate decision — it adds one
-# <!channel> to PRODUCTION critical alerts reporting a NEW or REOPENED P0.
-# Beta exposure alerts, unchanged/resolved-only alerts, run summaries and
-# failure notices never page. `here`/`everyone` are neutralized to `none`.
-SLACK_CRITICAL_MENTION=none
+# Broad channel mention on Slack messages. `channel` is the default and adds
+# one top-level <!channel> to every project alert and final audit report.
+# Set `none` only for an emergency paging opt-out. `here`/`everyone` are
+# neutralized to `none`.
+SLACK_CRITICAL_MENTION=channel
 ```
 
 **Slack destination prerequisites** (operator actions, not performed by the

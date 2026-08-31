@@ -222,8 +222,8 @@ test('an authorized alert is delivered with exactly one <!channel> over the bot 
   await sender.send(criticalAlert('channel'));
   const body = JSON.parse(fetchImpl.calls[0].init.body);
   assert.equal(countBroadMentions(body), 1, 'one token across text AND blocks');
-  assert.match(body.blocks[0].text.text, /^<!channel> :rotating_light:/);
-  assert.ok(!/<!(channel|here|everyone)/.test(body.text), 'the fallback carries no duplicate');
+  assert.match(body.text, /^<!channel> :rotating_light:/);
+  assert.ok(!/<!(channel|here|everyone)/.test(body.blocks[0].text.text), 'the visible block carries no duplicate');
   assert.equal(body.channel, 'C0123456789', 'delivery uses the immutable channel ID, not a name');
 });
 
@@ -234,7 +234,7 @@ test('an authorized alert is delivered with exactly one <!channel> over a webhoo
   await sender.send(criticalAlert('channel'));
   const body = JSON.parse(fetchImpl.calls[0].init.body);
   assert.equal(countBroadMentions(body), 1);
-  assert.match(body.blocks[0].text.text, /^<!channel> :rotating_light:/);
+  assert.match(body.text, /^<!channel> :rotating_light:/);
 });
 
 test('the internal authorization field never reaches Slack, on either method', async () => {

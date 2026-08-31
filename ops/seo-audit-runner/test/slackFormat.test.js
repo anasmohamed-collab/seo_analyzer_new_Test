@@ -76,12 +76,11 @@ test('a Production NEW P0 alert carries exactly one <!channel> when authorized',
   assert.equal(mentionsIn(message), 1, 'exactly one token in the entire message');
   assert.equal(message.mentionPolicy, 'channel', 'the message is stamped as authorized');
   assert.match(
-    message.blocks[0].text.text,
+    message.text,
     /^<!channel> :rotating_light: \*Total Critical Issues: 1\*/,
-    'the token opens the visible header',
+    'the token opens the notification fallback',
   );
-  assert.ok(!BROAD.test(message.text), 'the top-level fallback keeps no duplicate copy');
-  assert.match(message.text, /^:rotating_light: \*Total Critical Issues: 1\*/, 'the fallback starts with the total');
+  assert.ok(!BROAD.test(message.blocks[0].text.text), 'the Block Kit body keeps no duplicate copy');
   assert.match(message.text, /:rotating_light: \*Critical SEO Alert\*/, 'the existing alert header remains');
   assert.match(message.text, /\*P0:\* 1 new/);
 });
@@ -91,7 +90,7 @@ test('a Production REOPENED P0 alert carries exactly one <!channel> when authori
     baseArgs(lc({ reopened: [mkIssue(2)] }), { mentionPolicy: 'channel' }),
   );
   assert.equal(mentionsIn(message), 1);
-  assert.match(message.blocks[0].text.text, /^<!channel> /);
+  assert.match(message.text, /^<!channel> /);
   assert.match(message.text, /\*P0:\* 1 reopened/);
 });
 
@@ -116,7 +115,7 @@ test('a multi-block authorized alert still carries exactly one token', () => {
   assert.equal(mentionsIn(message), 1);
   assert.ok(
     message.blocks.slice(1).every((b) => !BROAD.test(b.text.text)),
-    'only the header block carries the token',
+    'no Block Kit section duplicates the top-level notification token',
   );
   assert.ok(
     message.blocks.every((b) => b.text.text.length <= 3000),
@@ -151,36 +150,35 @@ test('the default (no mentionPolicy argument) stays mention-free', () => {
   }
 });
 
-test('unchanged-only and resolved-only alerts never mention, even when authorized', () => {
+test('unchanged-only and resolved-only alerts mention when channel paging is enabled', () => {
   const unchanged = buildProjectMessages(
     baseArgs(lc({ unchanged: [mkIssue(3)] }), { mode: 'all_current', mentionPolicy: 'channel' }),
   )[0];
-  assert.equal(mentionsIn(unchanged), 0, 'UNCHANGED-only is not a paging event');
-  assert.equal(unchanged.mentionPolicy, undefined);
+  assert.equal(mentionsIn(unchanged), 1, 'every emitted alert carries the mention');
+  assert.equal(unchanged.mentionPolicy, 'channel');
 
   const resolved = buildProjectMessages(
     baseArgs(lc({ resolved: [mkIssue(4)] }), { mentionPolicy: 'channel' }),
   )[0];
-  assert.equal(mentionsIn(resolved), 0, 'RESOLVED-only is not a paging event');
+  assert.equal(mentionsIn(resolved), 1, 'resolved alerts carry the mention too');
   assert.match(resolved.text, /\*P0:\* none currently open \| \*Resolved:\* 1/);
 });
 
-test('Beta exposure alerts are distinct and never carry a broad mention', () => {
+test('Beta exposure alerts are distinct and carry the configured channel mention', () => {
   const exposure = mkIssue(1, {
     priority: 'P0',
     message: 'Beta/Staging seed URL is indexable (no noindex directive detected)',
   });
-  // Even with the operator opted in AND a new finding, Beta never pages.
   const [message] = buildProjectMessages(
     baseArgs(lc({ new: [exposure] }), { isBeta: true, mentionPolicy: 'channel' }),
   );
 
-  assert.match(message.text, /^:warning: \*Total Critical Issues: 1\*/);
+  assert.match(message.text, /^<!channel> :warning: \*Total Critical Issues: 1\*/);
   assert.match(message.text, /:warning: \*Beta SEO Exposure Alert\*/);
   assert.match(message.text, /\*Exposure findings:\* 1 new/);
   assert.match(message.text, /Beta\/Staging seed URL is indexable/);
-  assert.equal(mentionsIn(message), 0);
-  assert.equal(message.mentionPolicy, undefined);
+  assert.equal(mentionsIn(message), 1);
+  assert.equal(message.mentionPolicy, 'channel');
   assert.ok(!/\*P0:\*/.test(message.text));
 });
 
@@ -244,10 +242,10 @@ test('sanitizeSlackMessage strips an unauthorized payload without mutating the i
 
 test('sanitizeSlackMessage keeps exactly one token for an authorized payload', () => {
   const authorized = {
-    text: ':rotating_light: *Critical SEO Alert*',
+    text: '<!channel> :rotating_light: *Critical SEO Alert*',
     mentionPolicy: 'channel',
     blocks: [
-      { type: 'section', text: { type: 'mrkdwn', text: '<!channel> :rotating_light: *Critical SEO Alert*' } },
+      { type: 'section', text: { type: 'mrkdwn', text: ':rotating_light: *Critical SEO Alert*' } },
       // Extra tokens beyond the authorized one are still removed.
       { type: 'section', text: { type: 'mrkdwn', text: 'tail <!channel> <!here> <!channel|channel>' } },
       { type: 'context', elements: [{ type: 'mrkdwn', text: 'ctx <!everyone>' }] },
@@ -257,7 +255,7 @@ test('sanitizeSlackMessage keeps exactly one token for an authorized payload', (
 
   const clean = sanitizeSlackMessage(authorized);
   assert.equal(countBroadMentions(clean), 1, 'the authorization buys exactly one token');
-  assert.match(clean.blocks[0].text.text, /^<!channel> :rotating_light:/);
+  assert.match(clean.text, /^<!channel> :rotating_light:/);
   assert.ok(!BROAD.test(clean.blocks[1].text.text), 'surplus tokens are stripped');
   assert.deepEqual(authorized, before, 'the stored payload is never mutated');
 });
@@ -575,7 +573,7 @@ const summaryTotals = (over = {}) => ({
   ...over,
 });
 
-test('the run summary is compact and carries no broad mention', () => {
+test('the final report is compact and mention-free when not authorized', () => {
   const aggregate = createTechnicalAggregate();
   addTechnicalResult(aggregate, siteChecks());
   const { text, blocks } = buildRunSummaryMessage({
@@ -586,7 +584,7 @@ test('the run summary is compact and carries no broad mention', () => {
     totals: summaryTotals({ technical: aggregate }),
   });
 
-  assert.match(text, /^:clipboard: \*SEO Audit Summary\*/);
+  assert.match(text, /^:clipboard: \*SEO Audit Final Report\*/);
   assert.match(text, /Discovered: 1 \| Eligible: 1 \| Attempted: 1/);
   assert.match(text, /Audited: 1\/1 completed/);
   assert.match(text, /Critical projects: 1 \| Current P0: 1 \| New P0: 1/);
@@ -639,7 +637,7 @@ test('partial success stays a summary and surfaces only non-zero outcome counts'
     }),
   });
 
-  assert.match(text, /^:clipboard: \*SEO Audit Summary\*/);
+  assert.match(text, /^:clipboard: \*SEO Audit Final Report\*/);
   assert.match(text, /Audited: 7\/8 completed/);
   assert.match(text, /Critical projects: 3 \| Current P0: 4 \| New P0: 1 \| Resolved P0: 2/);
   assert.match(text, /Failed: 1/);

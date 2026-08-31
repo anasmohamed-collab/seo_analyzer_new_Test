@@ -53,8 +53,9 @@ const DEFAULTS = {
   SLACK_MAX_RETRIES: '4',
   SLACK_MAX_ISSUES_PER_MESSAGE: '20',
   SLACK_MAX_MESSAGE_CHARACTERS: '30000',
-  // Safe default: no broad mention. Opt in with `channel`. See the validation below.
-  SLACK_CRITICAL_MENTION: NO_MENTION_MODE,
+  // Slack alerts page the channel by default. Operators can explicitly opt out
+  // with `none` without disabling delivery of the alert itself.
+  SLACK_CRITICAL_MENTION: CHANNEL_MENTION_MODE,
 };
 
 export const ALERT_MODES = ['new_or_regressed', 'all_current', 'summary_only', 'disabled'];
@@ -274,18 +275,16 @@ export function loadConfig(env = process.env) {
     );
   }
 
-  // Broad channel mentions are OPT-IN and narrowly scoped:
-  //   missing / empty / `none` → no mention (the default, and what every
-  //     existing deployment that never set the variable keeps getting)
-  //   `channel`                → honored; a single <!channel> is added to a
-  //     Production critical alert that reports a NEW or REOPENED P0 (the
-  //     eligibility rule lives in notificationPipeline.js)
+  // Broad channel mentions apply to every Slack alert and the final report:
+  //   empty / missing          → `channel` (the default)
+  //   explicit `none`           → emergency opt-out without disabling alerts
+  //   `channel`                → honored; one top-level <!channel> is added
   //   `here` / `everyone`      → still ACCEPTED vocabulary but neutralized to
   //     `none`, so neither can become active by accident
   //   anything else            → hard error, so a typo can never be mistaken
   //     for a deliberate setting
   const rawCriticalMention = raw('SLACK_CRITICAL_MENTION').toLowerCase();
-  let slackCriticalMention = NO_MENTION_MODE;
+  let slackCriticalMention = rawCriticalMention ? NO_MENTION_MODE : CHANNEL_MENTION_MODE;
   let slackCriticalMentionNeutralized = false;
   if (rawCriticalMention && !SLACK_CRITICAL_MENTION_MODES.includes(rawCriticalMention)) {
     problems.push(

@@ -308,7 +308,7 @@ function validateConfigCommand(config, logger, out) {
       (config.slackCriticalMentionNeutralized
         ? ' (here/everyone are neutralized to none — never activated)'
         : config.slackCriticalMention === 'channel'
-          ? ' (<!channel> on Production critical alerts reporting a NEW or REOPENED P0 only)'
+          ? ' (one top-level <!channel> on every Slack alert and final report)'
           : ' (no broad mention on any message)'),
   ];
 

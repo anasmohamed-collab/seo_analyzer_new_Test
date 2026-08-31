@@ -144,23 +144,13 @@ retrying the old record cannot succeed for a permanent error.
 
 **The channel is not notified even though the alert arrived**
 Check `SLACK_CRITICAL_MENTION` with `status` / `validate-config`. The **default
-is `none`** — no message pages the channel — and enabling the mention is a
-deliberate operator action (`SLACK_CRITICAL_MENTION=channel`).
-
-Even with `channel` set, only a **Production critical alert reporting a NEW or
-REOPENED P0** carries the single `<!channel>`. These are mention-free by
-design and are not a bug:
-
-- Beta Exposure alerts (`is_beta === true`)
-- UNCHANGED-only and RESOLVED-only alerts
-- run summaries, zero-completed-audit summaries, and failure notices
-- failed, timed-out, incomplete-evidence, skipped and deferred results
+is `channel`**. Every project alert and final audit report that is actually
+emitted carries one top-level `<!channel>`. If the effective value is `none`,
+remove that emergency opt-out or set `SLACK_CRITICAL_MENTION=channel`.
 
 `here` and `everyone` are accepted vocabulary but **neutralized to `none`** and
 never activated; anything outside the vocabulary is a configuration error
-rather than a silent fallback. If the channel still needs to be woken for a
-case listed above, use Slack channel notification preferences or a keyword
-highlight rather than widening the runner's policy.
+rather than a silent fallback.
 
 If the mention is enabled but the message shows `@channel` as plain text, the
 Slack workspace restricts who may post broad mentions — a workspace setting,
