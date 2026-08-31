@@ -17,12 +17,15 @@ function pageData({ metaNoindex = false, headerNoindex = false } = {}) {
   };
 }
 
-function siteData(disallow: string[]) {
+function siteData(
+  disallow: string[],
+  extraRules: Array<{ userAgent: string; disallow: string[]; allow: string[] }> = [],
+) {
   return {
     robots: {
       status: 'FOUND',
       sitemapsFound: ['https://example.com/sitemap.xml'],
-      rules: [{ userAgent: '*', disallow, allow: [] }],
+      rules: [{ userAgent: '*', disallow, allow: [] }, ...extraRules],
       notes: [],
     },
   };
@@ -34,6 +37,52 @@ describe('Production indexability behavior', () => {
     expect(recs).toContainEqual(expect.objectContaining({
       priority: 'P0',
       message: 'robots.txt blocks all crawling with Disallow: /',
+    }));
+  });
+
+  it('treats an explicit Googlebot Disallow: / as Critical without duplicating a wildcard block', () => {
+    const googlebotRule = { userAgent: 'Googlebot', disallow: ['/'], allow: [] };
+    const explicitlyBlocked = scoreSiteChecks(siteData([], [googlebotRule]));
+    expect(explicitlyBlocked).toContainEqual(expect.objectContaining({
+      priority: 'P0',
+      message: 'robots.txt blocks Googlebot from crawling entire site',
+    }));
+
+    const wildcardAndGooglebot = scoreSiteChecks(siteData(['/'], [googlebotRule]));
+    expect(wildcardAndGooglebot.filter((rec) => rec.priority === 'P0' && rec.area === 'robots'))
+      .toEqual([expect.objectContaining({ message: 'robots.txt blocks all crawling with Disallow: /' })]);
+  });
+
+  it('keeps an explicit Googlebot-News block as Critical P0', () => {
+    const recs = scoreSiteChecks(siteData([], [
+      { userAgent: 'Googlebot-News', disallow: ['/'], allow: [] },
+    ]));
+    expect(recs).toContainEqual(expect.objectContaining({
+      priority: 'P0',
+      message: 'robots.txt blocks Googlebot-News from crawling entire site',
+    }));
+  });
+
+  it('keeps a missing XML sitemap at P0 while a missing News sitemap remains P1', () => {
+    const recs = scoreSiteChecks({
+      sitemap: { status: 'NOT_FOUND' },
+      newsSitemap: {
+        status: 'NOT_FOUND',
+        url: null,
+        hasNewsNamespace: false,
+        hasPublicationDate: false,
+        hasNewsTitle: false,
+        hasPublicationTag: false,
+        urlCount: 0,
+      },
+    });
+    expect(recs).toContainEqual(expect.objectContaining({
+      priority: 'P0',
+      message: 'No valid sitemap found after testing all priority paths',
+    }));
+    expect(recs).toContainEqual(expect.objectContaining({
+      priority: 'P1',
+      message: 'No Google News sitemap found at any standard path',
     }));
   });
 

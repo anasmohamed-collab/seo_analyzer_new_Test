@@ -1,10 +1,38 @@
 # Operational Rollout Checklist — SEO audit automation gap fixes
 
-Status: **not executed.** Every step below is an operator action requiring
-separate explicit authorization. Nothing in this checklist was performed while
-the code changes were made: no production data was read or written, no project
-was patched, no audit was triggered, no Slack message was sent, no timer was
-enabled, and nothing was deployed.
+Status: **partially executed — read-only Production preflight only.** Every
+remaining step below is an operator action requiring separate explicit
+authorization. No Production write, project mutation, audit trigger, Slack
+message, timer change, or deployment was performed by the preflight.
+
+## Execution log
+
+### 2026-08-13 — authorized read-only Production preflight
+
+- Target: `https://seo-analyzer.layoutworkflows.com`.
+- `GET /health`, `GET /api/health`, and `GET /api/build-info` returned HTTP 200.
+- Two live `GET /api/projects` captures returned 13 projects and matched
+  exactly. Full snapshots remain outside the repository because they contain
+  operational project data.
+- One `GET /api/projects/:id` read per project found zero active and zero stale
+  `RUNNING` audits at the capture instant.
+- All 13 current projects were automation-ready. Recent completed-audit
+  timestamps formed a two-minute sequence through `2026-08-13T10:05:23Z`, so
+  the runner must be treated as actively scheduled until IT proves the systemd
+  timer inactive.
+- The live `/api/build-info` response contained no `gitSha` and reported build
+  time `2026-08-12T05:20:20.744Z`. This predates the reviewed create-only work
+  merged on 2026-08-13, so the atomic `create_only` contract is not proven on
+  Production.
+- A validated Search Console evidence set contained 38 high-confidence project
+  inputs. Six canonical websites already exist in Production and are protected
+  from writes; 32 are absent and remain pending.
+- **No POST, PATCH, DELETE, audit trigger, notification, deployment, or runner
+  control command was sent.** The import stopped at the deployment and runner
+  pause gates.
+
+The sanitized handoff and IT request are recorded in
+`PRODUCTION_PROJECT_IMPORT_HANDOFF.md` and `IT_PRODUCTION_DEPLOYMENT_REQUEST.md`.
 
 This document exists because the repository does **not** contain the facts the
 work needs: current production project rows, the real article URL for
@@ -108,9 +136,9 @@ Nothing in this part modifies anything.
       NOTIFICATIONS_ENABLED=false
       ```
 
-      `SLACK_CRITICAL_MENTION=none` is the default and the correct starting
-      value: nothing pages the channel. `channel` is an explicit opt-in that
-      belongs in Part F, not here. `here`/`everyone` stay neutralized to `none`.
+      `SLACK_CRITICAL_MENTION=none` is a temporary validation-stage opt-out:
+      nothing pages the channel while notifications are disabled. Part F
+      restores the `channel` default. `here`/`everyone` stay neutralized.
 
       Confirm `SLACK_CHANNEL_ID` is the **immutable channel ID** (`C…`) of
       **`#seo_analyzer_bot`**, that the bot is already invited to that channel,
@@ -138,33 +166,32 @@ Nothing in this part modifies anything.
 
 ## Part F — Enable Slack (only after E passes and a review)
 
-- [ ] **F1.** Set `NOTIFICATIONS_ENABLED=true`, keeping
-      `SLACK_CRITICAL_MENTION=none`. Then verify, in order:
+- [ ] **F1.** Set `NOTIFICATIONS_ENABLED=true` and
+      `SLACK_CRITICAL_MENTION=channel`. Then verify, in order:
       - NEW → alerts
       - REOPENED → alerts
       - RESOLVED → updates
       - UNCHANGED → does **not** repeat in `new_or_regressed`
-      - **no broad mention tokens anywhere** — grep delivered messages for
-        `<!channel>`, `<!here>`, `<!everyone>`; run summaries included
+      - every emitted project alert carries exactly one top-level `<!channel>`
+      - the end-of-run final audit report carries exactly one `<!channel>`
+      - `<!here>` and `<!everyone>` never appear
 - [ ] **F2. Replay check.** If `notifications list` shows any `PENDING`/`FAILED`
       record created **before** this deployment, run
       `retry-notifications --dry-run` first, then a real retry, and confirm the
       delivered message carries no broad mention (those rows carry no
       authorization, so the last-mile sanitizer strips every token without
       rewriting the stored row).
-- [ ] **F3. Optional `@channel` opt-in.** Only after F1 and F2 pass, and only
-      as a deliberate, separately approved decision, set
-      `SLACK_CRITICAL_MENTION=channel` and re-run `validate-config` (it must
+- [ ] **F3. `@channel` delivery validation.** Re-run `validate-config` (it must
       report `channel`, not neutralized). Then confirm on live traffic:
       - a Production **NEW P0** alert carries exactly **one** `<!channel>`
       - a Production **REOPENED P0** alert carries exactly **one**
       - an alert with NEW **and** REOPENED P0 still carries exactly **one**
-      - Beta Exposure alerts, UNCHANGED-only and RESOLVED-only alerts, run
-        summaries and failure notices carry **none**
+      - Beta Exposure alerts, emitted UNCHANGED/RESOLVED alerts, the final
+        report and failure reports each carry exactly **one**
       - the mention lands in `#seo_analyzer_bot` (the channel `SLACK_CHANNEL_ID`
         points at) and the bot can post there
 
-      Reverting is a single edit back to `SLACK_CRITICAL_MENTION=none`.
+      Emergency paging opt-out is a single edit to `SLACK_CRITICAL_MENTION=none`.
       **Status: not executed — no real Slack validation of the mention has been
       performed.**
 

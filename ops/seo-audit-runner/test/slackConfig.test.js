@@ -52,12 +52,10 @@ test('alert mode is validated strictly', () => {
   }
 });
 
-test('SLACK_CRITICAL_MENTION defaults to none when omitted or empty', () => {
-  // An existing deployment that never set the variable keeps its current
-  // no-mention behavior.
-  assert.equal(loadConfig({}).slackCriticalMention, 'none');
-  assert.equal(loadConfig({ SLACK_CRITICAL_MENTION: '' }).slackCriticalMention, 'none');
-  assert.equal(loadConfig({ SLACK_CRITICAL_MENTION: '   ' }).slackCriticalMention, 'none');
+test('SLACK_CRITICAL_MENTION defaults to channel when omitted or empty', () => {
+  assert.equal(loadConfig({}).slackCriticalMention, 'channel');
+  assert.equal(loadConfig({ SLACK_CRITICAL_MENTION: '' }).slackCriticalMention, 'channel');
+  assert.equal(loadConfig({ SLACK_CRITICAL_MENTION: '   ' }).slackCriticalMention, 'channel');
   assert.equal(loadConfig({ SLACK_CRITICAL_MENTION: 'none' }).slackCriticalMention, 'none');
   assert.equal(loadConfig({ SLACK_CRITICAL_MENTION: 'NONE' }).slackCriticalMention, 'none');
   assert.equal(loadConfig({}).slackCriticalMentionNeutralized, false);
@@ -104,7 +102,7 @@ test('Phase 3 defaults and state DB path', () => {
   const config = loadConfig({});
   assert.equal(config.alertMode, 'new_or_regressed');
   assert.equal(config.sendRunSummary, true);
-  assert.equal(config.slackCriticalMention, 'none');
+  assert.equal(config.slackCriticalMention, 'channel');
   assert.equal(config.slackRequestTimeoutMs, 15000);
   assert.equal(config.slackMaxRetries, 4);
   assert.equal(config.slackMaxIssuesPerMessage, 20);

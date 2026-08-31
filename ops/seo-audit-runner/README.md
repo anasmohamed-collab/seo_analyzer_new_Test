@@ -170,49 +170,37 @@ without channel ID or vice versa) is always a configuration error.
 | `summary_only` | Project-level counts only, no individual issues. |
 | `disabled` | Never send Slack messages — issue lifecycle state is still updated after successful audits. |
 
-### Broad mentions (`SLACK_CRITICAL_MENTION`) — off by default, opt-in for Production P0
+### Broad mentions (`SLACK_CRITICAL_MENTION`) — every alert and final report
 
-The default is **no mention on any message**. An operator may opt in to a
-single `<!channel>` (`@channel`) on genuine Production critical alerts.
+The default is `channel`: every Slack message that is actually emitted carries
+a single `<!channel>` (`@channel`). This includes Production alerts, Beta
+exposure alerts, unchanged/resolved alerts in modes that emit them, operational
+failure reports, and the end-of-run final audit report.
 `<!here>` and `<!everyone>` are never activated, and the literal string `@all`
 is never emitted.
 
 | Value | Effect |
 |---|---|
-| *(omitted)* / `none` *(default)* | no broad mention on any message |
-| `channel` | **opt-in:** one `<!channel>` on a Production critical alert that reports a NEW or REOPENED P0 |
+| *(omitted)* / `channel` *(default)* | one top-level `<!channel>` on every emitted Slack message |
+| `none` | emergency opt-out; messages are still delivered without a broad mention |
 | `here` / `everyone` | **accepted, then neutralized to `none`** so existing env files keep validating; neither can become active |
 | anything else | **configuration error** — `validate-config` fails rather than guessing |
 
 `validate-config` and `status` print the effective value and whether a broad
 value was neutralized, so nothing is silent.
 
-**Exact eligibility.** With `SLACK_CRITICAL_MENTION=channel`, the mention is
-rendered only when **all** of the following hold:
-
-1. the message is a project-level critical SEO alert,
-2. the project is Production (`is_beta !== true`),
-3. the notification-eligible lifecycle contains at least one **NEW** or
-   **REOPENED** P0,
-4. Slack notifications and the project's alert mode already permit the message
-   to be sent.
-
-A message that reports a NEW/REOPENED P0 *and* other lifecycle buckets mentions
-the channel **once** — the mention is authorized by the NEW/REOPENED P0, not by
-the other buckets. Everything else stays mention-free: P1/P2 findings, page
-PASS/WARN/FAIL promotions, **Beta Exposure alerts**, UNCHANGED-only and
-RESOLVED-only alerts, **run summaries**, zero-completed-audit summaries,
-operational and trigger failures, incomplete evidence, timed-out or failed
-audits, skipped/deferred projects, health and doctor output, audit-config
-discovery, notification previews and dry runs, and ordinary runner logs. No
-P0/P1/P2 scoring rule changed to make this work.
+**Exact eligibility.** With `SLACK_CRITICAL_MENTION=channel`, every project
+alert and every end-of-run final report gets one token. Results that do not
+produce a Slack message (for example incomplete evidence by itself, suppressed
+unchanged findings in `new_or_regressed` mode, previews, dry runs, health output
+and ordinary logs) naturally do not page. No P0/P1/P2 scoring rule changed.
 
 **Authorization is data, never text.** The decision travels from configuration
 through the notification pipeline to the formatter as an explicit value; no
 code path grants a mention by searching a rendered message, alert title, or any
 audit-controlled string. The formatter inserts exactly one token at the start
-of the visible header block and deliberately keeps no copy in the top-level
-fallback text, so the payload carries it exactly once in total. Audit-supplied
+of top-level `text`, which Slack uses for notification delivery even when Block
+Kit renders the body. The blocks carry no duplicate. Audit-supplied
 content is escaped (`<` → `&lt;`), so an issue title, message, URL, project
 name, recommendation, or fix hint cannot inject one.
 
@@ -233,10 +221,9 @@ delivery — old queued messages are never authorized retroactively, and no
 historical row is rewritten. Delivered notifications are still never resent,
 retries never rerun an audit, and retries never modify issue lifecycle state.
 
-**Enabling it is a separate operator action.** Setting
-`SLACK_CRITICAL_MENTION=channel` on a host is a deliberate change made outside
-this repository. **No real Slack validation of the mention has been executed** —
-the behavior above is covered by unit tests with mocked HTTP only.
+Setting `SLACK_CRITICAL_MENTION=none` is the explicit emergency opt-out. **No
+real Slack validation of the mention has been executed** — the behavior above
+is covered by unit tests with mocked HTTP only.
 
 ### Message format
 

@@ -744,7 +744,7 @@ test('run summary is persisted and delivered when enabled', async () => {
   });
   assert.equal(status, 'delivered');
   assert.equal(sender.sent.length, 1);
-  assert.match(sender.sent[0].text, /SEO Audit Summary/);
+  assert.match(sender.sent[0].text, /SEO Audit Final Report/);
   db.close();
 });
 
@@ -756,16 +756,15 @@ test('shouldNotify matrix', () => {
   assert.equal(shouldNotify('summary_only', { new: 0, reopened: 0, resolved: 0, unchanged: 0, current: 0 }), false);
 });
 
-// ── Broad mentions: opt-in, Production NEW/REOPENED P0 only ─────────
+// ── Broad mentions: every emitted Slack alert and final report ──────
 
 /** Total broad-mention tokens across a message's text AND blocks. */
 const mentions = (message) => countBroadMentions(message);
 
-test('the mention eligibility rule is exactly config + Production + NEW/REOPENED P0', () => {
+test('the mention eligibility rule depends only on the channel setting', () => {
   const counts = (over = {}) => ({ new: 0, reopened: 0, unchanged: 0, resolved: 0, current: 0, ...over });
 
-  // Authorized: opted in, Production, and a NEW or REOPENED P0.
-  for (const c of [counts({ new: 1 }), counts({ reopened: 1 }), counts({ new: 2, reopened: 3, resolved: 4 })]) {
+  for (const c of [counts(), counts({ new: 1 }), counts({ reopened: 1 }), counts({ unchanged: 3 }), counts({ resolved: 4 })]) {
     assert.equal(
       criticalMentionPolicy({ configuredMention: 'channel', isBeta: false, counts: c }),
       'channel',
@@ -779,15 +778,11 @@ test('the mention eligibility rule is exactly config + Production + NEW/REOPENED
       `configuredMention=${String(configured)} must not authorize`,
     );
   }
-  // Beta, whatever the lifecycle.
+  // Beta alerts use the same policy.
   assert.equal(
     criticalMentionPolicy({ configuredMention: 'channel', isBeta: true, counts: counts({ new: 1, reopened: 1 }) }),
-    'none',
+    'channel',
   );
-  // No NEW/REOPENED bucket.
-  for (const c of [counts(), counts({ unchanged: 3, current: 3 }), counts({ resolved: 2 })]) {
-    assert.equal(criticalMentionPolicy({ configuredMention: 'channel', isBeta: false, counts: c }), 'none');
-  }
 });
 
 test('an opted-in Production NEW P0 alert carries exactly one <!channel>', async () => {
@@ -801,8 +796,12 @@ test('an opted-in Production NEW P0 alert carries exactly one <!channel>', async
 
   const message = sender.sent[0];
   assert.equal(mentions(message), 1, 'exactly one token across text and blocks');
-  assert.match(message.blocks[0].text.text, /^<!channel> :rotating_light: \*Critical SEO Alert\*/);
-  assert.ok(!/<!/.test(message.text), 'the fallback keeps no duplicate copy');
+  assert.match(
+    message.text,
+    /^<!channel> :rotating_light: \*Total Critical Issues: 1\*/,
+  );
+  assert.match(message.blocks[0].text.text, /:rotating_light: \*Critical SEO Alert\*/);
+  assert.ok(!/<!/.test(message.blocks[0].text.text), 'the Block Kit body keeps no duplicate copy');
   assert.match(message.text, /\*P0:\* 1 new/, 'the alert itself is unchanged');
   assert.ok(!message.text.includes('@all'), 'never a literal @all');
   db.close();
@@ -824,9 +823,53 @@ test('an opted-in Production REOPENED P0 alert carries exactly one <!channel>', 
   assert.equal(sender.sent.length, 3);
   assert.match(sender.sent[2].text, /\*P0:\* 1 reopened/);
   assert.equal(mentions(sender.sent[2]), 1, 'the REOPENED P0 alert pages once');
-  // The middle message is the RESOLVED-only alert — it must not page.
-  assert.equal(mentions(sender.sent[1]), 0, 'a RESOLVED-only alert never pages');
+  assert.equal(mentions(sender.sent[1]), 1, 'a RESOLVED-only alert also pages');
   db.close();
+});
+
+test('every real Production P0 condition pages on NEW and REOPENED only', async () => {
+  const productionP0s = [
+    { area: 'sitemap', message: 'No valid sitemap found after testing all priority paths', source: 'site' },
+    { area: 'robots', message: 'robots.txt blocks all crawling with Disallow: /', source: 'site' },
+    { area: 'robots', message: 'robots.txt blocks Googlebot from crawling entire site', source: 'site' },
+    { area: 'robots', message: 'robots.txt blocks Googlebot-News from crawling entire site', source: 'site' },
+    { area: 'meta', message: 'Page has noindex directive on a seed URL', source: 'page' },
+  ];
+
+  for (const [index, condition] of productionP0s.entries()) {
+    const { db, store } = freshStore();
+    const sender = mockSender();
+    const pipeline = pipelineWith(store, sender, { slackCriticalMention: 'channel' });
+    const issue = {
+      ...critical(index + 1),
+      ...condition,
+      pageUrl: condition.source === 'page' ? submittedUrls.homeUrl : null,
+    };
+
+    const first = await pipeline.handleProjectCompleted({
+      project, auditRunId: `condition-${index}-new`, results: results(), criticalIssues: [issue],
+    });
+    const unchanged = await pipeline.handleProjectCompleted({
+      project, auditRunId: `condition-${index}-unchanged`, results: results(), criticalIssues: [issue],
+    });
+    const resolved = await pipeline.handleProjectCompleted({
+      project, auditRunId: `condition-${index}-resolved`, results: results(), criticalIssues: [],
+    });
+    const reopened = await pipeline.handleProjectCompleted({
+      project, auditRunId: `condition-${index}-reopened`, results: results(), criticalIssues: [issue],
+    });
+
+    assert.equal(first.lifecycleCounts.new, 1, `${condition.message}: NEW`);
+    assert.equal(unchanged.lifecycleCounts.unchanged, 1, `${condition.message}: UNCHANGED`);
+    assert.equal(unchanged.notificationStatus, 'not-required', `${condition.message}: suppressed repeat`);
+    assert.equal(resolved.lifecycleCounts.resolved, 1, `${condition.message}: RESOLVED`);
+    assert.equal(reopened.lifecycleCounts.reopened, 1, `${condition.message}: REOPENED`);
+    assert.equal(sender.sent.length, 3, `${condition.message}: NEW, RESOLVED, and REOPENED messages`);
+    assert.equal(mentions(sender.sent[0]), 1, `${condition.message}: NEW pages exactly once`);
+    assert.equal(mentions(sender.sent[1]), 1, `${condition.message}: RESOLVED pages exactly once`);
+    assert.equal(mentions(sender.sent[2]), 1, `${condition.message}: REOPENED pages exactly once`);
+    db.close();
+  }
 });
 
 test('a NEW and a REOPENED P0 in one alert still page the channel only once', async () => {
@@ -877,7 +920,7 @@ test('no non-channel SLACK_CRITICAL_MENTION value can introduce a mention', asyn
   }
 });
 
-test('an unchanged-only alert carries no broad mention, even opted in (all_current)', async () => {
+test('an unchanged-only alert carries the channel mention (all_current)', async () => {
   const { db, store } = freshStore();
   const sender = mockSender();
   const pipeline = pipelineWith(store, sender, {
@@ -893,11 +936,11 @@ test('an unchanged-only alert carries no broad mention, even opted in (all_curre
   assert.equal(second.lifecycleCounts.unchanged, 1);
   assert.equal(sender.sent.length, 2);
   assert.equal(mentions(sender.sent[0]), 1, 'the first alert was NEW and pages');
-  assert.equal(mentions(sender.sent[1]), 0, 'the UNCHANGED-only repeat does not');
+  assert.equal(mentions(sender.sent[1]), 1, 'the UNCHANGED-only alert pages too');
   db.close();
 });
 
-test('a resolved-only alert carries no broad mention, even opted in', async () => {
+test('a resolved-only alert carries the channel mention', async () => {
   const { db, store } = freshStore();
   const sender = mockSender();
   const pipeline = pipelineWith(store, sender, { slackCriticalMention: 'channel' });
@@ -908,12 +951,12 @@ test('a resolved-only alert carries no broad mention, even opted in', async () =
   });
 
   assert.equal(second.notificationCounts.resolved, 1);
-  assert.equal(mentions(sender.sent[1]), 0);
+  assert.equal(mentions(sender.sent[1]), 1);
   assert.match(sender.sent[1].text, /\*Resolved:\* 1/);
   db.close();
 });
 
-test('a Beta exposure alert never pages the channel, even opted in', async () => {
+test('a Beta exposure alert pages the channel when enabled', async () => {
   const { db, store } = freshStore();
   const sender = mockSender();
   const pipeline = pipelineWith(store, sender, { slackCriticalMention: 'channel' });
@@ -926,7 +969,7 @@ test('a Beta exposure alert never pages the channel, even opted in', async () =>
   });
 
   assert.match(sender.sent[0].text, /Beta SEO Exposure Alert/);
-  assert.equal(mentions(sender.sent[0]), 0, 'a NEW Beta exposure finding is not an on-call page');
+  assert.equal(mentions(sender.sent[0]), 1, 'every emitted Beta alert carries the mention');
   db.close();
 });
 
@@ -954,7 +997,7 @@ test('audit-controlled content cannot inject a mention through the pipeline', as
   db.close();
 });
 
-test('the run summary never carries a broad mention, even opted in', async () => {
+test('the final report carries a broad mention when channel paging is enabled', async () => {
   const { db, store } = freshStore();
   const sender = mockSender();
   const pipeline = pipelineWith(store, sender, { slackCriticalMention: 'channel' });
@@ -974,14 +1017,14 @@ test('the run summary never carries a broad mention, even opted in', async () =>
   });
 
   const summary = sender.sent.at(-1);
-  assert.match(summary.text, /SEO Audit Summary/);
-  assert.equal(mentions(summary), 0);
-  assert.equal(summary.mentionPolicy, undefined, 'a summary is never stamped as authorized');
+  assert.match(summary.text, /SEO Audit Final Report/);
+  assert.equal(mentions(summary), 1);
+  assert.equal(summary.mentionPolicy, 'channel', 'the report is stamped as authorized');
   assert.ok(!summary.text.includes('@all'));
   db.close();
 });
 
-test('failed, timed-out, incomplete, skipped and deferred results never page', async () => {
+test('failed, timed-out, incomplete, skipped and deferred results page only through the final report', async () => {
   const { db, store } = freshStore();
   const sender = mockSender();
   const pipeline = pipelineWith(store, sender, { slackCriticalMention: 'channel' });
@@ -996,7 +1039,7 @@ test('failed, timed-out, incomplete, skipped and deferred results never page', a
   assert.equal(sender.sent.length, 0, 'no project alert exists to carry a mention');
 
   // A run in which everything failed, timed out or was skipped/deferred is a
-  // run summary, and summaries never page.
+  // The final report is still emitted and carries the configured mention.
   await pipeline.sendRunSummary({
     startedAt: '2026-07-13T06:00:00.000Z',
     finishedAt: '2026-07-13T06:00:20.000Z',
@@ -1008,7 +1051,7 @@ test('failed, timed-out, incomplete, skipped and deferred results never page', a
     },
   });
   assert.equal(sender.sent.length, 1);
-  assert.equal(mentions(sender.sent[0]), 0, 'an operational summary never pages the channel');
+  assert.equal(mentions(sender.sent[0]), 1, 'the operational final report pages the channel');
   db.close();
 });
 

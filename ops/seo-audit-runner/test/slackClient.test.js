@@ -62,23 +62,29 @@ const noSleep = async () => {};
 test('successful bot API delivery posts to chat.postMessage with channel ID', async () => {
   const fetchImpl = fetchQueue([jsonRes({ ok: true })]);
   const sender = createSlackSender({ config: botConfig(), fetchImpl, sleepFn: noSleep });
-  const result = await sender.send({ text: 'hello' });
+  const result = await sender.send({ text: 'See https://example.com/report' });
   assert.equal(result.method, 'bot');
   const call = fetchImpl.calls[0];
   assert.equal(call.url, SLACK_POST_MESSAGE_URL);
   const body = JSON.parse(call.init.body);
   assert.equal(body.channel, 'C0123456789');
-  assert.equal(body.text, 'hello');
+  assert.equal(body.text, 'See https://example.com/report', 'the URL remains in the message');
+  assert.equal(body.unfurl_links, false, 'text-page previews are disabled');
+  assert.equal(body.unfurl_media, false, 'media previews are disabled');
   assert.equal(call.init.headers.Authorization, `Bearer ${FAKE_TOKEN}`);
 });
 
 test('successful webhook delivery posts to the webhook URL', async () => {
   const fetchImpl = fetchQueue([new Response('ok', { status: 200 })]);
   const sender = createSlackSender({ config: webhookConfig(), fetchImpl, sleepFn: noSleep });
-  const result = await sender.send({ text: 'hello' });
+  const result = await sender.send({ text: 'See https://example.com/report' });
   assert.equal(result.method, 'webhook');
   assert.equal(fetchImpl.calls[0].url, FAKE_WEBHOOK);
   assert.equal(fetchImpl.calls[0].init.headers.Authorization, undefined);
+  const body = JSON.parse(fetchImpl.calls[0].init.body);
+  assert.equal(body.text, 'See https://example.com/report', 'the URL remains in the message');
+  assert.equal(body.unfurl_links, false, 'text-page previews are disabled');
+  assert.equal(body.unfurl_media, false, 'media previews are disabled');
 });
 
 test('HTTP 429 honors Retry-After and then succeeds', async () => {
@@ -216,8 +222,8 @@ test('an authorized alert is delivered with exactly one <!channel> over the bot 
   await sender.send(criticalAlert('channel'));
   const body = JSON.parse(fetchImpl.calls[0].init.body);
   assert.equal(countBroadMentions(body), 1, 'one token across text AND blocks');
-  assert.match(body.blocks[0].text.text, /^<!channel> :rotating_light:/);
-  assert.ok(!/<!(channel|here|everyone)/.test(body.text), 'the fallback carries no duplicate');
+  assert.match(body.text, /^<!channel> :rotating_light:/);
+  assert.ok(!/<!(channel|here|everyone)/.test(body.blocks[0].text.text), 'the visible block carries no duplicate');
   assert.equal(body.channel, 'C0123456789', 'delivery uses the immutable channel ID, not a name');
 });
 
@@ -228,7 +234,7 @@ test('an authorized alert is delivered with exactly one <!channel> over a webhoo
   await sender.send(criticalAlert('channel'));
   const body = JSON.parse(fetchImpl.calls[0].init.body);
   assert.equal(countBroadMentions(body), 1);
-  assert.match(body.blocks[0].text.text, /^<!channel> :rotating_light:/);
+  assert.match(body.text, /^<!channel> :rotating_light:/);
 });
 
 test('the internal authorization field never reaches Slack, on either method', async () => {
@@ -244,7 +250,9 @@ test('the internal authorization field never reaches Slack, on either method', a
     await sender.send(message);
     const body = JSON.parse(fetchImpl.calls[0].init.body);
     assert.ok(!('mentionPolicy' in body), 'internal metadata is not transmitted');
-    const supported = config.slackMethod === 'bot' ? ['blocks', 'channel', 'text'] : ['blocks', 'text'];
+    const supported = config.slackMethod === 'bot'
+      ? ['blocks', 'channel', 'text', 'unfurl_links', 'unfurl_media']
+      : ['blocks', 'text', 'unfurl_links', 'unfurl_media'];
     assert.deepEqual(Object.keys(body).sort(), supported, 'only Slack-supported fields are sent');
     assert.equal(message.mentionPolicy, 'channel', 'and the caller’s message is not mutated');
   }

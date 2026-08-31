@@ -38,29 +38,15 @@ export function notificationIdentity({ projectId, auditRunId, type, alertMode, l
 }
 
 /**
- * The ONLY rule that authorizes a broad `@channel` mention.
- *
- * All of the following must hold — the caller has already established that the
- * message is a project-level critical alert that Slack notifications and the
- * project's alert mode permit to be sent:
- *
- *  1. the operator opted in with `SLACK_CRITICAL_MENTION=channel`
- *  2. the project is Production (`project.is_beta !== true`)
- *  3. the NOTIFICATION-eligible lifecycle carries at least one NEW or
- *     REOPENED P0 (Beta exposure findings never reach here — condition 2
- *     already excluded them)
- *
- * Nothing about the rendered message, its title, or any audit-controlled
- * string takes part in this decision.
+ * Authorize `@channel` for every Slack message when channel paging is enabled.
+ * The rendered message and audit-controlled content never take part in this
+ * decision. Keeping this as structured data lets the last-mile sanitizer strip
+ * injected mentions and retain only the formatter-owned token.
  *
  * @returns 'channel' | 'none'
  */
-export function criticalMentionPolicy({ configuredMention, isBeta, counts }) {
-  const authorized =
-    configuredMention === CHANNEL_MENTION_MODE &&
-    isBeta !== true &&
-    (counts?.new ?? 0) + (counts?.reopened ?? 0) > 0;
-  return authorized ? CHANNEL_MENTION_MODE : NO_MENTION_MODE;
+export function criticalMentionPolicy({ configuredMention }) {
+  return configuredMention === CHANNEL_MENTION_MODE ? CHANNEL_MENTION_MODE : NO_MENTION_MODE;
 }
 
 export function shouldNotify(mode, counts) {
@@ -270,11 +256,7 @@ export function createNotificationPipeline({
           // Authorization travels as data from configuration → pipeline →
           // formatter. It is stamped onto the message, persisted with it, and
           // removed again by the Slack client before transmission.
-          mentionPolicy: criticalMentionPolicy({
-            configuredMention: config.slackCriticalMention,
-            isBeta,
-            counts,
-          }),
+          mentionPolicy: criticalMentionPolicy({ configuredMention: config.slackCriticalMention }),
           maxIssuesPerMessage: config.slackMaxIssuesPerMessage,
           maxMessageCharacters: config.slackMaxMessageCharacters,
         });
@@ -313,10 +295,11 @@ export function createNotificationPipeline({
         startedAt,
         finishedAt,
         durationMs: Date.parse(finishedAt) - Date.parse(startedAt),
-        // Run summaries never carry a broad mention — `buildRunSummaryMessage`
-        // has no mention parameter and stamps no authorization. The technical
-        // aggregate is the pipeline's own count of successfully completed audits.
+        // The final report uses the same configured mention policy as every
+        // project alert. The technical aggregate is the pipeline's own count
+        // of successfully completed audits.
         totals: { ...totals, technical: totals?.technical ?? technicalTotals },
+        mentionPolicy: criticalMentionPolicy({ configuredMention: config.slackCriticalMention }),
       });
       return persistAndSend({
         type: 'run_summary',
@@ -335,7 +318,7 @@ export function createNotificationPipeline({
  * replays stored Slack payloads.
  *
  * Mention authorization rides along inside the stored payload, so a retry of
- * an authorized Production critical alert still delivers its one `<!channel>`,
+ * any authorized alert or final report still delivers its one `<!channel>`,
  * and a payload stored WITHOUT that field — every row written before this
  * change — is stripped of any broad mention at delivery. Historical rows are
  * never rewritten, and nothing is authorized retroactively.

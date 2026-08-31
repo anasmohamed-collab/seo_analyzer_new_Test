@@ -87,6 +87,11 @@ export function createSlackSender({
       ...(method === 'bot' ? { channel: config.slackChannelId } : {}),
       text: message.text,
       ...(message.blocks ? { blocks: message.blocks } : {}),
+      // Supported by both chat.postMessage and Incoming Webhooks. Keep URLs
+      // clickable in the message while preventing Slack from expanding them
+      // into text or media previews.
+      unfurl_links: false,
+      unfurl_media: false,
     };
   }
 
@@ -185,7 +190,7 @@ export function createSlackSender({
         );
       }
       if (found === 1) {
-        logger?.debug?.('Delivering an authorized Production critical alert with one <!channel>');
+        logger?.debug?.('Delivering an authorized Slack message with one top-level <!channel>');
       } else if (countBroadMentions(rawMessage) > found) {
         logger?.debug?.('Stripped an unauthorized broad mention from a Slack payload before delivery');
       }
